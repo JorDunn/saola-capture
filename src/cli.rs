@@ -1,0 +1,898 @@
+//! Argument parsing (`clap`, Stage 1's pick) and CLI-flag-over-config
+//! resolution (PLAN.md Stage 3, task 2).
+//!
+//! # The split this module keeps (teaching note)
+//!
+//! [`Cli`]/[`Command`]/[`ShotArgs`]/[`RecordArgs`]/[`WindowAction`] are the
+//! *argv shape* — `clap`'s derive macro turns them straight into a parser,
+//! `--help` text and all. Everything below the `// -- resolution --`
+//! marker is the *meaning* of what was parsed: [`CaptureOptions`] and
+//! [`RecordOptions`] are plain data, built by folding a parsed args struct
+//! over a [`crate::config::CaptureConfig`] (flags win, the config file is
+//! the fallback, PLAN.md's own stated precedence). Keeping the fold as pure
+//! functions (`CaptureOptions::resolve`, `RecordOptions::resolve`) rather
+//! than mixing it into `main`'s dispatch is what makes flag-vs-config
+//! precedence unit-testable without spawning a process or touching argv —
+//! every test below builds a `ShotArgs`/`RecordArgs` value directly, the
+//! same way `saola-panel::config`'s tests build a `CliOverrides` directly
+//! instead of calling `std::env::args()`.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+use zbus::zvariant::OwnedValue;
+
+use crate::config::{CaptureConfig, ImageFormat, VideoPreset};
+
+/// Teaching note: `clap`'s `derive` feature turns this struct into a full
+/// argument parser at compile time. `Cli::parse()` in `main` reads
+/// `std::env::args()` and — on `--help`, `--version`, or a malformed
+/// invocation — prints the right text and exits the process itself
+/// (clap's own graceful exit path, not a `panic!`/`unwrap` on a runtime
+/// path, so CLAUDE.md's no-panic rule is untouched by it).
+#[derive(Parser, Debug)]
+#[command(
+    name = "saola-capture",
+    version,
+    about = "Screenshots and screen recording for the Saola desktop environment."
+)]
+pub struct Cli {
+    /// Read `capture.toml` from this directory instead of the
+    /// `$SAOLA_CONFIG_DIR`/XDG search path — heads
+    /// `config::CaptureConfig::resolve_path`'s precedence chain. `global =
+    /// true` so it can appear either before or after the subcommand
+    /// (`saola-capture --config-dir ~/scratch shot --fullscreen` and
+    /// `saola-capture shot --config-dir ~/scratch --fullscreen` both work),
+    /// matching how `saola-panel` exposes the same knob.
+    #[arg(long, global = true, value_name = "dir")]
+    pub config_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// The three run modes from `CLAUDE.md`, flattened into one dispatch enum.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Run the long-lived layer-shell daemon: selection overlay, camera
+    /// flash, toast stack, tray item, capture engine, recording pipeline,
+    /// and the `io.saola.Capture1` bus name.
+    Daemon,
+    /// Open the separate-process app window: main window, history library,
+    /// annotation editor.
+    Window {
+        #[command(subcommand)]
+        action: Option<WindowAction>,
+    },
+    /// Take a screenshot (fullscreen, region, or window) via the daemon, or
+    /// in-process and headless with `--no-daemon`.
+    Shot(ShotArgs),
+    /// Start, stop, or toggle screen recording.
+    Record(RecordArgs),
+    /// Pick a color from the screen and copy its hex value.
+    PickColor,
+    /// Open the app window (CLI convenience verb, same as `window` with no
+    /// further action).
+    Open,
+}
+
+/// `saola-capture window edit <path>` — jump straight into the annotation
+/// editor with a saved capture loaded, the toast-click flow's target
+/// (Architecture: "Toast click: spawn detached `saola-capture window edit
+/// <path>`"). No subcommand at all opens the plain main window.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum WindowAction {
+    /// Open the annotation editor on an existing capture file.
+    Edit { path: PathBuf },
+}
+
+impl WindowAction {
+    /// The `OpenWindow(mode s)` D-Bus argument this action resolves to —
+    /// `"main"` for the plain window, `"edit:<path>"` for the editor. A
+    /// free function of `Option<&WindowAction>` rather than a method on
+    /// `Option` itself, since `None` (no action given) is a meaningful
+    /// third case with its own string, not an absence to `unwrap_or`
+    /// around.
+    pub fn dbus_mode(action: Option<&WindowAction>) -> String {
+        match action {
+            None => "main".to_string(),
+            Some(WindowAction::Edit { path }) => format!("edit:{}", path.display()),
+        }
+    }
+}
+
+/// `shot [--fullscreen|--region [--geometry WxH+X+Y]|--window]` plus the
+/// flags Architecture lists as overriding `capture.toml`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ShotArgs {
+    /// Capture the whole output. The default when no target flag is given.
+    #[arg(long)]
+    pub fullscreen: bool,
+    /// Capture a selected region — interactively via the overlay, or
+    /// exactly via `--geometry` (skips the overlay entirely).
+    #[arg(long)]
+    pub region: bool,
+    /// Capture a single window via niri's own `ScreenshotWindow` action
+    /// (CAPTURE-RESEARCH D3) — picked from a list, not by hovering (niri
+    /// exposes no pixel position for tiled windows).
+    #[arg(long)]
+    pub window: bool,
+    /// Skip the overlay and capture exactly this rectangle. Logical
+    /// coordinates, matching slurp/grim's convention. Requires `--region`.
+    #[arg(long, value_name = "WxH+X+Y", requires = "region")]
+    pub geometry: Option<String>,
+
+    /// `webp` or `png`. Defaults to `capture.toml`'s `image-format`.
+    #[arg(long, value_name = "webp|png")]
+    pub format: Option<String>,
+    /// Directory to save into. Defaults to `capture.toml`'s `save-dir`, or
+    /// `~/Pictures/Captures` if that's unset too (storage.rs, Stage 5).
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// Countdown before the shutter, in whole seconds. Defaults to
+    /// `capture.toml`'s `delay`.
+    #[arg(long)]
+    pub delay: Option<u32>,
+
+    /// Composite the cursor into the capture.
+    #[arg(long, conflicts_with = "no_cursor")]
+    pub cursor: bool,
+    /// Omit the cursor from the capture.
+    #[arg(long, conflicts_with = "cursor")]
+    pub no_cursor: bool,
+
+    /// Copy the result to the clipboard.
+    #[arg(long, conflicts_with = "no_copy")]
+    pub copy: bool,
+    /// Don't touch the clipboard.
+    #[arg(long, conflicts_with = "copy")]
+    pub no_copy: bool,
+
+    /// Suppress the toast notification for this capture.
+    #[arg(long)]
+    pub no_toast: bool,
+    /// Capture fully in-process and headless (no flash, no toast, no
+    /// daemon round-trip) — the scriptable path.
+    #[arg(long)]
+    pub no_daemon: bool,
+}
+
+/// `record start|stop|toggle [--preset hevc|av1|h264] [--audio mic|system|both]`.
+#[derive(Args, Debug, Clone)]
+pub struct RecordArgs {
+    #[command(subcommand)]
+    pub action: RecordAction,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum RecordAction {
+    /// Begin recording.
+    Start(RecordStartArgs),
+    /// Stop the active recording and save it.
+    Stop,
+    /// Start if idle, stop if recording — what a single keybind toggles.
+    Toggle(RecordStartArgs),
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct RecordStartArgs {
+    /// Encoder preset. `av1` is software-encoded (SVT-AV1) and is not
+    /// realtime at high resolutions/frame rates — CAPTURE-RESEARCH §3.4
+    /// measured 0.58-0.84x at 2560x1600@60; Stage 11 caps it around 30fps.
+    /// Defaults to `capture.toml`'s `video-preset`.
+    #[arg(long, value_name = "hevc|av1|h264")]
+    pub preset: Option<String>,
+    /// Record audio from the microphone, system output, or both. Device
+    /// *names* are resolved at record time from `pactl list short sources`
+    /// (CAPTURE-RESEARCH: never hardcoded) — omit for a silent recording.
+    #[arg(long, value_name = "mic|system|both")]
+    pub audio: Option<String>,
+}
+
+// -- resolution: flags + config -> the values the rest of the app uses --
+
+/// A flag or config value that didn't parse — the CLI-verb equivalent of
+/// `config.rs`'s per-knob warnings, except a bad *flag* is fatal to that
+/// one invocation (printed to stderr, nonzero exit) rather than falling
+/// back to a default the way a bad *config* knob does: a script that typo'd
+/// `--format=jpeg` needs to know its capture didn't happen, not silently
+/// get a webp it didn't ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliError(pub String);
+
+impl fmt::Display for CliError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+/// Which of the three shot targets was asked for. Carries no data of its
+/// own beyond the variant — [`CaptureOptions::geometry`] is the one piece
+/// of per-kind data, and it only ever applies to [`Region`](Self::Region).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShotKind {
+    Fullscreen,
+    Region,
+    Window,
+}
+
+impl ShotKind {
+    /// The wire spelling `Screenshot`'s `kind` argument uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fullscreen => "fullscreen",
+            Self::Region => "region",
+            Self::Window => "window",
+        }
+    }
+}
+
+/// A `--geometry WxH+X+Y` value, parsed. Logical coordinates (matching
+/// slurp/grim — CAPTURE-RESEARCH D2), converted to physical pixels by
+/// whichever backend consumes it (Stage 5/7), not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Geometry {
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Geometry {
+    /// Parses `WxH+X+Y` — width and height are unsigned, `X`/`Y` may be
+    /// negative (a monitor to the left of or above the origin). The format
+    /// always writes the two `+` separators literally, even when the
+    /// coordinate that follows is negative (`800x600+-50+30`), so splitting
+    /// on the first two `+` characters is always correct — the `-` sign
+    /// belongs to the number, never to the separator.
+    pub fn parse(raw: &str) -> Result<Self, CliError> {
+        let bad = || CliError(format!("--geometry: expected WxH+X+Y, got {raw:?}"));
+
+        let mut parts = raw.splitn(3, '+');
+        let wh = parts.next().ok_or_else(bad)?;
+        let x = parts.next().ok_or_else(bad)?;
+        let y = parts.next().ok_or_else(bad)?;
+
+        let (width, height) = wh.split_once('x').ok_or_else(bad)?;
+        let width: u32 = width.parse().map_err(|_| bad())?;
+        let height: u32 = height.parse().map_err(|_| bad())?;
+        if width == 0 || height == 0 {
+            return Err(CliError(format!(
+                "--geometry: width and height must be positive, got {raw:?}"
+            )));
+        }
+        let x: i32 = x.parse().map_err(|_| bad())?;
+        let y: i32 = y.parse().map_err(|_| bad())?;
+
+        Ok(Geometry {
+            width,
+            height,
+            x,
+            y,
+        })
+    }
+}
+
+/// Which target flags were actually given, folded into the one kind the
+/// rest of the pipeline cares about. Pulled out of [`CaptureOptions::resolve`]
+/// so the mutual-exclusivity logic is unit-testable on its own.
+fn resolve_shot_kind(args: &ShotArgs) -> Result<(ShotKind, Option<Geometry>), CliError> {
+    let chosen = [args.fullscreen, args.region, args.window]
+        .iter()
+        .filter(|&&set| set)
+        .count();
+    if chosen > 1 {
+        return Err(CliError(
+            "choose at most one of --fullscreen, --region, --window".to_string(),
+        ));
+    }
+
+    // `requires = "region"` on the clap side already rejects
+    // `--geometry` without `--region` when parsed from real argv — this
+    // second check is what makes the rule enforced (and testable) for a
+    // `ShotArgs` built directly in a test, which bypasses clap entirely.
+    if args.geometry.is_some() && !args.region {
+        return Err(CliError("--geometry requires --region".to_string()));
+    }
+
+    let geometry = args.geometry.as_deref().map(Geometry::parse).transpose()?;
+
+    let kind = if args.region {
+        ShotKind::Region
+    } else if args.window {
+        ShotKind::Window
+    } else {
+        // No target flag at all: fullscreen. Chosen over an interactive
+        // region pick as the default because it needs no daemon-side
+        // picker to produce a result — the safer default for scripts and
+        // for `--no-daemon`, and `Print`'s own bind is `shot --fullscreen`
+        // explicitly rather than relying on this default anyway.
+        ShotKind::Fullscreen
+    };
+
+    Ok((kind, geometry))
+}
+
+/// A resolved `--cursor`/`--no-cursor`-shaped pair against a config
+/// default. clap's `conflicts_with` already prevents both flags being true
+/// out of real argv; a `ShotArgs` built directly in a test could still set
+/// both, which is treated as "no override" rather than a panic — the flag
+/// resolution equivalent of `config.rs`'s "a bad value degrades, it never
+/// crashes" rule.
+fn resolve_bool_override(set_true: bool, set_false: bool, default: bool) -> bool {
+    match (set_true, set_false) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => default,
+    }
+}
+
+/// The fully resolved options for one `shot` invocation: every
+/// `capture.toml` knob that applies to a screenshot, with any flag
+/// `ShotArgs` carried overriding it. This is what `main.rs`'s dispatch
+/// hands to the D-Bus call (via [`Self::to_dbus_options`]) or to the
+/// in-process path (`--no-daemon`, Stage 5).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureOptions {
+    pub kind: ShotKind,
+    pub geometry: Option<Geometry>,
+    pub format: ImageFormat,
+    pub png_also: bool,
+    /// `None` defers to `storage.rs`'s `~/Pictures/Captures` fallback
+    /// (Stage 5) — neither `capture.toml`'s `save-dir` nor `--output` was
+    /// given. Kept as an `Option` all the way through rather than resolved
+    /// here, so this module never has to know that fallback path (PLAN.md
+    /// assigns it to Stage 5's `storage.rs` alone).
+    pub output_dir: Option<PathBuf>,
+    pub delay: u32,
+    pub cursor: bool,
+    pub copy: bool,
+    pub toast: bool,
+    pub no_daemon: bool,
+}
+
+impl CaptureOptions {
+    /// Folds `args` over `config`: an explicitly-given flag wins, an absent
+    /// one falls through to the config value (which is already a concrete
+    /// default by the time it reaches here — see `config.rs`).
+    pub fn resolve(config: &CaptureConfig, args: &ShotArgs) -> Result<Self, CliError> {
+        let (kind, geometry) = resolve_shot_kind(args)?;
+
+        let format = match &args.format {
+            Some(raw) => ImageFormat::parse(raw).ok_or_else(|| {
+                CliError(format!(
+                    "--format: unrecognized image format {raw:?} (expected webp or png)"
+                ))
+            })?,
+            None => config.image_format,
+        };
+
+        let output_dir = args.output.clone().or_else(|| config.save_dir.clone());
+        let delay = args.delay.unwrap_or(config.delay);
+        let cursor = resolve_bool_override(args.cursor, args.no_cursor, config.cursor);
+        let copy = resolve_bool_override(args.copy, args.no_copy, config.copy);
+        let toast = if args.no_toast { false } else { config.toasts };
+
+        Ok(CaptureOptions {
+            kind,
+            geometry,
+            format,
+            png_also: config.png_also,
+            output_dir,
+            delay,
+            cursor,
+            copy,
+            toast,
+            no_daemon: args.no_daemon,
+        })
+    }
+
+    /// The resolved options as a D-Bus `a{sv}` map — Architecture: CLI
+    /// flags "travel as the D-Bus `a{sv}` options map". Every entry is
+    /// optional-on-failure rather than `.expect()`-ed: `OwnedValue`'s
+    /// primitive `From` impls are infallible for the types used here, but
+    /// building the map defensively (skip, don't crash, on the
+    /// unreachable failure case) matches CLAUDE.md's no-panic rule rather
+    /// than leaning on that guarantee.
+    pub fn to_dbus_options(&self) -> HashMap<String, OwnedValue> {
+        let mut options = HashMap::new();
+        options.insert(
+            "format".to_string(),
+            OwnedValue::from(fixed_str(self.format.as_str())),
+        );
+        options.insert("png-also".to_string(), OwnedValue::from(self.png_also));
+        if let Some(dir) = &self.output_dir {
+            options.insert(
+                "output".to_string(),
+                OwnedValue::from(fixed_str(dir.to_string_lossy().into_owned())),
+            );
+        }
+        options.insert("delay".to_string(), OwnedValue::from(self.delay));
+        options.insert("cursor".to_string(), OwnedValue::from(self.cursor));
+        options.insert("copy".to_string(), OwnedValue::from(self.copy));
+        options.insert("toast".to_string(), OwnedValue::from(self.toast));
+        if let Some(geometry) = self.geometry {
+            options.insert(
+                "geometry".to_string(),
+                OwnedValue::from(fixed_str(format!(
+                    "{}x{}+{}+{}",
+                    geometry.width, geometry.height, geometry.x, geometry.y
+                ))),
+            );
+        }
+        options
+    }
+}
+
+/// `zvariant::Str<'static>` from an owned `String`, the shape
+/// `OwnedValue`'s `Str` conversion wants (see `zvariant::owned_value`'s
+/// `to_value!` macro — it takes `Str<'a>`, not a bare `String`/`&str`).
+fn fixed_str(value: impl Into<String>) -> zbus::zvariant::Str<'static> {
+    zbus::zvariant::Str::from(value.into())
+}
+
+/// `mic`/`system`/`both` — never a hardcoded device name (CAPTURE-RESEARCH:
+/// resolved from `pactl list short sources` at record time, Stage 13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioSource {
+    Mic,
+    System,
+    Both,
+}
+
+impl AudioSource {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "mic" => Some(Self::Mic),
+            "system" => Some(Self::System),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mic => "mic",
+            Self::System => "system",
+            Self::Both => "both",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordActionKind {
+    Start,
+    Stop,
+    Toggle,
+}
+
+impl RecordActionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Toggle => "toggle",
+        }
+    }
+}
+
+/// The fully resolved options for one `record` invocation. `audio` has no
+/// config-file counterpart (`capture.toml` carries no audio knob) — it is
+/// `None` unless `--audio` was given, meaning "record video only."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordOptions {
+    pub action: RecordActionKind,
+    pub preset: VideoPreset,
+    pub audio: Option<AudioSource>,
+}
+
+impl RecordOptions {
+    pub fn resolve(config: &CaptureConfig, args: &RecordArgs) -> Result<Self, CliError> {
+        let (action, start_args) = match &args.action {
+            RecordAction::Start(a) => (RecordActionKind::Start, Some(a)),
+            RecordAction::Stop => (RecordActionKind::Stop, None),
+            RecordAction::Toggle(a) => (RecordActionKind::Toggle, Some(a)),
+        };
+
+        let preset = match start_args.and_then(|a| a.preset.as_deref()) {
+            Some(raw) => VideoPreset::parse(raw).ok_or_else(|| {
+                CliError(format!(
+                    "--preset: unrecognized preset {raw:?} (expected hevc, av1, or h264)"
+                ))
+            })?,
+            None => config.video_preset,
+        };
+
+        let audio = match start_args.and_then(|a| a.audio.as_deref()) {
+            Some(raw) => Some(AudioSource::parse(raw).ok_or_else(|| {
+                CliError(format!(
+                    "--audio: unrecognized source {raw:?} (expected mic, system, or both)"
+                ))
+            })?),
+            None => None,
+        };
+
+        Ok(RecordOptions {
+            action,
+            preset,
+            audio,
+        })
+    }
+
+    /// The `options` map for `StartRecording`'s `a{sv}` argument — same
+    /// defensive-insert shape as [`CaptureOptions::to_dbus_options`].
+    pub fn to_dbus_options(&self) -> HashMap<String, OwnedValue> {
+        let mut options = HashMap::new();
+        options.insert(
+            "preset".to_string(),
+            OwnedValue::from(fixed_str(self.preset.as_str())),
+        );
+        if let Some(audio) = self.audio {
+            options.insert(
+                "audio".to_string(),
+                OwnedValue::from(fixed_str(audio.as_str())),
+            );
+        }
+        options
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shot(mutate: impl FnOnce(&mut ShotArgs)) -> ShotArgs {
+        let mut args = ShotArgs::default();
+        mutate(&mut args);
+        args
+    }
+
+    // -- ShotKind / geometry resolution --------------------------------
+
+    #[test]
+    fn no_target_flag_defaults_to_fullscreen() {
+        let (kind, geometry) = resolve_shot_kind(&ShotArgs::default()).unwrap();
+        assert_eq!(kind, ShotKind::Fullscreen);
+        assert_eq!(geometry, None);
+    }
+
+    #[test]
+    fn explicit_fullscreen() {
+        let args = shot(|a| a.fullscreen = true);
+        let (kind, _) = resolve_shot_kind(&args).unwrap();
+        assert_eq!(kind, ShotKind::Fullscreen);
+    }
+
+    #[test]
+    fn region_without_geometry_is_interactive() {
+        let args = shot(|a| a.region = true);
+        let (kind, geometry) = resolve_shot_kind(&args).unwrap();
+        assert_eq!(kind, ShotKind::Region);
+        assert_eq!(geometry, None);
+    }
+
+    #[test]
+    fn region_with_geometry_skips_the_overlay() {
+        let args = shot(|a| {
+            a.region = true;
+            a.geometry = Some("600x450+100+100".to_string());
+        });
+        let (kind, geometry) = resolve_shot_kind(&args).unwrap();
+        assert_eq!(kind, ShotKind::Region);
+        assert_eq!(
+            geometry,
+            Some(Geometry {
+                width: 600,
+                height: 450,
+                x: 100,
+                y: 100
+            })
+        );
+    }
+
+    #[test]
+    fn window_kind() {
+        let args = shot(|a| a.window = true);
+        let (kind, _) = resolve_shot_kind(&args).unwrap();
+        assert_eq!(kind, ShotKind::Window);
+    }
+
+    #[test]
+    fn fullscreen_and_region_together_is_an_error() {
+        let args = shot(|a| {
+            a.fullscreen = true;
+            a.region = true;
+        });
+        assert!(resolve_shot_kind(&args).is_err());
+    }
+
+    #[test]
+    fn geometry_without_region_is_an_error() {
+        // Simulates a `ShotArgs` built directly (bypassing clap's own
+        // `requires = "region"` enforcement) — the pure resolver must
+        // still catch it.
+        let args = shot(|a| a.geometry = Some("100x100+0+0".to_string()));
+        assert!(resolve_shot_kind(&args).is_err());
+    }
+
+    #[test]
+    fn geometry_parses_negative_offsets() {
+        let g = Geometry::parse("800x600+-50+-30").unwrap();
+        assert_eq!(
+            g,
+            Geometry {
+                width: 800,
+                height: 600,
+                x: -50,
+                y: -30
+            }
+        );
+    }
+
+    #[test]
+    fn geometry_rejects_zero_dimensions() {
+        assert!(Geometry::parse("0x600+0+0").is_err());
+        assert!(Geometry::parse("600x0+0+0").is_err());
+    }
+
+    #[test]
+    fn geometry_rejects_garbage() {
+        assert!(Geometry::parse("not-a-geometry").is_err());
+        assert!(Geometry::parse("600x450").is_err());
+    }
+
+    // -- CaptureOptions::resolve precedence ------------------------------
+
+    #[test]
+    fn capture_options_default_to_config_when_no_flags_given() {
+        let config = CaptureConfig::default();
+        let options = CaptureOptions::resolve(&config, &ShotArgs::default()).unwrap();
+        assert_eq!(options.format, config.image_format);
+        assert_eq!(options.delay, config.delay);
+        assert_eq!(options.cursor, config.cursor);
+        assert_eq!(options.copy, config.copy);
+        assert_eq!(options.toast, config.toasts);
+        assert_eq!(options.output_dir, None);
+        assert!(!options.no_daemon);
+    }
+
+    #[test]
+    fn flags_override_config() {
+        // Every field below already matches `CaptureConfig::default()` —
+        // spelled out anyway so the "flags win" assertions read against
+        // concrete values rather than an opaque `default()` call.
+        let config = CaptureConfig::default();
+        assert_eq!(config.image_format, ImageFormat::Webp);
+        assert_eq!(config.delay, 0);
+        assert!(config.cursor);
+        assert!(config.copy);
+        assert!(config.toasts);
+
+        let args = shot(|a| {
+            a.format = Some("png".to_string());
+            a.delay = Some(5);
+            a.no_cursor = true;
+            a.no_copy = true;
+            a.no_toast = true;
+            a.output = Some(PathBuf::from("/tmp/shots"));
+        });
+
+        let options = CaptureOptions::resolve(&config, &args).unwrap();
+        assert_eq!(options.format, ImageFormat::Png);
+        assert_eq!(options.delay, 5);
+        assert!(!options.cursor);
+        assert!(!options.copy);
+        assert!(!options.toast);
+        assert_eq!(options.output_dir, Some(PathBuf::from("/tmp/shots")));
+    }
+
+    #[test]
+    fn cursor_flag_overrides_a_config_default_of_false() {
+        let config = CaptureConfig {
+            cursor: false,
+            ..CaptureConfig::default()
+        };
+        let args = shot(|a| a.cursor = true);
+        let options = CaptureOptions::resolve(&config, &args).unwrap();
+        assert!(
+            options.cursor,
+            "--cursor must win over a false config default"
+        );
+    }
+
+    #[test]
+    fn unrecognized_format_flag_is_an_error() {
+        let config = CaptureConfig::default();
+        let args = shot(|a| a.format = Some("jpeg".to_string()));
+        assert!(CaptureOptions::resolve(&config, &args).is_err());
+    }
+
+    #[test]
+    fn output_dir_falls_back_to_config_save_dir() {
+        let config = CaptureConfig {
+            save_dir: Some(PathBuf::from("/home/jordan/Pictures/Screenshots")),
+            ..CaptureConfig::default()
+        };
+        let options = CaptureOptions::resolve(&config, &ShotArgs::default()).unwrap();
+        assert_eq!(
+            options.output_dir,
+            Some(PathBuf::from("/home/jordan/Pictures/Screenshots"))
+        );
+    }
+
+    // -- RecordOptions::resolve ------------------------------------------
+
+    #[test]
+    fn record_start_defaults_to_config_preset_and_no_audio() {
+        let config = CaptureConfig::default();
+        assert_eq!(config.video_preset, VideoPreset::Hevc);
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs::default()),
+        };
+        let options = RecordOptions::resolve(&config, &args).unwrap();
+        assert_eq!(options.action, RecordActionKind::Start);
+        assert_eq!(options.preset, VideoPreset::Hevc);
+        assert_eq!(options.audio, None);
+    }
+
+    #[test]
+    fn record_start_flags_override_config() {
+        let config = CaptureConfig::default();
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs {
+                preset: Some("av1".to_string()),
+                audio: Some("both".to_string()),
+            }),
+        };
+        let options = RecordOptions::resolve(&config, &args).unwrap();
+        assert_eq!(options.preset, VideoPreset::Av1);
+        assert_eq!(options.audio, Some(AudioSource::Both));
+    }
+
+    #[test]
+    fn record_stop_carries_no_preset_or_audio_override() {
+        let config = CaptureConfig {
+            video_preset: VideoPreset::H264,
+            ..CaptureConfig::default()
+        };
+        let args = RecordArgs {
+            action: RecordAction::Stop,
+        };
+        let options = RecordOptions::resolve(&config, &args).unwrap();
+        assert_eq!(options.action, RecordActionKind::Stop);
+        assert_eq!(options.preset, VideoPreset::H264);
+        assert_eq!(options.audio, None);
+    }
+
+    #[test]
+    fn unrecognized_preset_is_an_error() {
+        let config = CaptureConfig::default();
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs {
+                preset: Some("prores".to_string()),
+                audio: None,
+            }),
+        };
+        assert!(RecordOptions::resolve(&config, &args).is_err());
+    }
+
+    #[test]
+    fn unrecognized_audio_source_is_an_error() {
+        let config = CaptureConfig::default();
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs {
+                preset: None,
+                audio: Some("bluetooth".to_string()),
+            }),
+        };
+        assert!(RecordOptions::resolve(&config, &args).is_err());
+    }
+
+    // -- a{sv} option maps --------------------------------------------------
+
+    #[test]
+    fn capture_options_to_dbus_options_carries_the_resolved_values() {
+        let config = CaptureConfig::default();
+        let args = shot(|a| {
+            a.region = true;
+            a.geometry = Some("600x450+100+100".to_string());
+        });
+        let options = CaptureOptions::resolve(&config, &args).unwrap();
+        let map = options.to_dbus_options();
+
+        assert_eq!(String::try_from(map["format"].clone()).unwrap(), "webp");
+        assert_eq!(
+            bool::try_from(map["cursor"].clone()).unwrap(),
+            options.cursor
+        );
+        assert_eq!(bool::try_from(map["copy"].clone()).unwrap(), options.copy);
+        assert_eq!(
+            String::try_from(map["geometry"].clone()).unwrap(),
+            "600x450+100+100"
+        );
+        assert!(!map.contains_key("output"), "no --output was given");
+    }
+
+    #[test]
+    fn record_options_to_dbus_options_omits_audio_when_not_given() {
+        let config = CaptureConfig::default();
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs::default()),
+        };
+        let options = RecordOptions::resolve(&config, &args).unwrap();
+        let map = options.to_dbus_options();
+
+        assert_eq!(String::try_from(map["preset"].clone()).unwrap(), "hevc");
+        assert!(!map.contains_key("audio"));
+    }
+
+    #[test]
+    fn record_options_to_dbus_options_carries_audio_when_given() {
+        let config = CaptureConfig::default();
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs {
+                preset: None,
+                audio: Some("system".to_string()),
+            }),
+        };
+        let options = RecordOptions::resolve(&config, &args).unwrap();
+        let map = options.to_dbus_options();
+        assert_eq!(String::try_from(map["audio"].clone()).unwrap(), "system");
+    }
+
+    // -- WindowAction::dbus_mode ------------------------------------------
+
+    #[test]
+    fn window_mode_defaults_to_main() {
+        assert_eq!(WindowAction::dbus_mode(None), "main");
+    }
+
+    #[test]
+    fn window_mode_edit_carries_the_path() {
+        let action = WindowAction::Edit {
+            path: PathBuf::from("/home/jordan/Pictures/Captures/shot.webp"),
+        };
+        assert_eq!(
+            WindowAction::dbus_mode(Some(&action)),
+            "edit:/home/jordan/Pictures/Captures/shot.webp"
+        );
+    }
+
+    // -- clap wiring sanity ------------------------------------------------
+
+    /// Not a resolution test — a guard that the derive macro actually
+    /// builds a valid parser (a common way to break `clap::Args`/
+    /// `clap::Subcommand` derives is a conflicting attribute that only
+    /// fails at `Command::debug_assert`'s internal validation, not at
+    /// plain `cargo build`).
+    #[test]
+    fn the_clap_command_graph_is_internally_consistent() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_a_representative_invocation() {
+        let cli = Cli::parse_from([
+            "saola-capture",
+            "shot",
+            "--region",
+            "--geometry",
+            "600x450+100+100",
+            "--no-cursor",
+            "--format",
+            "png",
+        ]);
+        let Command::Shot(args) = cli.command else {
+            panic!("expected the shot subcommand");
+        };
+        assert!(args.region);
+        assert_eq!(args.geometry.as_deref(), Some("600x450+100+100"));
+        assert!(args.no_cursor);
+        assert_eq!(args.format.as_deref(), Some("png"));
+    }
+}

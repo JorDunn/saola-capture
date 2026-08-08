@@ -1,0 +1,242 @@
+[package]
+name = "saola-capture"
+version = "0.1.0-dev"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Survey — 2026-08-08 (Stage 1). Version line and feature set verified against
+# `~/Developer/saola-panel/Cargo.toml` and `~/Developer/saola-lockscreen/Cargo.toml`
+# (both `iced = { version = "0.14", features = ["tokio", "svg", "image", "advanced"] }`)
+# — same four features apply here for the same reasons (`tokio`: the daemon and window
+# processes' one runtime, shared with zbus per the sibling rule; `svg`: Lucide icon
+# assets via `src/icons.rs`; `image`: raster decode for the flash/overlay frozen-frame
+# background and thumbnails; `advanced`: `iced::advanced` for any custom-widget needs).
+# `wayland` (present in PLAN.md's candidate list) is **not** listed explicitly: it is
+# already in iced 0.14's default feature set (`default = [wgpu, tiny-skia, crisp,
+# web-colors, thread-pool, linux-theme-detection, x11, wayland]`, verified via
+# `cargo info iced`), so naming it again would be a no-op — the siblings omit it for the
+# same reason. `canvas` is added here and is **not** in either sibling's feature list —
+# this crate is the first to need it: Stage 13's annotation editor draws over the
+# screenshot with `iced::widget::canvas` (crop/arrow/rect/ellipse/freehand tools), which
+# the panel and lockscreen never do.
+iced = { version = "0.14", features = ["tokio", "svg", "image", "advanced", "canvas"] }
+# Layer-shell binding for iced, waycrate/exwlshelleventloop, same version line as the
+# panel (`iced_layershell = "0.19"`, resolves to 0.19.1). Owns every daemon-side surface
+# (selection overlay, flash, toast stack, optional recording chip) per Architecture.
+iced_layershell = "0.19"
+# `tag` and `version` must move together (cargo errors if they disagree — the same
+# footgun-guard the panel's Cargo.toml documents). Pinned to the panel's current tag,
+# `saola-theme-v0.5.0` (verified live 2026-08-08: `git ls-remote --tags` shows the tag,
+# and `crates/saola-theme/Cargo.toml` inside it reports `version = "0.5.0"`, matching
+# below). Never `branch = "main"` — see CLAUDE.md Design language.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.5.0", version = "0.5.0" }
+# D-Bus. `default-features = false` drops zbus's default `async-io` runtime; `tokio`
+# makes it share the one runtime this crate ever spins up — iced's `tokio` feature
+# builds it for the daemon/window processes (same teaching note as the panel's
+# Cargo.toml); the CLI-verb process (thin D-Bus client, no iced) will construct its own
+# `tokio::runtime::Runtime` directly in Stage 3 — still the *only* runtime in that
+# process, per CLAUDE.md's "one runtime" rule. Never a second async runtime anywhere.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+# niri IPC, same exact-pin posture as the panel's Cargo.toml essay: niri-ipc tracks the
+# compositor version (installed: niri 26.04, `niri msg --json version`) and is
+# explicitly *not* Rust-semver-stable across releases, so the crate's own docs say to
+# pin exact. `=26.4.0` matches the panel's current pin. Default features only (the
+# `clap`/`json-schema` features are for niri's own CLI, not wanted here).
+#
+# Surprise worth flagging (not a Stage 1 blocker — the panel already accepts this same
+# posture): niri-ipc is licensed `GPL-3.0-or-later` (verified from the crate's own
+# `Cargo.toml`, not just crates.io metadata), unlike every other dependency here. Rust
+# static-links by default, so a distributed saola-capture binary is a combined work
+# under GPL-3.0-or-later's terms for that binary even though this repo's own source
+# stays `MIT OR Apache-2.0`. This is an established sibling-project posture, not a new
+# decision made here — flagged for Jordan's awareness, not re-litigated.
+niri-ipc = "=26.4.0"
+# Wayland core client bindings — `capture/screencopy.rs`'s direct `zwlr_screencopy_v1`
+# path (Architecture: screenshots go straight to the compositor protocol, not through
+# iced/iced_layershell, which only owns layer-shell surfaces). Version line per
+# PLAN.md; resolves to 0.31.15.
+wayland-client = "0.31"
+# Generated bindings for the *stable/official* Wayland protocol extensions
+# (`wl_shm`/`wl_output`-adjacent pieces the wlr protocols below build on).
+# `client` feature only (no `server` — this app is a Wayland client, never a
+# compositor). Resolves to 0.32.13.
+wayland-protocols = { version = "0.32", features = ["client"] }
+# Generated bindings for the wlroots protocol extensions. **The screencopy feature
+# flag, verified 2026-08-08**: there is no per-protocol feature (`screencopy` is not a
+# cargo feature at all) — every protocol module (`screencopy::v1`, `layer_shell::v1`,
+# `foreign_toplevel::v1`, `data_control::v1`, …) is compiled unconditionally; the
+# crate's *only* features are `client` and `server`, gating whether the `client`/
+# `server` submodule (and its `wayland-client`/`wayland-server` dependency) is
+# generated at all (confirmed by reading `src/lib.rs` and `Cargo.toml` in the
+# downloaded crate source, not inferred). `client` is what this crate needs —
+# `wayland_protocols_wlr::screencopy::v1::client::...` for `screencopy.rs`, and the
+# same crate/feature covers `foreign_toplevel` if window-geometry capture (Stage 2/7)
+# ends up needing it. Resolves to 0.3.12.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# `~/.config/saola/capture.toml`. Survey, 2026-08-08 (Stage 4 — the KDL → TOML config
+# migration decided with Jordan; see CLAUDE.md's amendment). Same hand-walked-not-derived
+# posture as Stage 1's `kdl` pick it replaces: precise per-knob warnings, explicit code
+# reads better for CLAUDE.md's teaching-note rule than a one-shot `serde::Deserialize`
+# failure would. Options weighed:
+# - `toml` (this pick, resolves **0.9.12**) — exposes `toml::Table`/`Value` (a generic
+#   `Map<String, Value>` value tree with `.get`/`.as_str`/`.as_bool`/`.as_integer`, …)
+#   that `config.rs` walks by hand exactly like it walked `kdl::KdlDocument`; parsing
+#   into that generic tree does *not* require deriving `serde::Deserialize` on
+#   `CaptureConfig` itself, so the hand-walked posture survives the format swap
+#   unchanged. Its default features do pull in `serde` internally (that's how `Table`
+#   gets its own `Deserialize` impl) — that's `toml`'s implementation detail, not this
+#   crate deriving anything. **Picked specifically at the `0.9` line, not the newer
+#   `1.x` line** (`cargo add toml` alone resolves 1.1.4, verified live): `saola-theme`'s
+#   own `saola-tokens` crate already depends on `toml = "0.9"` (verified in its
+#   `Cargo.toml`, resolves 0.9.12) to parse its own token files, and that dependency is
+#   already compiled into this binary's tree regardless of what this crate does. Matching
+#   the same `0.9` line lets Cargo unify to the *exact same already-resolved* `toml`
+#   crate instance instead of building a second major version side by side — confirmed
+#   via `cargo tree -i toml`/`cargo tree -i toml_edit` before this pick: `toml_datetime
+#   0.7.5`, `toml_parser`, `toml_writer`, `winnow 0.7.15`, `serde_core`, `serde_spanned`
+#   were all *already* in `Cargo.lock` at the versions this pick resolves to, so adding
+#   `toml = "0.9"` here added zero net new crates to the dependency tree.
+# - `toml_edit` (0.25.x) — a format-preserving editor (`DocumentMut`, comments/whitespace
+#   round-tripped) with no `serde` dependency at all; its own `Table`-like walking API
+#   (`.get`/`.as_str`/`.as_bool`/`.as_integer`) is just as suitable for the hand-walked
+#   posture. Rejected: this module is a **read-only consumer** — it never writes
+#   `capture.toml` back out — so format preservation buys nothing, and `toml_edit` was
+#   already pulled in transitively as a *build-time-only* proc-macro dependency
+#   (`zbus_macros` → `proc-macro-crate` → `toml_edit`), not a runtime one; adding it as a
+#   second, unrelated runtime dependency use would be less justified than reusing the
+#   `toml` line `saola-theme` already establishes as a real (non-proc-macro) runtime dep.
+# - `basic-toml` — inspected its source directly: it only exposes `from_str<T:
+#   Deserialize>`/`to_string<T: Serialize>`, no generic `Value`/`Table` type at all.
+#   Using it would force deriving `serde::Deserialize` on `CaptureConfig`, which is
+#   exactly the one-shot-error, can't-name-the-bad-knob failure mode the hand-walked
+#   posture exists to avoid. Rejected outright, not a close call.
+# Default features (includes `serde`, `parse`, `display`, `std` — `serde` only for
+# `Table`/`Value`'s own internal `Deserialize`, per above; `display` is unused today but
+# not worth carving out for a single feature-list edit against an already-shared crate).
+toml = "0.9"
+# Raster decode/encode: screencopy buffer handling, PNG fallback, thumbnail generation
+# for the toast/history. Default features (all codecs) per PLAN.md's version pin;
+# resolves to 0.25.10.
+image = "0.25"
+# WebP survey, 2026-08-08 — the primary v0.1 image format (Architecture: "space-
+# efficient formats first: WebP for images"). `image` 0.25's own `WebPEncoder` only
+# does **lossless** VP8L encoding (verified directly in
+# `image-0.25.10/src/codecs/webp/encoder.rs`: "Right now only lossless encoding is
+# supported... If you need lossy encoding, you'll have to use libwebp"); lossless WebP
+# does not deliver the size win the format is chosen for, so `image` alone is not
+# enough.
+#
+# Options considered:
+# - `webp` (this pick) — thin wrapper over `libwebp-sys`. `webp = "0.3"`'s own
+#   manifest asks for `libwebp-sys = "0.9.3"` (a caret range), which is what actually
+#   resolves in `Cargo.lock` here: **0.9.6**, not the newer 0.14.x line inspected first
+#   during this survey — checked separately since the two behave differently. 0.9.6's
+#   `build.rs` (read directly) always vendors and compiles libwebp's C sources into the
+#   binary via the `cc` crate — there is no `system-dylib`-style escape hatch at this
+#   version (that feature was added later, in the 0.14.x line) — so a build-time C
+#   compiler is unconditionally required here, which is exactly the "heavyweight dep /
+#   C toolchain" shape CLAUDE.md says needs strong justification. Justification: no
+#   pure-Rust lossy WebP encoder exists on crates.io as of this survey, and the result
+#   is fully static — the shipped binary needs no runtime `libwebp.so`, so the AUR
+#   `PKGBUILD` gains a `makedepends` C toolchain entry, not a `depends` entry
+#   (base-devel is a standard Arch dev-machine assumption; confirmed working end to end
+#   — `cargo build` in this repo compiled libwebp's vendored C sources without issue).
+# - Spawning `cwebp` as an external CLI (mirroring the `ffmpeg` boundary) — rejected:
+#   this app already has exactly one sanctioned external-CLI runtime dependency
+#   (ffmpeg, a *binding* Boundary with its own clean-error posture); adding a second
+#   spawned binary for the hot "every screenshot" path means a second
+#   `sudo pacman -S ...` line for Jordan and a second "what if it's missing" error
+#   surface, for a case where an in-process crate exists and works. ffmpeg earns the
+#   external-CLI carve-out because linking libav is explicitly forbidden by Boundaries;
+#   no such rule exists for WebP.
+# `img` (default) feature pulls in the `image` crate (already a direct dependency
+# above) purely for its buffer types at the wrapper boundary — no new codec surface.
+webp = "0.3"
+# Clipboard survey, 2026-08-08. Two options per PLAN.md:
+# - `wl-clipboard-rs` (this pick) — a pure-Rust implementation of the wayland
+#   data-control clipboard protocol (verified in the downloaded source: only
+#   `libc`/`log`/`os_pipe`/`rustix` plus the `wayland-client`/`wayland-backend` stack
+#   this crate already depends on for screencopy — no new protocol dependency, no
+#   external binary, no C toolchain).
+# - Spawning `wl-copy`/`wl-paste` (from the `wl-clipboard` package) — rejected: **not
+#   currently installed on Jordan's machine** (verified live, PLAN.md Context), so this
+#   would add a third `sudo pacman -S ...` line (after ffmpeg, and unlike WebP where an
+#   in-process crate avoided the question entirely) for a feature (`--copy`, on by
+#   default) meant to be automatic on every capture — a missing binary silently
+#   breaking clipboard on every screenshot is exactly the "absent service must degrade
+#   gracefully, not surprise" shape CLAUDE.md warns about, better avoided than handled.
+# Default features (neither `dlopen` nor `native_lib` — those only choose how
+# `wayland-backend` links to the system wayland libs; this crate's other wayland
+# dependencies already settle that via cargo's feature unification).
+wl-clipboard-rs = "0.9"
+# CLI arg parser survey, 2026-08-08. Architecture: "CLI is a first-class scriptable
+# interface" — four subcommands (`shot`, `record`, `pick-color`, `open`) with real flag
+# surfaces (`--fullscreen`/`--region`/`--geometry`/`--window`, `--format`, `--output`,
+# `--delay`, `--cursor`, `--copy`/`--no-copy`, `--no-toast`, `--preset`, `--audio`,
+# `start`/`stop`/`toggle` on `record`), each needing correct `--help` text and clean
+# error messages since scripts and Jordan's own keybinds both depend on this surface
+# behaving predictably. Options weighed under the light-deps rule:
+# - `clap` (this pick, `derive` feature) — `cargo tree` with `--features derive` in a
+#   scratch crate resolves 14 real crates (anstream/anstyle family, clap_lex, strsim,
+#   clap_derive + syn/quote/proc-macro2/unicode-ident/heck for the derive macro).
+#   The proc-macro chain (syn/quote/proc-macro2) is **not new weight** in this
+#   particular tree: zbus's own proc macros (`#[dbus_interface]` etc., used by
+#   `src/dbus.rs` from Stage 3 on) and wayland-scanner's protocol-code-generation
+#   macros already pull the same three crates in. Net new compile cost is small
+#   relative to what derive buys: generated `--help`/`--version`/subcommand dispatch/
+#   conflicting-flag validation for a surface with this many flags across four
+#   subcommands, instead of hand-writing and hand-testing all of it.
+# - `lexopt` / `pico-args` — genuinely tiny (lexopt: zero dependencies; pico-args:
+#   zero dependencies), the right choice for a tool with one or two flags. Rejected
+#   here specifically because of the *subcommand* shape (four verbs, `record` nested
+#   under `start|stop|toggle`) plus config-file flag precedence (Stage 3: CLI flags
+#   override `capture.kdl` — needs `Option<T>` "was this flag given" semantics clap's
+#   derive gives for free via `Option` fields): both would mean hand-rolling a small
+#   argument-dispatch framework this app doesn't need to own.
+clap = { version = "4", features = ["derive"] }
+# Recording pipeline survey, 2026-08-08 — **not added as a dependency yet**, per
+# PLAN.md Stage 1 (Stage 9 adds it once Stage 2's shm/dmabuf evidence is in hand).
+# Latest: `pipewire` 0.10.0 (rust-version 1.80), companion `spa` crate carries the SPA
+# pod/type system. Version-gated compositor-feature cargo features
+# (`v0_3_32` .. `v1_0_0`, cumulative) select which PipeWire API surface is available —
+# Jordan's machine runs PipeWire 1.6.8 (PLAN.md Context), well past `v1_0_0`, so the
+# newest feature gate is available once added. `pipewire-sys` links the *system*
+# `libpipewire` via `system_deps`/pkg-config and generates bindings with `bindgen`
+# (verified in its `build.rs`) — a build-time `libclang` + pipewire dev-headers
+# requirement, no vendored C compilation (unlike the WebP case above: this links
+# against the already-live system PipeWire, it doesn't bundle a copy). Stage 9 records
+# the exact feature-gate pin and any SPA pod gotchas found once real negotiation code
+# exists.
+# Stage 3, 2026-08-08 — `tokio` as a **direct** dependency, not just the transitive copy
+# iced's/zbus's own `tokio` cargo features already pull in. Architecture's CLI-verb
+# process is a plain async function with no iced event loop (`daemon`/`window` get a
+# runtime for free from iced's `tokio` feature; `shot`/`record`/`pick-color`/`open`
+# don't run iced at all), so `main.rs::run_async` constructs its own
+# `tokio::runtime::Runtime` directly — the Cargo.toml essay on `zbus` above already
+# flags this as the one place this crate builds a runtime by hand, and CLAUDE.md's
+# "one runtime" rule is about never running two *different* async runtime crates in
+# one process, not about a single `tokio::Runtime` construction — see `run_async`'s own
+# doc comment. `default-features = false` + an explicit list, mirroring
+# saola-session's essay (the closest sibling precedent: it also has to construct its
+# own runtime rather than borrowing iced's):
+#   - `rt-multi-thread`: `Runtime::new()` specifically needs this (not just `rt`) —
+#     the current-thread builder is a separate, more verbose API this crate has no
+#     reason to reach for over the one-line `Runtime::new()`.
+#   - `macros`: `tokio::select!` in the daemon's SIGTERM/SIGINT wait
+#     (`main.rs::shutdown_signal_stream`).
+#   - `signal`: `tokio::signal::unix::{signal, SignalKind}` for that same wait.
+#   - `time`: `tokio::time::sleep` in `dbus::ensure_daemon_running`'s bounded poll for
+#     a freshly spawned daemon to claim the bus name.
+# `net`/`sync`/`process` are deliberately not listed: zbus's own `tokio` feature (see
+# above) already pulls whatever socket I/O it needs and Cargo unifies features across
+# the graph (a second declaration here would be a no-op, not a smaller build); nothing
+# in this crate yet needs `tokio::sync` channels or `tokio::process` (the daemon is
+# spawned with `std::process::Command`, deliberately fire-and-forget — see
+# `dbus::spawn_daemon_detached`'s doc comment).
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+] }
