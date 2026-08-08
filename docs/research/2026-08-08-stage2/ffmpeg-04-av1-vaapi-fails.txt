@@ -1,0 +1,27 @@
+=== TEST C: av1_vaapi (expected to FAIL — 680M has no AV1 encode entrypoint) ===
+$ ... -vf "format=nv12,hwupload" -c:v av1_vaapi
+[vf#0:0 @ 0x55fc51e49300] Task finished with error code: -38 (Function not implemented)
+[vf#0:0 @ 0x55fc51e49300] Terminating thread with return code -38 (Function not implemented)
+[vost#0:0/av1_vaapi @ 0x55fc51e430c0] [enc:av1_vaapi @ 0x55fc51e43580] Could not open encoder before EOF
+[vost#0:0/av1_vaapi @ 0x55fc51e430c0] Task finished with error code: -22 (Invalid argument)
+[vost#0:0/av1_vaapi @ 0x55fc51e430c0] Terminating thread with return code -22 (Invalid argument)
+[out#0/matroska @ 0x55fc51e42d40] Nothing was written into output file, because at least one of its streams received no packets.
+frame=    0 fps=0.0 q=0.0 Lsize=       0KiB time=N/A bitrate=N/A speed=N/A elapsed=0:00:00.02    
+Conversion failed!
+exit=0
+
+=== vainfo entrypoints for AV1 (decode-only proof) ===
+      VAProfileAV1Profile0            :	VAEntrypointVLD
+=== TEST C2: av1_vaapi verbose — the exact refusal ===
+[vost#0:0/av1_vaapi @ 0x557dc2a3ff40] Created video stream from input stream 0:0
+  Stream #0:0 -> #0:0 (rawvideo (native) -> av1 (av1_vaapi))
+[vost#0:0/av1_vaapi @ 0x557dc2a3ff40] Starting thread...
+[vost#0:0/av1_vaapi @ 0x557dc2a3ff40] [enc:av1_vaapi @ 0x557dc2a40400] Using input frames context (format vaapi) with av1_vaapi encoder.
+[av1_vaapi @ 0x557dc2a40480] Input surface format is nv12.
+[av1_vaapi @ 0x557dc2a40480] Using VAAPI profile VAProfileAV1Profile0 (32).
+[av1_vaapi @ 0x557dc2a40480] No usable encoding entrypoint found for profile VAProfileAV1Profile0 (32).
+[vost#0:0/av1_vaapi @ 0x557dc2a3ff40] [enc:av1_vaapi @ 0x557dc2a40400] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+[vf#0:0 @ 0x557dc2a46180] Error sending frames to consumers: Function not implemented
+[vf#0:0 @ 0x557dc2a46180] Task finished with error code: -38 (Function not implemented)
+[vost#0:0/av1_vaapi @ 0x557dc2a3ff40] [enc:av1_vaapi @ 0x557dc2a40400] Encoder thread received EOF
+[vost#0:0/av1_vaapi @ 0x557dc2a3ff40] [enc:av1_vaapi @ 0x557dc2a40400] Could not open encoder before EOF

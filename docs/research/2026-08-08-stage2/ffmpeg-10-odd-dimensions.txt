@@ -1,0 +1,21 @@
+=== odd-dimension encode: window casts negotiate e.g. 2507x1457 (both odd) ===
+--- (A) straight through, no fixup:
+  Stream #0:0 -> #0:0 (rawvideo (native) -> hevc (hevc_vaapi))
+  Stream #0:0: Video: hevc (Main), nv12(tv, bt709/unknown/unknown, progressive), 2507x1457, q=2-31, 20000 kb/s, 30 fps, 1k tbn
+[vist#0:0/rawvideo @ 0x563ebb8a87c0] [dec:rawvideo @ 0x563ebb8d8500] Error submitting packet to decoder: Invalid argument
+frame=   29 fps=0.0 q=-0.0 Lsize=    2664KiB time=00:00:00.96 bitrate=22578.2kbits/s speed=2.55x elapsed=0:00:00.37    
+    output: 2728198 bytes
+hevc,2508,1458
+
+--- (B) with an explicit crop/pad to even dimensions (the safe recipe):
+[vist#0:0/rawvideo @ 0x560223c9e840] [dec:rawvideo @ 0x560223cceb00] Error submitting packet to decoder: Invalid argument
+frame=   29 fps=0.0 q=-0.0 Lsize=    2741KiB time=00:00:00.96 bitrate=23232.1kbits/s speed=2.57x elapsed=0:00:00.37    
+hevc,2506,1456
+
+--- (C) same odd size through libsvtav1 (software AV1):
+frame=    1 fps=1.0 q=17.0 size=       1KiB time=00:00:00.00 bitrate=N/A speed=   0x elapsed=0:00:01.00    [out#0/matroska @ 0x5604537ed700] video:2854KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.025456%
+frame=   29 fps= 24 q=30.0 Lsize=    2855KiB time=00:00:00.93 bitrate=25057.9kbits/s speed=0.778x elapsed=0:00:01.20    
+av1,2507,1457
+
+=== full decode check of the primary hevc_vaapi output (no corruption) ===
+   decode exit=0 (blank above = clean)

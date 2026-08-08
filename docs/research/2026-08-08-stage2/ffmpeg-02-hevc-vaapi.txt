@@ -1,0 +1,27 @@
+=== TEST A: rawvideo bgr0 on stdin -> format=nv12,hwupload -> hevc_vaapi -> MKV ===
+$ cat raw-2560x1600-bgr0.raw | ffmpeg -f rawvideo -pixel_format bgr0 -video_size 2560x1600 -framerate 60 -i pipe:0 -vaapi_device /dev/dri/renderD128 -vf "format=nv12,hwupload" -c:v hevc_vaapi -b:v 20M -f matroska out-hevc.mkv
+Input #0, rawvideo, from 'pipe:0':
+  Duration: N/A, start: 0.000000, bitrate: 7864320 kb/s
+  Stream #0:0: Video: rawvideo (BGR[0] / 0x524742), bgr0, 2560x1600, 7864320 kb/s, 60 tbr, 60 tbn
+Stream mapping:
+  Stream #0:0 -> #0:0 (rawvideo (native) -> hevc (hevc_vaapi))
+Output #0, matroska, to 'out-hevc.mkv':
+  Metadata:
+    encoder         : Lavf63.1.100
+  Stream #0:0: Video: hevc (Main), nv12(tv, progressive), 2560x1600, q=2-31, 20000 kb/s, 60 fps, 1k tbn
+    Metadata:
+      encoder         : Lavc63.1.100 hevc_vaapi
+frame=   60 fps=0.0 q=-0.0 size=       1KiB time=00:00:01.00 bitrate=   5.4kbits/s speed=   2x elapsed=0:00:00.50    [out#0/matroska @ 0x557ba9ba5c40] video:5686KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.029095%
+frame=  120 fps=0.0 q=-0.0 Lsize=    5687KiB time=00:00:02.00 bitrate=23295.7kbits/s speed=2.11x elapsed=0:00:00.94    
+WALL: 1.07s  for 120 frames @2560x1600 (2.00s of video)
+
+-- ffprobe out-hevc.mkv --
+Input #0, matroska,webm, from 'out-hevc.mkv':
+  Metadata:
+    ENCODER         : Lavf63.1.100
+  Duration: 00:00:02.00, start: 0.000000, bitrate: 23295 kb/s
+  Stream #0:0: Video: hevc (Main), yuv420p(tv, progressive), 2560x1600, 60 fps, 60 tbr, 1k tbn
+    Metadata:
+      ENCODER         : Lavc63.1.100 hevc_vaapi
+      DURATION        : 00:00:02.000000000
+-rw-r--r-- 1 jordan jordan 5823919 Aug  8 14:03 out-hevc.mkv

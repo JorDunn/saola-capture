@@ -1,0 +1,47 @@
+=== nested niri layers with the ON-DEMAND, output-targeted overlay mapped ===
+Output "winit":
+  Background layer: (empty)
+
+  Bottom layer: (empty)
+
+  Top layer: (empty)
+
+  Overlay layer:
+    Surface:
+      Namespace: "saola-capture-lstest-overlay"
+      Keyboard interactivity: exclusive
+
+
+=== is it rendering? (view calls) ===
+36
+
+=== inject drag + Escape ===
+  motion 7 -> (530,582)
+  motion 8 -> (577,631)
+  release left
+  key ESC press
+  key ESC release
+inject: done
+
+=== lstest log ===
+== lstest: iced_layershell overlay viability probe
+   WAYLAND_DISPLAY = Ok("wayland-2")
+   start_mode = Background + on-demand NewLayerShell
+[boot] loading frozen frame from /tmp/claude-1000/-home-jordan-Developer-saola-capture/23479e85-b6aa-4c8e-a055-02ab53cdd73a/scratchpad/nested-frame.png
+[boot] frozen frame present: true
+[boot] requesting on-demand overlay on output "winit"
+[boot] -> surface Id Id(1)
+[mouse] press Left at Some(Point { x: 206.2461, y: 242.2461 })
+[mouse] drag motion #1 -> Point { x: 252.30469, y: 290.29688 }
+[mouse] drag motion #2 -> Point { x: 298.35938, y: 339.34766 }
+[mouse] drag motion #3 -> Point { x: 345.41797, y: 387.39844 }
+[mouse] drag motion #4 -> Point { x: 391.47266, y: 436.4453 }
+[mouse] drag motion #5 -> Point { x: 437.52734, y: 485.4961 }
+[mouse] release Left at Some(Point { x: 577.6992, y: 631.64844 }); drag had 8 motion events; rect = Some((Point { x: 206.2461, y: 242.2461 }, Point { x: 577.6992, y: 631.64844 }))
+[key] pressed Named(Escape)
+[key] ESCAPE received on an Exclusive-keyboard layer surface
+=== REPORT
+  surfaces this process rendered views for: []
+  escape delivered to Exclusive surface: true
+  last selection rect: Some((Point { x: 206.2461, y: 242.2461 }, Point { x: 577.6992, y: 631.64844 }))
+  key events seen: 1

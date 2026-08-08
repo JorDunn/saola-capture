@@ -1,0 +1,98 @@
+=== CreateSession
+    session = /org/gnome/Mutter/ScreenCast/Session/u6
+=== RecordMonitor eDP-1 (cursor-mode 1 = embedded)
+    stream  = /org/gnome/Mutter/ScreenCast/Stream/u8
+=== monitoring PipeWireStreamAdded
+=== Start
+    PipeWireStreamAdded node id = 70
+=== niri msg casts (before consumer attaches)
+    Cast stream ID 8: (inactive)
+      Session ID: 6
+      Kind: PipeWire
+      Target: output "eDP-1"
+      PipeWire node ID: 70
+    
+
+=== pwprobe 70 dmabuf
+== pwprobe: node=70 mode=dmabuf  (libpipewire 1.6.8, headers 1.6.8)
+== offered SPA_PARAM_EnumFormat:
+    Object: size 240, type Spa:Pod:Object:Param:Format (262147), id Spa:Enum:ParamId:EnumFormat (3)
+      Prop: key Spa:Pod:Object:Param:Format:mediaType (1), flags 00000000
+        Id 2        (Spa:Enum:MediaType:video)
+      Prop: key Spa:Pod:Object:Param:Format:mediaSubtype (2), flags 00000000
+        Id 1        (Spa:Enum:MediaSubtype:raw)
+      Prop: key Spa:Pod:Object:Param:Format:Video:format (131073), flags 00000000
+        Id 8        (Spa:Enum:VideoFormat:BGRx)
+      Prop: key Spa:Pod:Object:Param:Format:Video:modifier (131074), flags 00000018
+        Choice: type Spa:Enum:Choice:Enum, flags 00000000 32 8
+          Long 0
+          Long 0
+      Prop: key Spa:Pod:Object:Param:Format:Video:size (131075), flags 00000000
+        Choice: type Spa:Enum:Choice:Range, flags 00000000 40 8
+          Rectangle 1920x1080
+          Rectangle 1x1
+          Rectangle 8192x8192
+      Prop: key Spa:Pod:Object:Param:Format:Video:framerate (131076), flags 00000000
+        Choice: type Spa:Enum:Choice:Range, flags 00000000 40 8
+          Fraction 60/1
+          Fraction 0/1
+          Fraction 1000/1
+[state] unconnected -> connecting
+== pw_stream_connect -> 0
+[state] connecting -> paused
+[format] NEGOTIATED SPA_PARAM_Format:
+     video/raw
+               format : (Id) BGRx
+             modifier : (Long) { 0, 0 }
+                 size : (Rectangle) 2560x1600
+            framerate : (Fraction) 0/1
+         maxFramerate : (Fraction) 60000/1000
+[format] parsed: format=BGRx size=2560x1600 framerate=0/1 modifier=0x0
+[buffers] replying with SPA_PARAM_Buffers dataType mask 0x8 (MemFd=0 MemPtr=0 DmaBuf=1) size=16384000 stride=10240
+[format] NEGOTIATED SPA_PARAM_Format:
+     video/raw
+               format : (Id) BGRx
+             modifier : (Long) 0
+                 size : (Rectangle) 2560x1600
+            framerate : (Fraction) 0/1
+         maxFramerate : (Fraction) 60000/1000
+[format] parsed: format=BGRx size=2560x1600 framerate=0/1 modifier=0x0
+[buffers] replying with SPA_PARAM_Buffers dataType mask 0x8 (MemFd=0 MemPtr=0 DmaBuf=1) size=16384000 stride=10240
+[state] paused -> streaming
+[frame 0] n_datas=1
+   data[0] type=3 (DmaBuf) fd=20 mapoffset=0 maxsize=1 data=(nil) chunk{offset=0 size=1 stride=10240}
+   dmabuf fd size (lseek END) = 16384000, want 16384000, mmap -> OK
+   DMA_BUF_IOCTL_SYNC(START|READ) -> 0 (ok)
+   px[0..3] (B G R X): [f3 de bf ff] [f5 df c0 ff] [f7 df c1 ff] [f8 df c1 ff] 
+   px at row 800 col 1280: [00 0a 0c ff]
+   non-black sample points: 4000 / 4000
+[frame 1] n_datas=1
+   data[0] type=3 (DmaBuf) fd=21 mapoffset=0 maxsize=1 data=(nil) chunk{offset=0 size=1 stride=10240}
+   dmabuf fd size (lseek END) = 16384000, want 16384000, mmap -> OK
+   DMA_BUF_IOCTL_SYNC(START|READ) -> 0 (ok)
+   px[0..3] (B G R X): [f3 de bf ff] [f5 df c0 ff] [f7 df c1 ff] [f8 df c1 ff] 
+   px at row 800 col 1280: [00 0a 0c ff]
+   non-black sample points: 4000 / 4000
+[frame 2] n_datas=1
+   data[0] type=3 (DmaBuf) fd=22 mapoffset=0 maxsize=1 data=(nil) chunk{offset=0 size=1 stride=10240}
+   dmabuf fd size (lseek END) = 16384000, want 16384000, mmap -> OK
+   DMA_BUF_IOCTL_SYNC(START|READ) -> 0 (ok)
+   px[0..3] (B G R X): [f3 de bf ff] [f5 df c0 ff] [f7 df c1 ff] [f8 df c1 ff] 
+   px at row 800 col 1280: [00 0a 0c ff]
+   non-black sample points: 4000 / 4000
+== RESULT: got_format=1 frames_received=10
+[state] streaming -> paused
+[param] id=4 -> NULL (cleared)
+[param] id=4 -> NULL (cleared)
+[state] paused -> unconnected
+
+=== niri msg casts (after consumer ran)
+    Cast stream ID 8: (inactive)
+      Session ID: 6
+      Kind: PipeWire
+      Target: output "eDP-1"
+      PipeWire node ID: 70
+    
+--- Stop session /org/gnome/Mutter/ScreenCast/Session/u6
+--- niri msg casts after teardown:
+    No screencasts.

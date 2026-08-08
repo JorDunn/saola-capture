@@ -1,0 +1,25 @@
+=== screencopy against the NESTED output (which has 'Transform: flipped vertically') ===
+   zwlr_screencopy_manager_v1 version = Some(3)
+   winit: mode 1238x1457 scale 2 transform 6
+== requesting capture, mode=output overlay_cursor=0 on winit
+   [event] linux_dmabuf fourcc=0x34325258 1238x1457
+   buffer(format=1 [Xrgb8888], width=1238, height=1457, stride=4952)
+   linux_dmabuf(fourcc=0x34325258 'XR24', width=1238, height=1457)
+   failed      = false
+   [event] flags = 0
+   [event] ready
+   flags  = Some(0)  (1 = y_invert)
+   ready  = true
+   failed = false
+   (0,0)      = (64, 64, 64, 255)
+   (0,h-1)    = (64, 64, 64, 255)
+
+=== grim in the nested compositor, for the frozen-frame background ===
+  Stream #0:0: Video: png, rgb24(pc, gbr/unknown/unknown), 1238x1457, 25 fps, 25 tbr, 25 tbn
+
+=== nested compositor globals (virtual input available for safe in-nest injection?) ===
+wl_seat v9 (name 40)
+zwlr_layer_shell_v1 v5 (name 6)
+zwlr_screencopy_manager_v1 v3 (name 32)
+zwlr_virtual_pointer_manager_v1 v2 (name 27)
+zwp_virtual_keyboard_manager_v1 v1 (name 26)

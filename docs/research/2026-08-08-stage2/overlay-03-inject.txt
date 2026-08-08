@@ -1,0 +1,17 @@
+inject: display=Ok("wayland-2") 825x971
+  virtual_pointer_manager=true virtual_keyboard_manager=true
+  got compositor keymap: format=1 size=35572
+  move to (206,242)
+  press left
+  motion 1 -> (252,290)
+  motion 2 -> (298,339)
+  motion 3 -> (345,387)
+  motion 4 -> (391,436)
+  motion 5 -> (437,485)
+  motion 6 -> (484,533)
+  motion 7 -> (530,582)
+  motion 8 -> (577,631)
+  release left
+  key ESC press
+  key ESC release
+inject: done

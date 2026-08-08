@@ -1,0 +1,16 @@
+=== nested niri, outputs before scaling ===
+Output "Smithay Winit Unknown" (winit)
+  Current mode: 1238x1457 @ 60.000 Hz (preferred)
+  Variable refresh rate: not supported
+  Physical size: unknown
+  Logical position: 0, 0
+  Logical size: 1238x1457
+  Scale: 1
+  Transform: flipped vertically
+  Available modes:
+    1238x1457@60.000 (current, custom, preferred)
+
+=== force scale 1.5 (Jordan's real panel is fractional; the winit output defaults to 1) ===
+  Current mode: 1238x1457 @ 60.000 Hz (preferred)
+  Logical size: 825x971
+  Scale: 1.5

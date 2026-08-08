@@ -1,0 +1,7 @@
+########## spatial clustering of the cursor-attributable diff (64px cells)
+  top 8 densest 64x64 cells (cellx,celly): count
+    cell (20, 14) -> 455 px  (physical origin 1280,896)
+    cell (0, 19) -> 34 px  (physical origin 0,1216)
+    cell (1, 19) -> 11 px  (physical origin 64,1216)
+  densest blob: 455 px, bbox x 1314..1334 y 912..946 (21x35)
+  sample pixel there: nocursor BGR=(0, 10, 12)  cursor BGR=(6, 15, 17)

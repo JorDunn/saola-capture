@@ -1,0 +1,31 @@
+=== FINDING: -f pulse is an infinite input; ffmpeg does NOT exit on stdin EOF.
+    The first attempt hung until killed. -shortest is required (plus a graceful
+    stop signal from the recorder). Re-running with -shortest:
+
+=== (1) rawvideo stdin (wallclock PTS) + -f pulse audio, -shortest ===
+[aist#1:0/pcm_s16le @ 0x5634bae5f3c0] Guessed Channel Layout: stereo
+[libopus @ 0x5634bae64ec0] Queue input is backward in time
+[aost#0:1/libopus @ 0x5634bae64600] Non-monotonic DTS; previous: 54, current: 48; changing to 54. This may result in incorrect timestamps in the output file.
+[libopus @ 0x5634bae64ec0] Queue input is backward in time
+    Last message repeated 1 times
+  (producer ran 120 frames at 30 fps = 4.00 s of real time)
+index=0
+codec_type=video
+start_time=0.000000
+duration=N/A
+index=1
+codec_type=audio
+start_time=0.000000
+duration=N/A
+=== (1a) pulse audio, DEFAULT timestamp handling (independent normalisation)
+    v: n=115 last_pts=3.917000 first_pts=0.000000
+    a: n=196 last_pts=3.909000, first_pts=-0.007000,
+
+=== (1b) pulse audio + -copyts -start_at_zero (shared absolute clock)
+    v: n=116 last_pts=3.917000 first_pts=0.000000
+    a: n=196 last_pts=3.912000, first_pts=-0.007000,
+
+=== (2) PCM on pipe:3 (4 s of s16le/48k/stereo prepared in advance)
+    pcm.raw: 768000 bytes = 4.00 s
+    v: n=120 last_pts=3.967000 first_pts=0.000000
+    a: n=201 last_pts=3.994000, first_pts=-0.007000,

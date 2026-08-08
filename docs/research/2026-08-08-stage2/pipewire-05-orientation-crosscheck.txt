@@ -1,0 +1,9 @@
+=== Orientation / pixel cross-check: grim vs the dmabuf mmap ===
+grim ok
+grim (RGB):  (0,0)= (190, 221, 242)  (1,0)= (191, 222, 244)  (2,0)= (192, 222, 246)  (3,0)= (192, 222, 247)
+grim (RGB):  (1280,800)= (12, 10, 0)
+grim (RGB):  bottom-left (0,1599)= (25, 25, 29)
+
+dmabuf mmap gave BGRX [f3 de bf ff] [f5 df c0 ff] [f7 df c1 ff] [f8 df c1 ff] at row0
+  -> as RGB: (191,222,243) (192,223,245) (193,223,247) (193,223,248)
+dmabuf mmap at row 800 col 1280: BGRX [00 0a 0c ff] -> RGB (12,10,0)

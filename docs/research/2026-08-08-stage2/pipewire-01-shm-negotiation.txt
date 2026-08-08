@@ -1,0 +1,57 @@
+=== CreateSession
+    session = /org/gnome/Mutter/ScreenCast/Session/u4
+=== RecordMonitor eDP-1 (cursor-mode 1 = embedded)
+    stream  = /org/gnome/Mutter/ScreenCast/Stream/u6
+=== monitoring PipeWireStreamAdded
+=== Start
+    PipeWireStreamAdded node id = 70
+=== niri msg casts (before consumer attaches)
+    Cast stream ID 6: (inactive)
+      Session ID: 4
+      Kind: PipeWire
+      Target: output "eDP-1"
+      PipeWire node ID: 70
+    
+
+=== pwprobe 70 shm
+== pwprobe: node=70 mode=shm  (libpipewire 1.6.8, headers 1.6.8)
+== offered SPA_PARAM_EnumFormat:
+    Object: size 192, type Spa:Pod:Object:Param:Format (262147), id Spa:Enum:ParamId:EnumFormat (3)
+      Prop: key Spa:Pod:Object:Param:Format:mediaType (1), flags 00000000
+        Id 2        (Spa:Enum:MediaType:video)
+      Prop: key Spa:Pod:Object:Param:Format:mediaSubtype (2), flags 00000000
+        Id 1        (Spa:Enum:MediaSubtype:raw)
+      Prop: key Spa:Pod:Object:Param:Format:Video:format (131073), flags 00000000
+        Id 8        (Spa:Enum:VideoFormat:BGRx)
+      Prop: key Spa:Pod:Object:Param:Format:Video:size (131075), flags 00000000
+        Choice: type Spa:Enum:Choice:Range, flags 00000000 40 8
+          Rectangle 1920x1080
+          Rectangle 1x1
+          Rectangle 8192x8192
+      Prop: key Spa:Pod:Object:Param:Format:Video:framerate (131076), flags 00000000
+        Choice: type Spa:Enum:Choice:Range, flags 00000000 40 8
+          Fraction 60/1
+          Fraction 0/1
+          Fraction 1000/1
+[state] unconnected -> connecting
+== pw_stream_connect -> 0
+[state] connecting -> paused
+[param] id=20 -> NULL (cleared)
+[param] id=15 -> NULL (cleared)
+[param] id=17 -> NULL (cleared)
+[param] id=4 -> NULL (cleared)
+[param] id=4 -> NULL (cleared)
+[state] paused -> error : no more input formats
+== RESULT: got_format=0 frames_received=0
+[state] paused -> unconnected
+
+=== niri msg casts (after consumer ran)
+    Cast stream ID 6: (inactive)
+      Session ID: 4
+      Kind: PipeWire
+      Target: output "eDP-1"
+      PipeWire node ID: 70
+    
+--- Stop session /org/gnome/Mutter/ScreenCast/Session/u4
+--- niri msg casts after teardown:
+    No screencasts.

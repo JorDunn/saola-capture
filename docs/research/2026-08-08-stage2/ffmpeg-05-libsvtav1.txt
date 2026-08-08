@@ -1,0 +1,21 @@
+=== libsvtav1 preset 8 (software) — 60 frames of 2560x1600@60 (1.00s of video) ===
+$ cat raw | ffmpeg -f rawvideo -pixel_format bgr0 -video_size 2560x1600 -framerate 60 -i pipe:0 -vf format=yuv420p -c:v libsvtav1 -preset 8 -crf 35 -g 120 -svtav1-params 'tune=0' -f matroska out-av1-p8.mkv
+frame=    0 fps=0.0 q=0.0 size=       0KiB time=N/A bitrate=N/A speed=N/A elapsed=0:00:01.00    frame=   25 fps= 17 q=25.0 size=       1KiB time=00:00:00.40 bitrate=  11.0kbits/s speed=0.267x elapsed=0:00:01.50    [out#0/matroska @ 0x5602ea47c700] video:2548KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.034450%
+frame=   60 fps= 35 q=35.0 Lsize=    2549KiB time=00:00:00.98 bitrate=21237.7kbits/s speed=0.577x elapsed=0:00:01.70    
+WALL: 1.85s  -> realtime factor 0.54x
+size: 2610463 bytes
+
+=== libsvtav1 preset 10 (software) — 60 frames of 2560x1600@60 (1.00s of video) ===
+$ cat raw | ffmpeg -f rawvideo -pixel_format bgr0 -video_size 2560x1600 -framerate 60 -i pipe:0 -vf format=yuv420p -c:v libsvtav1 -preset 10 -crf 35 -g 120 -svtav1-params 'tune=0' -f matroska out-av1-p10.mkv
+frame=    0 fps=0.0 q=0.0 size=       0KiB time=N/A bitrate=N/A speed=N/A elapsed=0:00:01.00    [out#0/matroska @ 0x5621d6c2c700] video:2718KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.032296%
+frame=   60 fps= 49 q=35.0 Lsize=    2719KiB time=00:00:00.98 bitrate=22653.9kbits/s speed=0.803x elapsed=0:00:01.22    
+WALL: 1.37s  -> realtime factor 0.73x
+size: 2784541 bytes
+
+=== libsvtav1 preset 12 (software) — 60 frames of 2560x1600@60 (1.00s of video) ===
+$ cat raw | ffmpeg -f rawvideo -pixel_format bgr0 -video_size 2560x1600 -framerate 60 -i pipe:0 -vf format=yuv420p -c:v libsvtav1 -preset 12 -crf 35 -g 120 -svtav1-params 'tune=0' -f matroska out-av1-p12.mkv
+frame=    1 fps=1.0 q=12.0 size=       1KiB time=00:00:00.00 bitrate=N/A speed=   0x elapsed=0:00:01.00    [out#0/matroska @ 0x558ebf1d4700] video:2744KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.031990%
+frame=   60 fps= 51 q=35.0 Lsize=    2745KiB time=00:00:00.98 bitrate=22870.7kbits/s speed=0.843x elapsed=0:00:01.16    
+WALL: 1.31s  -> realtime factor 0.76x
+size: 2811191 bytes
+

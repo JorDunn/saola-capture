@@ -1,0 +1,62 @@
+########## capture_output_region x=100 y=100 w=400 h=300 (protocol coords), overlay_cursor=0
+== globals bound
+   zwlr_screencopy_manager_v1 version = Some(3)
+   wl_shm formats advertised by the compositor (wl_shm.format events):
+      875708993 (AB24)
+      875709016 (XB24)
+      1 (Xrgb8888)
+      0 (Argb8888)
+== outputs:
+   eDP-1: mode 2560x1600 scale 2 transform 0
+
+== requesting capture, mode=region overlay_cursor=0 on eDP-1
+   [event] buffer format=1 600x450 stride=2400
+   [event] linux_dmabuf fourcc=0x34325258 600x450
+   [event] buffer_done
+== handshake events received BEFORE we attach a buffer:
+   buffer(format=1 [Xrgb8888], width=600, height=450, stride=2400)
+   linux_dmabuf(fourcc=0x34325258 'XR24', width=600, height=450)
+   buffer_done = true
+   failed      = false
+
+== allocating shm buffer 600x450 stride=2400 len=1080000 format=1
+   [event] flags = 0
+   [event] ready
+== after copy():
+   flags  = Some(0)  (1 = y_invert)
+   damage events = []
+   ready  = true
+   failed = false
+
+== pixels (bytes as stored, i.e. B G R X for wl_shm Xrgb8888 on LE):
+   (0,0)      = (0, 10, 12, 255)
+   (1,0)      = (0, 10, 12, 255)
+   (w/2,h/2)  = (0, 10, 12, 255)
+   (0,h-1)    = (0, 10, 12, 255)
+   bytes still 0x7f (never written) = 282 / 1080000 (0.03%)
+   wrote /tmp/claude-1000/-home-jordan-Developer-saola-capture/23479e85-b6aa-4c8e-a055-02ab53cdd73a/scratchpad/sccopy-region-nocursor.raw (600x450 stride 2400)
+
+########## grim -g '100,100 400x300' for comparison (grim takes LOGICAL coords)
+-o and -g are mutually exclusive
+
+########## niri msg outputs (true fractional scale)
+Output "Thermotrex Corporation TL140ADXP01 Unknown" (eDP-1)
+  Current mode: 2560x1600 @ 60.000 Hz
+  Variable refresh rate: supported, disabled
+  Physical size: 300x190 mm
+  Logical position: 0, 0
+  Logical size: 1706x1066
+  Scale: 1.5
+  Transform: normal
+  Available modes:
+    2560x1600@120.000 (preferred)
+    2560x1600@60.000 (current)
+    1920x1200@120.000
+    1920x1080@120.000
+    1600x1200@120.000
+    1680x1050@120.000
+    1280x1024@120.000
+    1440x900@120.000
+    1280x800@120.000
+    1280x720@120.000
+    1024x768@120.000

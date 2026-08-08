@@ -1,0 +1,11 @@
+=== CPU cost: swscale nv12 vs GPU scale_vaapi, 120 frames of 2560x1600 (2.00s @60) ===
+(source raw is read from page cache; 'cat' cost is common to both)
+--- vf="format=nv12,hwupload"
+( cat raw-2560x1600-bgr0.raw | ffmpeg -hide_banner -loglevel error -y -f     )  3.50s user 1.60s system 513% cpu 0.994 total
+    output: 5823919 bytes
+--- vf="hwupload,scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=tv"
+( cat raw-2560x1600-bgr0.raw | ffmpeg -hide_banner -loglevel error -y -f     )  0.34s user 1.36s system 222% cpu 0.766 total
+    output: 5791236 bytes
+
+=== nproc ===
+16

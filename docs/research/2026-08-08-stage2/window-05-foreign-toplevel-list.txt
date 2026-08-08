@@ -1,0 +1,26 @@
+NOTE: ext_foreign_toplevel_list needs wayland-protocols feature "staging" AND a
+wayland_client::event_created_child! specialization INSIDE the Dispatch impl.
+
+== ext_foreign_toplevel_list_v1 bound, version 1
+== events, verbatim, in arrival order:
+  [list] toplevel -> new handle id ext_foreign_toplevel_handle_v1@4278190080
+     [handle ext_foreign_toplevel_handle_v1@4278190080] identifier = "19"
+     [handle ext_foreign_toplevel_handle_v1@4278190080] title      = "jordan@nt-14589:~"
+     [handle ext_foreign_toplevel_handle_v1@4278190080] app_id     = "Alacritty"
+     [handle ext_foreign_toplevel_handle_v1@4278190080] done (atomic state applied)
+  [list] toplevel -> new handle id ext_foreign_toplevel_handle_v1@4278190081
+     [handle ext_foreign_toplevel_handle_v1@4278190081] identifier = "16"
+     [handle ext_foreign_toplevel_handle_v1@4278190081] title      = "⠂ System update completed"
+     [handle ext_foreign_toplevel_handle_v1@4278190081] app_id     = "Alacritty"
+     [handle ext_foreign_toplevel_handle_v1@4278190081] done (atomic state applied)
+  [list] toplevel -> new handle id ext_foreign_toplevel_handle_v1@4278190082
+     [handle ext_foreign_toplevel_handle_v1@4278190082] identifier = "18"
+     [handle ext_foreign_toplevel_handle_v1@4278190082] title      = "JorDunn/saola-capture: Screenshot and video recording application for Saola - Work - Microsoft\u{200b} Edge"
+     [handle ext_foreign_toplevel_handle_v1@4278190082] app_id     = "microsoft-edge"
+     [handle ext_foreign_toplevel_handle_v1@4278190082] done (atomic state applied)
+== 3 toplevel handles announced; 'finished'/'done' seen = true
+
+=== niri msg -j windows at the same moment, for id correlation ===
+  niri id 16 | app_id Alacritty | title ⠂ System update completed
+  niri id 18 | app_id microsoft-edge | title JorDunn/saola-capture: Screenshot and video r
+  niri id 19 | app_id Alacritty | title jordan@nt-14589:~

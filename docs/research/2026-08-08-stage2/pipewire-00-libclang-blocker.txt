@@ -1,0 +1,12 @@
+=== pipewire-rs 0.10 build attempt on this machine (scratch crate, NOT the repo) ===
+$ cargo add pipewire@0.10 && cargo build
+
+  --- stderr
+
+  thread 'main' (62869) panicked at /home/jordan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bindgen-0.72.1/lib.rs:616:27:
+  Unable to find libclang: "couldn't find any valid shared libraries matching: ['libclang.so', 'libclang-*.so', 'libclang.so.*', 'libclang-*.so.*'], set the `LIBCLANG_PATH` environment variable to a path where one of these files can be found (invalid: [])"
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+$ find / -name "libclang.so*"  -> (no results)
+$ pacman -Q clang llvm -> both "was not found"
+$ pkg-config --modversion libpipewire-0.3 libspa-0.2 -> 1.6.8 / 0.2  (dev headers ARE present)

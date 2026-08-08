@@ -1,0 +1,16 @@
+=== Byte-order check: ffmpeg pix_fmt bgr0 == PipeWire SPA_VIDEO_FORMAT_BGRx ===
+$ first 8 bytes of a pure-red frame in pix_fmt bgr0 (expect B=00 G=00 R=ff x=00 per pixel):
+(eval):6: command not found: xxd
+$ ffmpeg -pix_fmts | grep -E "^(IO|)\.\.\. (bgr0|rgb0|bgra|rgba) "
+IO... rgba                   4             32      8-8-8-8
+IO... bgra                   4             32      8-8-8-8
+IO... 0rgb                   3             24      8-8-8
+IO... rgb0                   3             24      8-8-8
+IO... 0bgr                   3             24      8-8-8
+IO... bgr0                   3             24      8-8-8
+
+=== Colour fidelity through the two VAAPI conversion paths ===
+-- vf="format=nv12,hwupload" corner pixel RGB (expect 255,0,0 / 0,255,0 / 0,0,255 / 255,255,255):
+   TL (252, 0, 0) TR (0, 252, 0) BL (0, 0, 254) BR (255, 255, 255)
+-- vf="hwupload,scale_vaapi=format=nv12" corner pixel RGB (expect 255,0,0 / 0,255,0 / 0,0,255 / 255,255,255):
+   TL (232, 0, 2) TR (20, 255, 8) BL (1, 0, 243) BR (255, 255, 255)

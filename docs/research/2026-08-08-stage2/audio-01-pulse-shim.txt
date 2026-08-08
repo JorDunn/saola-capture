@@ -1,0 +1,41 @@
+=== pactl sources (PipeWire pulse shim) ===
+56	alsa_output.pci-0000_07_00.6.analog-stereo.monitor	PipeWire	s32le 2ch 48000Hz	SUSPENDED
+57	alsa_input.pci-0000_07_00.6.analog-stereo	PipeWire	s32le 2ch 48000Hz	SUSPENDED
+
+=== pactl info (server identity) ===
+Server String: /run/user/1000/pulse/native
+Library Protocol Version: 35
+Server Protocol Version: 35
+Is Local: yes
+Client Index: 315
+Tile Size: 65472
+User Name: jordan
+Host Name: nt-14589
+
+=== ffmpeg pulse demuxer present? ===
+ DE alsa            ALSA audio output
+ D  jack            JACK Audio Connection Kit
+ DE pulse           Pulse audio output
+
+=== 2 s capture from the monitor source via ffmpeg -f pulse ===
+$ ffmpeg -f pulse -i alsa_output.pci-0000_07_00.6.analog-stereo.monitor -t 2 -c:a libopus -b:a 96k out-sys.mka
+Output #0, matroska, to 'out-sys.mka':
+  Metadata:
+    encoder         : Lavf63.1.100
+  Stream #0:0: Audio: opus ([255][255][255][255] / 0xFFFFFFFF), 48000 Hz, stereo, s16, 96 kb/s
+    Metadata:
+      encoder         : Lavc63.1.100 libopus
+size=       1KiB time=00:00:00.53 bitrate=   8.3kbits/s speed=1.06x elapsed=0:00:00.50    size=       1KiB time=00:00:01.02 bitrate=   4.3kbits/s speed=1.03x elapsed=0:00:01.00    size=       1KiB time=00:00:01.52 bitrate=   2.9kbits/s speed=1.01x elapsed=0:00:01.50    size=       1KiB time=00:00:01.98 bitrate=   2.2kbits/s speed=0.99x elapsed=0:00:02.00    [out#0/matroska @ 0x55f5369c9c40] video:0KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 399.339934%
+size=       1KiB time=00:00:02.00 bitrate=   6.1kbits/s speed=0.957x elapsed=0:00:02.09    
+  Duration: 00:00:02.01, start: 0.000000, bitrate: 6 kb/s
+  Stream #0:0: Audio: opus, 48000 Hz, stereo, fltp
+
+=== 2 s capture from the mic via ffmpeg -f pulse ===
+    encoder         : Lavf63.1.100
+  Stream #0:0: Audio: opus ([255][255][255][255] / 0xFFFFFFFF), 48000 Hz, stereo, s16, 96 kb/s
+    Metadata:
+      encoder         : Lavc63.1.100 libopus
+size=       1KiB time=00:00:00.52 bitrate=   8.4kbits/s speed=1.04x elapsed=0:00:00.50    size=       1KiB time=00:00:00.99 bitrate=   4.4kbits/s speed=0.997x elapsed=0:00:01.00    size=       1KiB time=00:00:01.48 bitrate=   3.0kbits/s speed=0.989x elapsed=0:00:01.50    size=       1KiB time=00:00:01.94 bitrate=   2.3kbits/s speed=0.97x elapsed=0:00:02.00    [out#0/matroska @ 0x5582f207cc00] video:0KiB audio:35KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 3.711650%
+size=      36KiB time=00:00:01.99 bitrate= 148.9kbits/s speed=0.938x elapsed=0:00:02.13    
+  Duration: 00:00:02.03, start: 0.000000, bitrate: 146 kb/s
+  Stream #0:0: Audio: opus, 48000 Hz, stereo, fltp

@@ -1,0 +1,18 @@
+=== byte order (od, xxd absent) — pure red in bgr0 ===
+ 00 00 fd ff 00 00 fd ff
+
+=== scale_vaapi options ===
+   format            <string>     ..FV....... Output video format (software format of hardware frames)
+   mode              <int>        ..FV....... Scaling mode (from 0 to 768) (default hq)
+   out_color_matrix  <string>     ..FV....... Output colour matrix coefficient set
+   out_range         <int>        ..FV....... Output colour range (from 0 to 2) (default 0)
+   out_chroma_location <string>     ..FV....... Output chroma sample location
+
+=== retry GPU conversion with explicit bt709/limited tagging ===
+-- hwupload,scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=tv
+   TL (251, 0, 0) TR (0, 252, 0) BL (0, 0, 254) BR (255, 255, 255)
+Error opening output file c2-hwupload_scale_vaapi_format_nv12_out_color_matrix_bt601_out_range_tv_.mkv.
+Error opening output files: Invalid argument
+-- hwupload,scale_vaapi=format=nv12:out_color_matrix=bt601:out_range=tv -> FAILED
+-- hwupload,scale_vaapi=format=nv12:out_range=full
+   TL (232, 0, 2) TR (20, 255, 8) BL (1, 0, 243) BR (255, 255, 255)

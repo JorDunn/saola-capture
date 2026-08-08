@@ -1,0 +1,4 @@
+########## cursor compositing, noise-cancelled: nocursor, cursor, nocursor in sequence
+  cursor-attributable pixels (stable in both nocursor shots, different with cursor=1): 500
+  bounding box: x 55..1334  y 912..1254  (1280x343 px)
+  -> physical px; logical position ~ (37, 608)

@@ -1,0 +1,15 @@
+=== CreateSession
+    session = /org/gnome/Mutter/ScreenCast/Session/u9
+=== RecordWindow window-id=999999 cursor-mode=1
+    -> o "/org/gnome/Mutter/ScreenCast/Stream/u11"
+    stream = /org/gnome/Mutter/ScreenCast/Stream/u11
+=== Stream Parameters property
+    a{sv} 2 "position" (ii) 0 0 "size" (ii) 1 1
+=== Start
+    node id = <none>
+=== niri msg casts
+    No screencasts.
+--- Stop session /org/gnome/Mutter/ScreenCast/Session/u9
+    Call failed: Unknown object '/org/gnome/Mutter/ScreenCast/Session/u9'
+--- niri msg casts after teardown:
+    No screencasts.

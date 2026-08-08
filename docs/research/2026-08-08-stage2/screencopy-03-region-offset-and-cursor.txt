@@ -1,0 +1,8 @@
+########## region-offset verification: does region(100,100,400,300) == full[150..750, 150..600] ?
+  region buffer is 600x450 (= logical 400x300 * scale 1.5)
+  pixels differing from full-output at physical offset (150,150): 0 / 270000
+  (non-zero is expected only if the screen changed between the two captures)
+
+########## cursor compositing: two captures back to back, cursor=0 then cursor=1
+  differing pixels: 2544
+  bounding box: x 55..2118  y 45..1258  (2064x1214 px)

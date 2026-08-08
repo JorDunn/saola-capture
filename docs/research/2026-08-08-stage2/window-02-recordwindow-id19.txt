@@ -1,0 +1,80 @@
+########## RecordWindow with niri-ipc window id 19 (Alacritty 'jordan@nt-14589:~', window_size 1671x971 logical)
+=== CreateSession
+    session = /org/gnome/Mutter/ScreenCast/Session/u8
+=== RecordWindow window-id=19 cursor-mode=1
+    -> o "/org/gnome/Mutter/ScreenCast/Stream/u10"
+    stream = /org/gnome/Mutter/ScreenCast/Stream/u10
+=== Stream Parameters property
+    a{sv} 2 "position" (ii) 0 0 "size" (ii) 1 1
+=== Start
+    node id = 70
+=== niri msg casts
+    Cast stream ID 10: (inactive)
+      Session ID: 8
+      Kind: PipeWire
+      Target: window 19
+      PipeWire node ID: 70
+    
+
+=== pwprobe 70 dmabuf
+== pwprobe: node=70 mode=dmabuf  (libpipewire 1.6.8, headers 1.6.8)
+== offered SPA_PARAM_EnumFormat:
+    Object: size 240, type Spa:Pod:Object:Param:Format (262147), id Spa:Enum:ParamId:EnumFormat (3)
+      Prop: key Spa:Pod:Object:Param:Format:mediaType (1), flags 00000000
+        Id 2        (Spa:Enum:MediaType:video)
+      Prop: key Spa:Pod:Object:Param:Format:mediaSubtype (2), flags 00000000
+        Id 1        (Spa:Enum:MediaSubtype:raw)
+      Prop: key Spa:Pod:Object:Param:Format:Video:format (131073), flags 00000000
+        Id 8        (Spa:Enum:VideoFormat:BGRx)
+      Prop: key Spa:Pod:Object:Param:Format:Video:modifier (131074), flags 00000018
+        Choice: type Spa:Enum:Choice:Enum, flags 00000000 32 8
+          Long 0
+          Long 0
+      Prop: key Spa:Pod:Object:Param:Format:Video:size (131075), flags 00000000
+        Choice: type Spa:Enum:Choice:Range, flags 00000000 40 8
+          Rectangle 1920x1080
+          Rectangle 1x1
+          Rectangle 8192x8192
+      Prop: key Spa:Pod:Object:Param:Format:Video:framerate (131076), flags 00000000
+        Choice: type Spa:Enum:Choice:Range, flags 00000000 40 8
+          Fraction 60/1
+          Fraction 0/1
+          Fraction 1000/1
+[state] unconnected -> connecting
+== pw_stream_connect -> 0
+[state] connecting -> paused
+[format] NEGOTIATED SPA_PARAM_Format:
+     video/raw
+               format : (Id) BGRx
+             modifier : (Long) { 0, 0 }
+                 size : (Rectangle) 2507x1457
+            framerate : (Fraction) 0/1
+         maxFramerate : (Fraction) 60000/1000
+[format] parsed: format=BGRx size=2507x1457 framerate=0/1 modifier=0x0
+[buffers] replying with SPA_PARAM_Buffers dataType mask 0x8 (MemFd=0 MemPtr=0 DmaBuf=1) size=14610796 stride=10028
+[format] NEGOTIATED SPA_PARAM_Format:
+     video/raw
+               format : (Id) BGRx
+             modifier : (Long) 0
+                 size : (Rectangle) 2507x1457
+            framerate : (Fraction) 0/1
+         maxFramerate : (Fraction) 60000/1000
+[format] parsed: format=BGRx size=2507x1457 framerate=0/1 modifier=0x0
+[buffers] replying with SPA_PARAM_Buffers dataType mask 0x8 (MemFd=0 MemPtr=0 DmaBuf=1) size=14610796 stride=10028
+[state] paused -> streaming
+[frame 0] n_datas=1
+   data[0] type=3 (DmaBuf) fd=20 mapoffset=0 maxsize=1 data=(nil) chunk{offset=0 size=1 stride=10240}
+   dmabuf fd size (lseek END) = 14921728, want 14610796, mmap -> OK
+   DMA_BUF_IOCTL_SYNC(START|READ) -> 0 (ok)
+   px[0..3] (B G R X): [00 0a 0c ff] [00 0a 0c ff] [00 0a 0c ff] [00 0a 0c ff] 
+   px at row 728 col 1253: [00 0a 0c ff]
+   non-black sample points: 3568 / 3568
+[timeout] giving up after 6s (got_format=1 frames=1)
+== RESULT: got_format=1 frames_received=1
+[state] streaming -> paused
+[param] id=4 -> NULL (cleared)
+[param] id=4 -> NULL (cleared)
+[state] paused -> unconnected
+--- Stop session /org/gnome/Mutter/ScreenCast/Session/u8
+--- niri msg casts after teardown:
+    No screencasts.

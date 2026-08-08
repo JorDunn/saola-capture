@@ -1,0 +1,16 @@
+=== PTS model test: producer runs at 20 fps REAL time, ffmpeg told -framerate 60 ===
+--- (A) naive: -f rawvideo -framerate 60, no wallclock
+feeder: wrote 60 frames over 3.00s (target 20.0 fps)
+    output duration: 1.000000
+
+--- (B) -use_wallclock_as_timestamps 1 + -fps_mode vfr
+feeder: wrote 60 frames over 3.00s (target 20.0 fps)
+    output duration: 2.900000
+    nb_frames: 60
+
+--- (C) -use_wallclock_as_timestamps 1 + -fps_mode cfr -r 60 (ffmpeg duplicates to CFR)
+feeder: wrote 60 frames over 3.00s (target 20.0 fps)
+    output duration: 2.934000
+    nb_frames: 176
+
+    EXPECTED real elapsed for 60 frames at 20 fps = 3.00 s

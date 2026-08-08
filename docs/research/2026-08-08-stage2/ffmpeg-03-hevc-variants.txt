@@ -1,0 +1,37 @@
+=== TEST A2: same, -v verbose, proving VAAPI driver init (hardware) ===
+[VAAPI @ 0x55ce30a44ac0] libva: VA-API version 1.24.0
+[VAAPI @ 0x55ce30a44ac0] libva: Trying to open /usr/lib/dri/radeonsi_drv_video.so
+[VAAPI @ 0x55ce30a44ac0] libva: Found init function __vaDriverInit_1_24
+[VAAPI @ 0x55ce30a44ac0] libva: va_openDriver() returns 0
+[VAAPI @ 0x55ce30a44ac0] Initialised VAAPI connection: version 1.24
+[VAAPI @ 0x55ce30a44ac0] VAAPI driver: Mesa Gallium driver 26.1.6-arch1.1 for AMD Radeon 680M (radeonsi, rembrandt, ACO, DRM 3.64, 7.1.4-arch1-1).
+[VAAPI @ 0x55ce30a44ac0] Driver not found in known nonstandard list, using standard behaviour.
+[vost#0:0/hevc_vaapi @ 0x55ce30bf6f80] Created video stream from input stream 0:0
+  Stream #0:0 -> #0:0 (rawvideo (native) -> hevc (hevc_vaapi))
+[vost#0:0/hevc_vaapi @ 0x55ce30bf6f80] Starting thread...
+[vost#0:0/hevc_vaapi @ 0x55ce30bf6f80] [enc:hevc_vaapi @ 0x55ce30bf7440] Using input frames context (format vaapi) with hevc_vaapi encoder.
+[hevc_vaapi @ 0x55ce30bf74c0] Input surface format is nv12.
+[hevc_vaapi @ 0x55ce30bf74c0] Using VAAPI profile VAProfileHEVCMain (17).
+[hevc_vaapi @ 0x55ce30bf74c0] Using VAAPI entrypoint VAEntrypointEncSlice (6).
+[hevc_vaapi @ 0x55ce30bf74c0] Using VAAPI render target format YUV420 (0x1).
+[hevc_vaapi @ 0x55ce30bf74c0] Using CTU size 64x64, min CB size 8x8.
+[hevc_vaapi @ 0x55ce30bf74c0] RC mode: VBR.
+[hevc_vaapi @ 0x55ce30bf74c0] Block Level bitrate control: OFF.
+[hevc_vaapi @ 0x55ce30bf74c0] RC target: 50% of 40000000 bps over 500 ms.
+[hevc_vaapi @ 0x55ce30bf74c0] RC buffer: 20000000 bits, initial fullness 15000000 bits.
+[hevc_vaapi @ 0x55ce30bf74c0] RC framerate: 60/1 (60.00 fps).
+[hevc_vaapi @ 0x55ce30bf74c0] Driver does not report any additional prediction constraints.
+[hevc_vaapi @ 0x55ce30bf74c0] Using intra and P-frames (supported references: 1 / 0).
+[hevc_vaapi @ 0x55ce30bf74c0] All wanted packed headers available (wanted 0xd, found 0x1f).
+[hevc_vaapi @ 0x55ce30bf74c0] Using level 5.
+
+=== TEST B: GPU-side colour conversion: hwupload (bgr0 surface) + scale_vaapi=format=nv12 ===
+$ ... -vf "hwupload,scale_vaapi=format=nv12" -c:v hevc_vaapi
+    encoder         : Lavf63.1.100
+  Stream #0:0: Video: hevc (Main), nv12(pc, gbr/unknown/unknown, progressive), 2560x1600, q=2-31, 20000 kb/s, 60 fps, 1k tbn
+    Metadata:
+      encoder         : Lavc63.1.100 hevc_vaapi
+frame=   83 fps=0.0 q=-0.0 size=       1KiB time=00:00:01.38 bitrate=   3.9kbits/s speed=2.77x elapsed=0:00:00.50    [out#0/matroska @ 0x557c1b872d80] video:5761KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0KiB muxing overhead: 0.028851%
+frame=  120 fps=0.0 q=-0.0 Lsize=    5763KiB time=00:00:02.00 bitrate=23604.2kbits/s speed=2.84x elapsed=0:00:00.70    
+WALL: 0.79s
+-rw-r--r-- 1 jordan jordan 5901061 Aug  8 14:04 out-hevc-gpuconv.mkv

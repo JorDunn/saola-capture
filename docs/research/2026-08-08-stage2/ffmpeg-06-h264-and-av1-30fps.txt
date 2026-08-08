@@ -1,0 +1,15 @@
+=== libsvtav1 preset 10 at 30 fps input (60 frames = 2.00s of video) ===
+frame=   60 fps= 42 q=35.0 Lsize=    2719KiB time=00:00:01.96 bitrate=11326.9kbits/s speed=1.39x elapsed=0:00:01.41    
+WALL: 1.58s for 2.00s of video -> 1.26x realtime
+
+=== h264_vaapi -> MP4 (hardware), 120 frames @60 ===
+$ cat raw | ffmpeg -f rawvideo -pixel_format bgr0 -video_size 2560x1600 -framerate 60 -i pipe:0 -vaapi_device /dev/dri/renderD128 -vf "format=nv12,hwupload" -c:v h264_vaapi -b:v 20M -movflags +faststart -f mp4 out-h264vaapi.mp4
+frame=  120 fps= 81 q=-0.0 Lsize=    4923KiB time=00:00:01.98 bitrate=20335.7kbits/s speed=1.34x elapsed=0:00:01.48    
+WALL: 1.58s for 2.00s -> 1.27x realtime
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv, progressive), 2560x1600, 20157 kb/s, 60 fps, 60 tbr, 15360 tbn (default)
+
+=== libx264 -> MP4 (software, ultrafast/veryfast), 60 frames @60 (1.00s) ===
+frame=   60 fps=0.0 q=-1.0 Lsize=    5859KiB time=00:00:01.00 bitrate=47993.1kbits/s speed=2.55x elapsed=0:00:00.39    
+  ultrafast WALL: 0.48s for 1.00s -> 2.07x realtime
+frame=   60 fps=0.0 q=-1.0 Lsize=    1524KiB time=00:00:00.96 bitrate=12913.5kbits/s speed=1.68x elapsed=0:00:00.57    
+  veryfast WALL: 0.69s for 1.00s -> 1.44x realtime

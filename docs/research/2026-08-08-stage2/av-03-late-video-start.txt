@@ -1,0 +1,13 @@
+=== VIDEO STARTS 1.0 s AFTER ffmpeg (simulates PipeWire negotiation latency)
+    producer then runs 90 frames at 30 fps = 3.00 s. Audio from -f pulse runs the whole time.
+
+--- (A) default normalisation (no -copyts)
+      v: n=86 first=0.000000 last=3.000000
+      a: n=152 first=-0.007000, last=3.016000,
+
+--- (B) -copyts -start_at_zero (both inputs on the absolute wall clock)
+      v: n=88 first=0.000000 last=3.000000
+      a: n=154 first=-0.007000, last=3.019000,
+
+    INTERPRETATION: if video first_pts ~= 1.0 while audio first_pts ~= 0, the true
+    1 s offset survived. If both are ~0, ffmpeg discarded it and A/V is 1 s out.

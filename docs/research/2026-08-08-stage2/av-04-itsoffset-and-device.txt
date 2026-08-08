@@ -1,0 +1,10 @@
+=== -itsoffset as the correction knob (audio delayed by +0.5 s) ===
+   v first=0.000000
+   a first=0.494000,
+   -> a 0.5 s shift here means -itsoffset survives normalisation and is usable for calibration
+
+=== pulse source state before/after an ffmpeg open (device-resume latency) ===
+   before: 56	alsa_output.pci-0000_07_00.6.analog-stereo.monitor	PipeWire	s32le 2ch 48000Hz	SUSPENDED
+   before: 57	alsa_input.pci-0000_07_00.6.analog-stereo	PipeWire	s32le 2ch 48000Hz	IDLE
+   during: 56	alsa_output.pci-0000_07_00.6.analog-stereo.monitor	PipeWire	s32le 2ch 48000Hz	SUSPENDED
+   during: 57	alsa_input.pci-0000_07_00.6.analog-stereo	PipeWire	s32le 2ch 48000Hz	RUNNING

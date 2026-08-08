@@ -1,0 +1,30 @@
+$ ffmpeg -hide_banner -encoders | grep -Ei 'vaapi|svtav1|libx264|libopus'
+ V..... libsvtav1            SVT-AV1(Scalable Video Technology for AV1) encoder (codec av1)
+ V....D av1_vaapi            AV1 (VAAPI) (codec av1)
+ V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)
+ V....D libx264rgb           libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 RGB (codec h264)
+ V....D h264_vaapi           H.264/AVC (VAAPI) (codec h264)
+ V....D hevc_vaapi           H.265/HEVC (VAAPI) (codec hevc)
+ V....D mjpeg_vaapi          MJPEG (VAAPI) (codec mjpeg)
+ V....D mpeg2_vaapi          MPEG-2 (VAAPI) (codec mpeg2video)
+ V....D vp8_vaapi            VP8 (VAAPI) (codec vp8)
+ V....D vp9_vaapi            VP9 (VAAPI) (codec vp9)
+ A....D libopus              libopus Opus (codec opus)
+
+$ ffmpeg -hide_banner -hwaccels
+Hardware acceleration methods:
+vdpau
+cuda
+vaapi
+qsv
+drm
+opencl
+vulkan
+amf
+
+
+$ ls /dev/dri
+total 0
+drwxr-xr-x  2 root root         80 Aug  5 02:12 by-path
+crw-rw----+ 1 root video  226,   1 Aug  8 14:00 card1
+crw-rw-rw-  1 root render 226, 128 Aug  8 14:00 renderD128

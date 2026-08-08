@@ -1,0 +1,10 @@
+=== bogus-window-id failure path, with Session.Closed monitoring ===
+session=/org/gnome/Mutter/ScreenCast/Session/u10
+RecordWindow 999999 ->
+   o "/org/gnome/Mutter/ScreenCast/Stream/u12"
+Start ->
+   busctl exit=0
+--- session-interface signals seen:
+     Sender=:1.19  Path=/org/gnome/Mutter/ScreenCast/Session/u10  Interface=org.gnome.Mutter.ScreenCast.Session  Member=Closed
+--- is the session object still there?
+Failed to introspect object /org/gnome/Mutter/ScreenCast/Session/u10 of service org.gnome.Mutter.ScreenCast: Unknown object '/org/gnome/Mutter/ScreenCast/Session/u10'
