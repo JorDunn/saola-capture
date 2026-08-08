@@ -1,0 +1,15 @@
+Output "eDP-1":
+  Background layer:
+    Surface:
+      Namespace: "wallpaper"
+      Keyboard interactivity: none
+
+  Bottom layer: (empty)
+
+  Top layer:
+    Surface:
+      Namespace: "saola-panel"
+      Keyboard interactivity: none
+
+  Overlay layer: (empty)
+

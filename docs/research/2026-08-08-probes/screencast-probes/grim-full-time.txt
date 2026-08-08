@@ -1,0 +1,1 @@
+timeout 15 grim -o eDP-1 $S/grim-full-eDP-1.png  0.36s user 0.01s system 92% cpu 0.398 total

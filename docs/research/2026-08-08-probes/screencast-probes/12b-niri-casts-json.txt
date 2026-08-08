@@ -1,0 +1,1 @@
+[{"stream_id":4,"session_id":2,"kind":"PipeWire","target":{"Output":{"name":"eDP-1"}},"is_dynamic_target":false,"is_active":false,"pid":null,"pw_node_id":70}]

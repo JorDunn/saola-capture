@@ -1,0 +1,13 @@
+Monitoring bus message stream.
+‣ Type=signal  Endian=l  Flags=0  Version=1 Cookie=161  Timestamp="Sat 2026-08-08 16:35:19.924377 UTC"
+  Sender=:1.19  Path=/org/gnome/Mutter/ScreenCast/Session/u1  Interface=org.gnome.Mutter.ScreenCast.Session  Member=Closed
+  UniqueName=:1.19
+  MESSAGE "" {
+  };
+
+‣ Type=signal  Endian=l  Flags=0  Version=1 Cookie=169  Timestamp="Sat 2026-08-08 16:37:35.604005 UTC"
+  Sender=:1.19  Path=/org/gnome/Mutter/ScreenCast/Session/u2  Interface=org.gnome.Mutter.ScreenCast.Session  Member=Closed
+  UniqueName=:1.19
+  MESSAGE "" {
+  };
+

@@ -98,15 +98,28 @@ HEVC-in-MKV and AV1 for video; popular formats as the app matures.
 - The sudo rule: no agent runs `sudo` or edits Jordan's user/system config;
   exact commands are printed for him.
 
+**Pre-plan live probes (2026-08-08)** already verified part of Stage 2 —
+evidence in `docs/research/2026-08-08-probes/` (read its README before
+Stage 2). Headlines: the full Mutter.ScreenCast handshake works, but the
+session interface has **no `RecordArea`** (region recording =
+RecordMonitor + crop) and the cast node advertises **dmabuf-only** (BGRx,
+physical-res, MANDATORY modifier prop incl. LINEAR; no shm pod);
+cursor-mode is the Mutter enum 0/1/2, not the portal bitmask; drag through
+a grab overlay is pixel-exact; screencopy **composites overlay surfaces**
+(freeze-before-map is mandatory); PickColor works and returns exact
+colors; `niri msg casts` + cast events work as assumed.
+
 **Risks this plan sequences around** (research first, riskiest subsystems
 right after the MVP): iced_layershell's overlay fidelity (per-output
-surfaces, exclusive keyboard, drag) is unproven at overlay scale — Stage 2
+surfaces, exclusive keyboard from iced specifically) is unproven — Stage 2
 confirms it or the overlay falls back to a hand-rolled
-smithay-client-toolkit surface; SPA format negotiation is the classic pain
-point — shm is the committed baseline, dmabuf only on Stage 2 evidence;
-ffmpeg is absent until Stage 2 (Jordan installs it there, and the whole
-encode chain is verified before any pipeline code exists); the
-window-capture mechanism has three candidates and no winner until Stage 2;
+smithay-client-toolkit surface; SPA buffer negotiation — the cast node
+advertises dmabuf-only, so plan for **dmabuf-first (LINEAR-modifier mmap
+as the conservative path)** unless Stage 2 proves shm negotiable; ffmpeg
+is absent until Stage 2 (Jordan installs it there, and the whole encode
+chain is verified before any pipeline code exists); the window-capture
+mechanism has three candidates and no winner until Stage 2 (RecordWindow
+exists and takes `window-id (t)`, id-space match with niri-ipc untested);
 A/V sync is decided by measurement in Stage 12; v0.1 may ship a
 single-output-aware overlay with the limitation documented.
 
@@ -198,7 +211,9 @@ New capture or encode paths go **behind these traits, never around them**:
   readout + floating toolbar. Confirm → crop in memory → same tail as
   PrintScr. Escape → unmap, nothing saved.
 - **Recording**: Mutter.ScreenCast `CreateSession` →
-  `RecordMonitor`/`RecordArea`/`RecordWindow` → `Start` → PipeWire node id →
+  `RecordMonitor`/`RecordWindow` (there is no `RecordArea` on niri —
+  region recording is a monitor cast cropped before encode) → `Start` →
+  PipeWire node id →
   pipewire-rs stream on a **dedicated thread** (the pw main loop is not
   tokio; frames cross a bounded channel; teaching-note the threading) →
   `EncoderSink` (ffmpeg child: rawvideo stdin, `hwupload,hevc_vaapi`,
@@ -319,21 +334,26 @@ verify:
 
 The load-bearing unknowns, resolved with **evidence** (command output, source
 references, transcripts — not inference), in the mold of
-`~/Developer/saola-session/docs/SIGNALS.md`. Throwaway prototypes go in the
-scratch directory, never this repo. Split the work across two subagents if
-useful (stills + overlay vs screencast + encode). Produce
-`docs/CAPTURE-RESEARCH.md`:
+`~/Developer/saola-session/docs/SIGNALS.md`. **Start from
+`docs/research/2026-08-08-probes/README.md`** — the pre-plan probes already
+answered several items below (marked); fold their findings into
+`docs/CAPTURE-RESEARCH.md` rather than re-running them, and focus effort on
+the listed gaps. Throwaway prototypes go in the scratch directory, never
+this repo. Split the work across two subagents if useful (stills + overlay
+vs screencast + encode). Produce `docs/CAPTURE-RESEARCH.md`:
 
 1. **Screencopy handshake** against the real niri (read-only, safe):
    formats offered per output, y-invert flag behavior, cursor compositing
    options, per-output vs region semantics. grim's source is the reference
    implementation; `grim` is installed for output comparison.
-2. **Mutter.ScreenCast v4**: full `busctl --user` transcript of
-   `CreateSession → RecordMonitor → Start`, the PipeWire node id, and a
-   `pw-dump` of the node's advertised formats — does it offer shm
-   (`MemPtr`), dmabuf, or both, and which pixel formats? Close with a
-   **shm-vs-dmabuf decision and fallback chain** (shm-first is the expected
-   conservative call).
+2. **Mutter.ScreenCast v4** *(largely pre-answered — see probes)*: the
+   handshake transcript exists; the node advertises **dmabuf-only** (BGRx,
+   physical-res, MANDATORY modifier incl. LINEAR), no `RecordArea`,
+   Mutter-enum cursor-mode. The remaining question: **is shm negotiable
+   anyway?** Write a minimal pipewire-rs consumer offering BGRx without
+   the modifier prop and inspect the negotiated Buffers `dataType`. Close
+   with the **buffer-path decision and fallback chain** (expected:
+   dmabuf-with-LINEAR mmap as conservative primary if shm is refused).
 3. **ffmpeg encode chain**: ffmpeg is not installed — print
    `sudo pacman -S ffmpeg` for Jordan and **wait for his confirmation**.
    Then verify `ffmpeg -encoders | grep vaapi`, and run a synthetic
@@ -348,14 +368,20 @@ useful (stills + overlay vs screencast + encode). Produce
    `screenshot-window` action (where does the file land? is there pixel
    access without disk?), geometry-crop from an output screencopy using
    niri-ipc/foreign-toplevel geometry (what about overlapping floating
-   windows?), or a one-frame `RecordWindow` cast. Decide, with evidence.
+   windows?), or a one-frame `RecordWindow` cast (probes confirmed it
+   takes `window-id (t)` with validation deferred to Start; check the id
+   space matches niri-ipc ids — needs a consumer attached). Note
+   `ext_image_copy_capture` is absent on niri 26.04, so grim-style `-T`
+   toplevel capture is not a candidate. Decide, with evidence.
 6. **Overlay viability in iced_layershell** (nested niri, lockscreen
    procedure): per-output overlay surfaces, `KeyboardInteractivity::Exclusive`
    with Escape, pointer drag fidelity on `Layer::Overlay`, and whether a
    frozen-frame image background at output size renders acceptably. If any
    of this fails, document the smithay-client-toolkit fallback shape.
-7. **Enumeration**: `ext_foreign_toplevel_list_v1` and niri-ipc window/output
-   listings; `Request::Casts` / `CastsChanged` event shapes.
+7. **Enumeration** *(pre-answered — see probes)*: `niri msg casts` and the
+   `CastsChanged`/`CastStartedOrChanged`/`CastStopped` events are
+   confirmed working; verify the `ext_foreign_toplevel_list_v1` window
+   listing shape is all that remains.
 
 Close with a **decision section** — every later stage keys off it; do not
 guess where evidence is thin, say what would firm it up.
@@ -591,7 +617,9 @@ shm/dmabuf decision; add the `pipewire` crate now with its survey essay.
    (CreateSession → Record* → Start → node id → Stop), zbus-side in the
    daemon's runtime.
 2. The PipeWire stream runs on a **dedicated thread** (pw main loop ≠
-   tokio): SPA format negotiation per Stage 2 (shm baseline; dmabuf only if
+   tokio): SPA buffer negotiation per Stage 2's decision (probes showed
+   the node advertises dmabuf-only with LINEAR available — expect
+   dmabuf/LINEAR mmap primary; shm only if
    green-lit), frames crossing a bounded channel to the daemon side.
    Teaching-note the threading and the SPA pod handling — this is the
    hardest plumbing in the project.
@@ -665,7 +693,9 @@ item this stage builds) and Architecture's recording flow.
 2. Recording elapsed-time: tray tooltip/title; add the small chip surface
    only if Stage 2/6 evidence says a layer-shell pill is cheap — otherwise
    note it as future work.
-3. `record start --region` (overlay reuse → `RecordArea`) and
+3. `record start --region` (overlay reuse selects the rect; there is no
+   `RecordArea` — record the monitor and crop before encode, per Stage
+   2's decision on where the crop runs cheapest) and
    `record start --window` (→ `RecordWindow`); finish toast per
    Architecture's toast-click flow (videos open containing dir for now).
 4. `RecordingStarted`/`RecordingFinished` signals wired; the app window's

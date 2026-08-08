@@ -1,0 +1,8 @@
+Monitoring bus message stream.
+‣ Type=signal  Endian=l  Flags=0  Version=1 Cookie=168  Timestamp="Sat 2026-08-08 16:35:54.802827 UTC"
+  Sender=:1.19  Path=/org/gnome/Mutter/ScreenCast/Stream/u4  Interface=org.gnome.Mutter.ScreenCast.Stream  Member=PipeWireStreamAdded
+  UniqueName=:1.19
+  MESSAGE "u" {
+          UINT32 70;
+  };
+

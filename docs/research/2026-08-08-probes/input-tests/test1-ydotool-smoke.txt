@@ -1,0 +1,4 @@
+== test1: absolute move to 200,200 ==
+exit=0
+== test1: relative move +50,+30 ==
+exit=0

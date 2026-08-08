@@ -1,0 +1,33 @@
+Screencast-path probes on live niri session — 2026-08-08
+Machine: niri 26.04 (8ed0da4), pipewire 1.6.8, grim 1.5.0, systemd 261, AMD GPU (680M), eDP-1 2560x1600@60 scale 1.5 (logical 1706x1066)
+
+KEY VERDICTS
+1. Registry (00-wayland-globals.txt, via wl_globals.py — wayland-utils NOT installed):
+   zwlr_screencopy_manager_v1 v3 / zwlr_layer_shell_v1 v5 / ext_foreign_toplevel_list_v1 v1 /
+   zwlr_foreign_toplevel_manager_v1 v3 / zwp_linux_dmabuf_v1 v5 all present.
+   ABSENT: ext_image_copy_capture_manager_v1 -> grim -T (toplevel capture) cannot work on this niri.
+2. grim: full eDP-1 -> 2560x1600 RGBA PNG in 0.398s wall. Region "100,100 400x300" (logical)
+   -> 599x449 physical PNG (RGB), 0.041s. Formats: png|ppm|jpeg only (no webp).
+3. Mutter.ScreenCast Version=4, served by niri PID 1314.
+   Session iface: RecordMonitor(s a{sv} -> o), RecordWindow(a{sv} -> o), Start, Stop, Closed.
+   *** NO RecordArea, NO RecordVirtual. ***
+   cursor-mode: u, Mutter enum 0|1|2 (hidden|embedded|metadata); 3 and 4 rejected
+   ("expected variant index 0 <= i < 3") — NOT the portal bitmask.
+   RecordWindow: requires window-id (t); bogus id accepted at RecordWindow time (validation deferred).
+   RecordMonitor with unknown connector -> "no such monitor".
+   Stream object: Parameters property = position (ii) + size (ii) in LOGICAL px (1706x1066);
+   PipeWireStreamAdded(u) fired ~immediately after Start -> node 70.
+4. Node 70 EnumFormat (10-node70-enumformat.txt / 11-pwcli-enumformat-raw.txt):
+   ONE pod: video/raw, format BGRx, size 2560x1600 (PHYSICAL), framerate 0/1 (variable),
+   maxFramerate range 1/1..60000/1000. modifier prop flags 0x18 (MANDATORY|DONT_FIXATE),
+   choice of 8: six AMD (vendor 0x2) tiled/DCC modifiers, LINEAR (0x0), INVALID (0xffffffffffffff).
+   No modifier-less pod => shm (MemPtr/MemFd) NOT advertised in EnumFormat; dmabuf-first.
+   (Caveat: whether niri renegotiates to shm for a modifier-less client is untested here —
+   gst-plugin-pipewire not installed; needs a pipewire-rs stream connect test.)
+5. Cast visibility: no new layer surface during cast (layers: wallpaper + saola-panel only).
+   niri msg casts EXISTS: showed stream_id 4 / session_id 2 / target eDP-1 / pw_node_id 70 /
+   is_active false (no consumer attached). Event stream: CastsChanged, CastStartedOrChanged
+   (pw_node_id null -> 70), CastStopped on Stop.
+6. Cleanup verified: Stop -> session object gone, node 70 gone from pw-dump, "No screencasts".
+7. Audio (16-pactl-sources.txt): sources = alsa_output.pci-0000_07_00.6.analog-stereo.monitor (56)
+   and alsa_input.pci-0000_07_00.6.analog-stereo (57), both s32le 2ch 48000Hz SUSPENDED.

@@ -1,0 +1,27 @@
+  Object: size 288, type Spa:Pod:Object:Param:Format (262147), id Spa:Enum:ParamId:EnumFormat (3)
+    Prop: key Spa:Pod:Object:Param:Format:mediaType (1), flags 00000000
+      Id 2        (Spa:Enum:MediaType:video)
+    Prop: key Spa:Pod:Object:Param:Format:mediaSubtype (2), flags 00000000
+      Id 1        (Spa:Enum:MediaSubtype:raw)
+    Prop: key Spa:Pod:Object:Param:Format:Video:format (131073), flags 00000000
+      Id 8        (Spa:Enum:VideoFormat:BGRx)
+    Prop: key Spa:Pod:Object:Param:Format:Video:modifier (131074), flags 00000018
+      Choice: type Spa:Enum:Choice:Enum, flags 00000000 88 8
+        Long 144115188349975299
+        Long 144115188349975299
+        Long 144115188349958915
+        Long 144115188349762307
+        Long 144115188348492547
+        Long 144115188348491267
+        Long 144115188075858177
+        Long 0
+        Long 72057594037927935
+    Prop: key Spa:Pod:Object:Param:Format:Video:size (131075), flags 00000000
+      Rectangle 2560x1600
+    Prop: key Spa:Pod:Object:Param:Format:Video:framerate (131076), flags 00000000
+      Fraction 0/1
+    Prop: key Spa:Pod:Object:Param:Format:Video:maxFramerate (131077), flags 00000000
+      Choice: type Spa:Enum:Choice:Range, flags 00000000 40 8
+        Fraction 60000/1000
+        Fraction 1/1
+        Fraction 60000/1000

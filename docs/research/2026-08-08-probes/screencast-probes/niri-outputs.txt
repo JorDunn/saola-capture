@@ -1,0 +1,23 @@
+Output "Thermotrex Corporation TL140ADXP01 Unknown" (eDP-1)
+  Current mode: 2560x1600 @ 60.000 Hz
+  Variable refresh rate: supported, disabled
+  Physical size: 300x190 mm
+  Logical position: 0, 0
+  Logical size: 1706x1066
+  Scale: 1.5
+  Transform: normal
+  Available modes:
+    2560x1600@120.000 (preferred)
+    2560x1600@60.000 (current)
+    1920x1200@120.000
+    1920x1080@120.000
+    1600x1200@120.000
+    1680x1050@120.000
+    1280x1024@120.000
+    1440x900@120.000
+    1280x800@120.000
+    1280x720@120.000
+    1024x768@120.000
+    800x600@120.000
+    640x480@120.000
+

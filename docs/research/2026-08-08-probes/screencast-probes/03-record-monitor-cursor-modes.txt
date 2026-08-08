@@ -1,0 +1,10 @@
+== cursor-mode 0 ==
+o "/org/gnome/Mutter/ScreenCast/Stream/u1"
+== cursor-mode 1 ==
+o "/org/gnome/Mutter/ScreenCast/Stream/u2"
+== cursor-mode 2 ==
+o "/org/gnome/Mutter/ScreenCast/Stream/u3"
+== cursor-mode 4 ==
+Call failed: invalid value: integer `4`, expected variant index 0 <= i < 3
+== cursor-mode 3 ==
+Call failed: invalid value: integer `3`, expected variant index 0 <= i < 3

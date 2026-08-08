@@ -1,0 +1,63 @@
+== props ==
+{
+ "adapt.follower.spa-node": "",
+ "client.id": 69,
+ "clock.quantum-limit": 8192,
+ "factory.id": 9,
+ "library.name": "videoconvert/libspa-videoconvert",
+ "media.class": "Stream/Output/Video",
+ "media.name": "niri-screen-cast-src",
+ "node.async": true,
+ "node.driver": true,
+ "node.loop.class": "main",
+ "node.loop.name": "main-loop",
+ "node.name": "niri",
+ "node.want-driver": true,
+ "object.id": 70,
+ "object.register": false,
+ "object.serial": 277,
+ "port.group": "stream.0",
+ "stream.is-live": true
+}
+== params keys == ['EnumFormat', 'PropInfo', 'Props', 'Format', 'EnumPortConfig', 'PortConfig', 'Latency', 'ProcessLatency', 'Tag']
+== EnumFormat ==
+[
+ {
+  "mediaType": "video",
+  "mediaSubtype": "raw",
+  "format": "BGRx",
+  "modifier": {
+   "default": 144115188349975299,
+   "alt1": 144115188349975299,
+   "alt2": 144115188349958915,
+   "alt3": 144115188349762307,
+   "alt4": 144115188348492547,
+   "alt5": 144115188348491267,
+   "alt6": 144115188075858177,
+   "alt7": 0,
+   "alt8": 72057594037927935
+  },
+  "size": {
+   "width": 2560,
+   "height": 1600
+  },
+  "framerate": {
+   "num": 0,
+   "denom": 1
+  },
+  "maxFramerate": {
+   "default": {
+    "num": 60000,
+    "denom": 1000
+   },
+   "min": {
+    "num": 1,
+    "denom": 1
+   },
+   "max": {
+    "num": 60000,
+    "denom": 1000
+   }
+  }
+ }
+]

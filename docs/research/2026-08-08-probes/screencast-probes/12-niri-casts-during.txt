@@ -1,0 +1,6 @@
+Cast stream ID 4: (inactive)
+  Session ID: 2
+  Kind: PipeWire
+  Target: output "eDP-1"
+  PipeWire node ID: 70
+

@@ -1,0 +1,17 @@
+NAME                                TYPE      SIGNATURE RESULT/VALUE FLAGS
+org.freedesktop.DBus.Introspectable interface -         -            -
+.Introspect                         method    -         s            -
+org.freedesktop.DBus.Peer           interface -         -            -
+.GetMachineId                       method    -         s            -
+.Ping                               method    -         -            -
+org.freedesktop.DBus.Properties     interface -         -            -
+.Get                                method    ss        v            -
+.GetAll                             method    s         a{sv}        -
+.Set                                method    ssv       -            -
+.PropertiesChanged                  signal    sa{sv}as  -            -
+org.gnome.Mutter.ScreenCast.Session interface -         -            -
+.RecordMonitor                      method    sa{sv}    o            -
+.RecordWindow                       method    a{sv}     o            -
+.Start                              method    -         -            -
+.Stop                               method    -         -            -
+.Closed                             signal    -         -            -
