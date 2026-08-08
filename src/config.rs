@@ -157,6 +157,14 @@ impl fmt::Display for VideoPreset {
 pub struct CaptureConfig {
     pub save_dir: Option<PathBuf>,
     pub image_format: ImageFormat,
+    /// `webp-quality = 1..=100` — libwebp's lossy quality knob, used by
+    /// `storage.rs` (PLAN.md Stage 5, item 3: "WebP encode … quality knob
+    /// from config"). **Added in Stage 5**, the one schema addition since
+    /// Stage 4's migration. Only affects WebP: PNG is lossless and has no
+    /// quality dial at all, which is why the knob is named for the format
+    /// it actually applies to rather than a generic `image-quality` that
+    /// would silently do nothing half the time.
+    pub webp_quality: u8,
     pub png_also: bool,
     pub video_preset: VideoPreset,
     pub cursor: bool,
@@ -164,6 +172,12 @@ pub struct CaptureConfig {
     pub toasts: bool,
     pub copy: bool,
 }
+
+/// The default `webp-quality`. 90 is high enough that a screenshot of text
+/// stays crisp (libwebp's own `cwebp` default is 75, which visibly softens
+/// small type) while still landing a full-screen capture at a fraction of
+/// the equivalent PNG.
+pub const DEFAULT_WEBP_QUALITY: u8 = 90;
 
 impl Default for CaptureConfig {
     /// WebP, no PNG sidecar, HEVC preset, cursor visible, no delay, toasts
@@ -175,6 +189,7 @@ impl Default for CaptureConfig {
         CaptureConfig {
             save_dir: None,
             image_format: ImageFormat::default(),
+            webp_quality: DEFAULT_WEBP_QUALITY,
             png_also: false,
             video_preset: VideoPreset::default(),
             cursor: true,
@@ -286,6 +301,8 @@ impl CaptureConfig {
             .and_then(|value| match_or_warn(value, "image-format", ImageFormat::parse))
             .unwrap_or_default();
 
+        let webp_quality = read_webp_quality(&body).unwrap_or(DEFAULT_WEBP_QUALITY);
+
         let png_also = read_bool(&body, "png-also").unwrap_or(false);
 
         let video_preset = read_str(&body, "video-preset")
@@ -303,6 +320,7 @@ impl CaptureConfig {
         Ok(CaptureConfig {
             save_dir,
             image_format,
+            webp_quality,
             png_also,
             video_preset,
             cursor,
@@ -440,6 +458,25 @@ fn read_delay(table: &Table) -> Option<u32> {
     }
 }
 
+/// `webp-quality = <1..=100>`. Same per-knob rule as [`read_delay`]: only a
+/// TOML integer qualifies, and only one inside libwebp's own accepted range
+/// — a `0` would be a legal libwebp value but produces an unusable image, so
+/// the floor is 1 and anything outside warns and defaults rather than being
+/// silently clamped (a clamp would hide a typo'd `webp-quality = 900`).
+fn read_webp_quality(table: &Table) -> Option<u8> {
+    let value = table.get("webp-quality")?;
+    match value.as_integer() {
+        Some(quality) if (1..=100).contains(&quality) => Some(quality as u8),
+        _ => {
+            eprintln!(
+                "saola-capture: capture.toml: webp-quality {value} is not an integer in 1..=100 \
+                 — using default ({DEFAULT_WEBP_QUALITY})"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +498,7 @@ mod tests {
         let toml = r#"
             save-dir = "~/Pictures/Screenshots"
             image-format = "png"
+            webp-quality = 72
             png-also = true
             video-preset = "av1"
             cursor = false
@@ -475,6 +513,7 @@ mod tests {
             Some(expand_tilde("~/Pictures/Screenshots"))
         );
         assert_eq!(config.image_format, ImageFormat::Png);
+        assert_eq!(config.webp_quality, 72);
         assert!(config.png_also);
         assert_eq!(config.video_preset, VideoPreset::Av1);
         assert!(!config.cursor);
@@ -598,6 +637,43 @@ mod tests {
         assert!(
             config.cursor,
             "a non-boolean cursor value keeps the default"
+        );
+    }
+
+    #[test]
+    fn out_of_range_webp_quality_falls_back_to_the_default() {
+        for toml in [
+            "webp-quality = 0",
+            "webp-quality = 101",
+            "webp-quality = -5",
+        ] {
+            let config = CaptureConfig::parse(toml).expect("well-formed TOML");
+            assert_eq!(
+                config.webp_quality, DEFAULT_WEBP_QUALITY,
+                "{toml} must warn and default"
+            );
+        }
+    }
+
+    #[test]
+    fn fractional_webp_quality_falls_back_to_the_default() {
+        let config = CaptureConfig::parse("webp-quality = 82.5").expect("well-formed TOML");
+        assert_eq!(config.webp_quality, DEFAULT_WEBP_QUALITY);
+    }
+
+    #[test]
+    fn webp_quality_accepts_the_range_boundaries() {
+        assert_eq!(
+            CaptureConfig::parse("webp-quality = 1")
+                .expect("valid")
+                .webp_quality,
+            1
+        );
+        assert_eq!(
+            CaptureConfig::parse("webp-quality = 100")
+                .expect("valid")
+                .webp_quality,
+            100
         );
     }
 

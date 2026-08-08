@@ -101,16 +101,88 @@ fn not_yet_implemented(method: &str, stage: &str) -> zbus::fdo::Error {
     zbus::fdo::Error::NotSupported(format!("{method} is not implemented yet ({stage})"))
 }
 
+/// The daemon's half of the `shot` pipeline — the exact two library calls
+/// `main.rs`'s `--no-daemon` branch makes, in the same order, differing only
+/// in who ends up owning the clipboard selection.
+///
+/// Blocking; always called from [`run_blocking`].
+fn capture_and_save(
+    options: &crate::cli::CaptureOptions,
+) -> Result<crate::storage::SavedCapture, String> {
+    let backend = crate::capture::screencopy::ScreencopyBackend::new();
+    let frame =
+        crate::capture::take_screenshot(&backend, options).map_err(|err| err.to_string())?;
+    crate::storage::save_capture(
+        &frame,
+        options,
+        options.kind,
+        // The daemon outlives the copy, so it can serve the selection
+        // itself rather than spawning a helper — see `storage`'s module
+        // doc comment on why a Wayland "copy" needs somebody to stay alive.
+        crate::storage::ClipboardOwner::ThisProcess,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// Runs a blocking closure without stalling the daemon's executor.
+///
+/// See [`CaptureService::screenshot`]'s doc comment for the reasoning; this
+/// is factored out because Stage 8's window capture and Stage 16's colour
+/// picker will want the same treatment.
+async fn run_blocking<T, F>(work: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => match tokio::task::spawn_blocking(work).await {
+            Ok(result) => result,
+            // The blocking task panicked or was cancelled. Nothing in this
+            // crate's own capture path panics, but a dependency could, and
+            // the daemon reporting it beats the daemon dying with it.
+            Err(err) => Err(format!("the capture task did not finish: {err}")),
+        },
+        // No tokio runtime (not reachable from the daemon, whose iced
+        // executor is tokio-backed — but `spawn_blocking` panics rather
+        // than erroring in that case, so it is guarded rather than assumed).
+        Err(_) => work(),
+    }
+}
+
 #[zbus::interface(name = "io.saola.Capture1")]
 impl CaptureService {
     /// `Screenshot(kind s, options a{sv}) -> s`. `kind` is one of
     /// `"fullscreen"`/`"region"`/`"window"` (see `cli::ShotKind::as_str`);
     /// `options` carries the resolved `CaptureOptions` as CLI-flag-shaped
-    /// key/value pairs (`cli::CaptureOptions::to_dbus_options`). Stage 5
-    /// wires this to `capture/screencopy.rs` + `storage.rs` and returns the
-    /// saved path.
+    /// key/value pairs (`cli::CaptureOptions::to_dbus_options`, decoded by
+    /// its sibling `from_dbus_options`).
+    ///
+    /// **Real as of Stage 5** for `fullscreen` and for `region` with an
+    /// explicit `geometry`; `region` without one needs Stage 7's overlay and
+    /// `window` needs Stage 8, and both report that as a clean D-Bus error
+    /// naming the stage (`capture::CaptureError::Unsupported`).
+    ///
+    /// # Two teaching notes on the body
+    ///
+    /// **`spawn_blocking`.** Everything below the `CaptureBackend` boundary
+    /// blocks: Wayland roundtrips, a ~0.3 s compositor blit, a libwebp
+    /// encode, a file write. Running that directly in this `async fn` would
+    /// park the daemon's whole executor — no other D-Bus method, no iced
+    /// subscription, nothing — for the duration. `spawn_blocking` moves it
+    /// to tokio's blocking pool instead. `Handle::try_current()` guards the
+    /// call because `spawn_blocking` *panics* outside a runtime, and
+    /// CLAUDE.md's no-panic rule does not make an exception for "that can't
+    /// happen"; if there is somehow no runtime, the work runs inline.
+    ///
+    /// **The signal.** `CaptureTaken` is emitted on success, before
+    /// returning. It is the future saola-notifications contract (CLAUDE.md
+    /// Boundaries), so it fires whether the capture came from a keybind, the
+    /// window process or `busctl`. A failed emission is logged, not
+    /// propagated: the screenshot is already on disk and the caller is owed
+    /// its path.
     async fn screenshot(
         &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         kind: String,
         options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<String> {
@@ -118,7 +190,22 @@ impl CaptureService {
             "saola-capture: daemon: Screenshot(kind={kind:?}, {} option(s))",
             options.len()
         );
-        Err(not_yet_implemented("Screenshot", "Stage 5"))
+
+        let options = crate::cli::CaptureOptions::from_dbus_options(&kind, &options)
+            .map_err(|err| zbus::fdo::Error::InvalidArgs(err.to_string()))?;
+
+        let saved = run_blocking(move || capture_and_save(&options))
+            .await
+            .map_err(|err| {
+                eprintln!("saola-capture: daemon: Screenshot failed: {err}");
+                zbus::fdo::Error::Failed(err)
+            })?;
+
+        let path = saved.path.to_string_lossy().into_owned();
+        if let Err(err) = Self::capture_taken(&emitter, &path, &kind).await {
+            eprintln!("saola-capture: daemon: could not emit CaptureTaken: {err}");
+        }
+        Ok(path)
     }
 
     /// `StartRecording(kind s, options a{sv})`. Stage 10/11 wire this to

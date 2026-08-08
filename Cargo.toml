@@ -195,6 +195,50 @@ wl-clipboard-rs = "0.9"
 #   derive gives for free via `Option` fields): both would mean hand-rolling a small
 #   argument-dispatch framework this app doesn't need to own.
 clap = { version = "4", features = ["derive"] }
+# Survey, 2026-08-08 (Stage 5 — screencopy backend + storage). Two needs, one crate,
+# **zero net new crates in the tree** (`libc 0.2.189` was already in `Cargo.lock` as a
+# transitive dependency of the wayland/iced/tokio stacks; verified with `cargo tree -i
+# libc` before adding it, so this is a *direct* declaration of something already
+# compiled, not new weight):
+#  1. `memfd_create` + `ftruncate` — `wl_shm` needs a file descriptor the compositor can
+#     `mmap` to blit a screencopy frame into (`capture/screencopy.rs::shm_file`). The
+#     wayland-client crate deliberately ships no shm-allocation helper.
+#  2. `localtime_r` + `tzset` — `storage.rs` names captures after the **local** wall
+#     clock (`Screenshot_2026-08-08_17-42-31.webp`). `std::time` only knows the Unix
+#     epoch; converting that to a local civil date needs the system timezone database.
+# Options weighed:
+# - `libc` (this pick) — already resolved in the tree, covers both needs, and the unsafe
+#   surface is four one-line calls whose contracts are checked immediately (see the
+#   `SAFETY:` comments at each site). The no-panic rule is unaffected: every call site
+#   checks the return value and converts a failure into a typed error.
+# - `rustix` — safer, more modern wrappers around the same syscalls, and also already in
+#   the tree (twice: 0.38.44 and 1.1.4, via wayland-backend/zbus/calloop). Rejected on
+#   two counts: it would need its `fs` feature declared here (a feature-unification
+#   question against two already-resolved versions, for a saving of ~6 lines of unsafe),
+#   and it has no `localtime_r` equivalent at all, so `libc` would still be needed for
+#   filenames — one dependency doing both beats two doing one each.
+# - `chrono`/`time`/`jiff` for the timestamp — rejected: none is in the tree, all three
+#   are non-trivial additions (`time` alone brings its own tz database handling), and
+#   this crate needs exactly one format string, produced once per screenshot.
+libc = "0.2"
+# Survey, 2026-08-08 (Stage 5). The history index `storage.rs` appends to — a
+# **JSON Lines** file (one JSON object per line, append-only) that Stage 16's library
+# reads. Also **zero net new crates**: `serde_json 1.0.151` was already in `Cargo.lock`
+# as niri-ipc's own transport dependency (`niri_ipc::socket::Socket::send` serializes
+# every request with it), so this is again a direct declaration of an
+# already-compiled crate. Options weighed:
+# - `serde_json` (this pick) — used through `serde_json::json!`/`Value` only; **no
+#   `#[derive(Serialize)]` anywhere**, matching `config.rs`'s hand-walked posture. Escaping
+#   is the whole reason it wins: a saved path can legally contain a tab, a newline, a
+#   quote or invalid UTF-8, and every one of those silently corrupts a hand-rolled TSV
+#   line while `serde_json` handles them by construction.
+# - A hand-written TSV/CSV — zero dependencies, but see above: the escaping is the
+#   feature, and re-implementing it here would be the kind of "boring" that is actually
+#   just untested.
+# - `toml` (already a dependency) — rejected: TOML has no append-a-record form. Every
+#   write would mean re-reading and re-serializing the whole history, which is O(n) per
+#   screenshot and loses the crash-safety an append gives for free.
+serde_json = "1"
 # Recording pipeline survey, 2026-08-08 — **not added as a dependency yet**, per
 # PLAN.md Stage 1 (Stage 9 adds it once Stage 2's shm/dmabuf evidence is in hand).
 # Latest: `pipewire` 0.10.0 (rust-version 1.80), companion `spa` crate carries the SPA

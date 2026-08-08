@@ -2,18 +2,22 @@
 //! three run modes described in `CLAUDE.md` — `daemon`, `window`, or one of
 //! the CLI verbs (`shot`, `record`, `pick-color`, `open`).
 //!
-//! # Stage 3: real dispatch, stub backends
+//! # What is real, and what is still a stub
 //!
-//! Stage 1 left every mode as a print-and-exit-0 stub. This stage makes the
-//! *plumbing* real — argument parsing (`cli.rs`), config-vs-flag resolution
-//! (`cli::CaptureOptions`/`cli::RecordOptions`), the `io.saola.Capture1`
-//! bus (`dbus.rs`), and the daemon's surfaceless boot — while every actual
-//! capture/record/pick-color *backend* stays a stub (`dbus::CaptureService`'s
-//! methods log-and-`Error`; the window process still just prints). That
-//! split is deliberate: Stage 3's job is proving the seams work end to end
-//! (a CLI verb really does reach the daemon over D-Bus and get a real
-//! answer back, even though today that answer is always "not yet"),
-//! not building the capture engine — that's Stage 5 on.
+//! Stage 3 made the *plumbing* real — argument parsing (`cli.rs`),
+//! config-vs-flag resolution (`cli::CaptureOptions`/`cli::RecordOptions`),
+//! the `io.saola.Capture1` bus (`dbus.rs`), and the daemon's surfaceless
+//! boot — while every capture backend stayed a stub.
+//!
+//! **Stage 5 made `shot` real**, both ways: `run_shot_in_process`
+//! (`--no-daemon`) and the daemon's `Screenshot` method call the same two
+//! library functions (`capture::take_screenshot` then
+//! `storage::save_capture`), and the saved path prints to stdout. What is
+//! still a stub: `record` (Stages 10–11), `pick-color` (Stage 16), the
+//! `window` process (Stage 9), and the two capture *kinds* that need a
+//! surface — an interactive `--region` (Stage 7's overlay) and `--window`
+//! (Stage 8) — each reporting a clean error naming its stage rather than
+//! failing silently.
 //!
 //! # The two process shapes in this file
 //!
@@ -29,9 +33,11 @@
 //! comment for why that's still "one runtime" and not a violation of the
 //! rule.
 
+mod capture;
 mod cli;
 mod config;
 mod dbus;
+mod storage;
 
 use std::fmt;
 use std::future::Future;
@@ -62,6 +68,7 @@ fn main() -> ExitCode {
         Command::Record(args) => report(run_record(cli.config_dir.as_deref(), args)),
         Command::PickColor => report(run_pick_color()),
         Command::Open => report(run_open()),
+        Command::ClipboardServe(args) => run_clipboard_serve(&args.mime),
     }
 }
 
@@ -87,9 +94,9 @@ fn report(result: Result<String, CliRunError>) -> ExitCode {
 /// `report` has one thing to format. Deliberately *not* `Box<dyn Error>`:
 /// naming each source explicitly means a new failure mode has to be
 /// threaded through consciously rather than auto-boxing into an opaque
-/// blob, which matters here because two of these (`Args`,
-/// `NotYetImplemented`) are this crate's own, user-actionable messages,
-/// not just wrapped library errors.
+/// blob, which matters here because several of these (`Args`, `Capture`,
+/// `Storage`) are this crate's own, user-actionable messages, not just
+/// wrapped library errors.
 #[derive(Debug)]
 enum CliRunError {
     /// A flag, or flag/config combination, didn't resolve — see `cli.rs`'s
@@ -104,10 +111,13 @@ enum CliRunError {
     /// runtime — see `run_async`'s doc comment) failed to build. Distinct
     /// from `Bus`/`Client` because it means nothing async ever ran at all.
     Runtime(std::io::Error),
-    /// The backend this verb needs hasn't landed yet (Stage 5+). Carries
-    /// a note naming the stage that will implement it, so the message is
-    /// actionable rather than a bare "not implemented."
-    NotYetImplemented(&'static str),
+    /// The in-process (`--no-daemon`) capture itself failed — no
+    /// compositor, no outputs, a refused screencopy request. Only the
+    /// `--no-daemon` path produces this; on the daemon path the same
+    /// failures come back as a D-Bus error reply and land in `Bus`.
+    Capture(capture::CaptureError),
+    /// The in-process capture succeeded but could not be saved.
+    Storage(storage::StorageError),
 }
 
 impl fmt::Display for CliRunError {
@@ -117,8 +127,21 @@ impl fmt::Display for CliRunError {
             CliRunError::Bus(err) => write!(f, "{err}"),
             CliRunError::Client(err) => write!(f, "{err}"),
             CliRunError::Runtime(err) => write!(f, "could not start an async runtime: {err}"),
-            CliRunError::NotYetImplemented(note) => write!(f, "{note}"),
+            CliRunError::Capture(err) => write!(f, "{err}"),
+            CliRunError::Storage(err) => write!(f, "{err}"),
         }
+    }
+}
+
+impl From<capture::CaptureError> for CliRunError {
+    fn from(err: capture::CaptureError) -> Self {
+        CliRunError::Capture(err)
+    }
+}
+
+impl From<storage::StorageError> for CliRunError {
+    fn from(err: storage::StorageError) -> Self {
+        CliRunError::Storage(err)
     }
 }
 
@@ -182,20 +205,19 @@ async fn connect_to_daemon() -> Result<zbus::Connection, CliRunError> {
 }
 
 /// `shot`: resolve flags-over-config into a `CaptureOptions`, then either
-/// call the daemon over D-Bus or (`--no-daemon`) run in-process. The
-/// in-process path has no capture backend yet — Stage 5 fills it in;
-/// today it reports a clean, actionable "not yet" rather than doing
-/// nothing silently (CLAUDE.md's no-panic rule extends to "a no-op that
-/// looks like success").
+/// call the daemon over D-Bus or (`--no-daemon`) run in-process.
+///
+/// Both branches end up in the same two library calls —
+/// `capture::take_screenshot` then `storage::save_capture` — because the
+/// daemon's `Screenshot` method calls exactly those too (`dbus.rs`). The
+/// only differences are where they run and who owns the clipboard
+/// afterwards; see `storage::ClipboardOwner`.
 fn run_shot(config_dir: Option<&Path>, args: cli::ShotArgs) -> Result<String, CliRunError> {
     let config = load_config(config_dir);
     let options = cli::CaptureOptions::resolve(&config, &args)?;
 
     if options.no_daemon {
-        return Err(CliRunError::NotYetImplemented(
-            "--no-daemon: in-process, headless capture lands in Stage 5 \
-             (capture/screencopy.rs + storage.rs)",
-        ));
+        return run_shot_in_process(&options);
     }
 
     run_async(async move {
@@ -207,6 +229,44 @@ fn run_shot(config_dir: Option<&Path>, args: cli::ShotArgs) -> Result<String, Cl
             .await?;
         Ok(path)
     })
+}
+
+/// `shot --no-daemon`: the whole capture, in this process, with no D-Bus,
+/// no iced, no surfaces (PLAN.md Stage 5, task 4 — "the same library calls,
+/// no UI").
+///
+/// Deliberately **synchronous**: there is no async work here at all, so this
+/// branch never builds the `tokio::Runtime` `run_async` would. That is the
+/// scriptable path's whole selling point — a `shot --fullscreen --no-daemon`
+/// is process start, one Wayland connection, one encode, one write.
+///
+/// The clipboard is the one thing that can't be finished in-process (see
+/// `storage`'s module doc comment): this process is about to exit, so it
+/// hands the selection to a detached helper instead of owning it.
+fn run_shot_in_process(options: &cli::CaptureOptions) -> Result<String, CliRunError> {
+    let backend = capture::screencopy::ScreencopyBackend::new();
+    let frame = capture::take_screenshot(&backend, options)?;
+    let saved = storage::save_capture(
+        &frame,
+        options,
+        options.kind,
+        storage::ClipboardOwner::DetachedHelper,
+    )?;
+    Ok(saved.path.display().to_string())
+}
+
+/// The hidden `clipboard-serve` verb (see `cli::Command::ClipboardServe`):
+/// blocks serving the Wayland selection until something else claims it, so
+/// it must not go through `report` — there is no path to print, and its
+/// stdout is `/dev/null` anyway.
+fn run_clipboard_serve(mime: &str) -> ExitCode {
+    match storage::run_clipboard_serve(mime) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("saola-capture: clipboard-serve: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `record start|stop|toggle`. `toggle` is forwarded as `StartRecording`

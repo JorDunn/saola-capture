@@ -13,16 +13,21 @@ window, history library, annotation editor), and **CLI verbs** (`shot`,
 architecture, dependencies, or conventions updates this file in the same
 stage and says so in its handoff. A stale CLAUDE.md is a bug.
 
-> Status: Stages 1–4 landed (repo skeleton, dependency survey; every capture
+> Status: Stages 1–5 landed (repo skeleton, dependency survey; every capture
 > path proven with live evidence in `docs/CAPTURE-RESEARCH.md`; full CLI
-> parsing, `capture.toml` config, the `io.saola.Capture1` bus, and a
-> surfaceless daemon boot). Every CLI verb now really talks to the daemon
-> over D-Bus — auto-spawning it detached and retrying once if the bus name
-> is unowned — but every method it calls (`Screenshot`, `StartRecording`,
-> `StopRecording`, `PickColor`, `OpenWindow`) is still a stub that logs and
-> returns a clean D-Bus error naming the stage that implements it; so is
-> `--no-daemon` and the `window` process. PLAN.md is the staged build plan.
-> Sections marked *(pending Stage N)* fill in as later stages land.
+> parsing, `capture.toml` config, the `io.saola.Capture1` bus, a surfaceless
+> daemon boot, and — new in Stage 5 — a **real screenshot pipeline**).
+> `shot --fullscreen` and `shot --region --geometry WxH+X+Y` now genuinely
+> capture, encode, save, copy and print a path, **both ways**: through the
+> daemon's `Screenshot` D-Bus method (which also emits `CaptureTaken`) and
+> in-process via `--no-daemon`. Both go through the same two library calls,
+> `capture::take_screenshot` → `storage::save_capture`.
+> Still stubs, each answering with a clean error naming its stage:
+> `StartRecording`/`StopRecording` (Stages 10–11), `PickColor` (Stage 16),
+> `OpenWindow` and the `window` process (Stage 9), an interactive `--region`
+> with no `--geometry` (Stage 7's overlay) and `--window` (Stage 8).
+> PLAN.md is the staged build plan. Sections marked *(pending Stage N)* fill
+> in as later stages land.
 >
 > **2026-08-08 amendment (decided with Jordan)**: config migrated KDL → TOML
 > (`capture.toml`) in Stage 4, which is why PLAN.md's original Stages 4–18
@@ -53,12 +58,19 @@ cargo run -- window [edit <path>]  # the app window / editor process
 cargo run -- --config-dir ~/scratch shot --fullscreen  # capture.toml from an alternate dir
 ```
 
+There is also a **hidden** verb, `saola-capture clipboard-serve --mime
+image/png`, which reads bytes on stdin and serves them as the Wayland
+selection until something else claims it. It is an implementation detail of
+`--no-daemon` captures (a Wayland "copy" needs a live process to answer paste
+requests, and a CLI verb exits immediately) — spawned detached by
+`storage.rs`, never typed by hand, hidden from `--help`.
+
 Every CLI verb above except `--no-daemon` shots is a real D-Bus client of the
 daemon as of Stage 3 (auto-spawning it detached, retrying once, if the bus
 name is unowned) — `busctl --user introspect io.saola.Capture1
-/io/saola/Capture1` shows the live interface once a daemon is running. Every
-served method still answers with a stub `Error` until its stage lands
-(`src/dbus.rs` names which).
+/io/saola/Capture1` shows the live interface once a daemon is running. As of
+Stage 5 `Screenshot` is real; the other served methods still answer with a
+stub `Error` until their stage lands (`src/dbus.rs` names which).
 
 Live-testing anything that maps overlay surfaces or grabs the keyboard
 happens in a **nested niri** (see Conventions), never the real session.
@@ -112,6 +124,21 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   - **`iced_layershell` is confirmed viable for the overlay** (Exclusive
     keyboard, Escape, pixel-exact drag, frozen-frame background — all
     live-tested in nested niri). Multi-output is source-verified only.
+  - **A screencopy buffer is the output's *framebuffer*, not what the user
+    sees** — new in Stage 5, extending §1.2 (which covered only the unrelated
+    `y_invert` flag, still always 0 on niri). On an output whose
+    `wl_output.geometry.transform` isn't `Normal`, the captured pixels must
+    have the **inverse** of that transform applied, or the screenshot comes
+    out mirrored/rotated. Caught live: nested niri's winit output is
+    `Flipped180` ("flipped vertically") and the first draft's captures were
+    upside down versus `grim`; with the correction they are **byte-identical**
+    to grim's. Jordan's eDP-1 is `Normal`, so nothing in the real session
+    would ever have shown this. `capture/screencopy.rs::undo_output_transform`.
+  - **`grim` is not a byte-exact oracle at fractional scale.** grim composites
+    into a surface sized `logical × scale` and resamples; on a 1.5-scale output
+    (`825 × 1.5 = 1237.5`) that leaves ~0.03% of pixels differing by ≤5/255 at
+    edges and in gradients. Set the output to scale 1 before demanding an exact
+    match. Same class of artefact §1.4 already flagged for grim's `-g` cropping.
 
 ## Design language (binding)
 
@@ -154,7 +181,8 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   `Cargo.toml` comment essay — alternatives considered and why they lost.
   Heavyweight deps and build-time C toolchains need strong justification.
   Stage 1 landed the WebP encoder, clipboard, and CLI parser surveys; Stage 4
-  landed the TOML crate survey (essays live in `Cargo.toml`; outcomes below).
+  landed the TOML crate survey; Stage 5 landed the `libc` and `serde_json`
+  surveys (essays live in `Cargo.toml`; outcomes below).
   *(Survey pending Stage 10: pipewire —
   Stage 1 recorded version/SPA notes only, per PLAN.md, without adding the
   dependency yet. Stage 2 added the decisive build fact: `pipewire-sys` runs
@@ -187,6 +215,21 @@ PLAN.md's Architecture section is binding; read it first. Summary:
     own proc macros, so the marginal dependency cost is small. `lexopt`/
     `pico-args` stay zero-dependency but would mean hand-writing subcommand
     dispatch and config-override precedence this app doesn't need to own.
+  - **libc** (Stage 5, `libc = "0.2"`) — **zero net new crates** (already in
+    the tree transitively). Two uses, both unavoidable: `memfd_create` +
+    `ftruncate` for the `wl_shm` buffer screencopy blits into, and
+    `localtime_r` for local-time capture filenames (`std::time` knows only the
+    epoch; converting to a local civil date needs the system tz database).
+    Rejected `rustix` (safer wrappers, also already in the tree — but no
+    `localtime_r`, so `libc` would still be needed, and one dep beats two) and
+    `chrono`/`time`/`jiff` (none in the tree, all heavier than one format
+    string per screenshot).
+  - **serde_json** (Stage 5, `serde_json = "1"`) — also **zero net new
+    crates** (niri-ipc's own transport already pulls it). Backs the
+    append-only JSON-Lines history index. Used via `serde_json::Map`/`Value`
+    only, **no `#[derive(Serialize)]`**, matching `config.rs`'s hand-walked
+    posture. Chosen over a hand-rolled TSV specifically for escaping: a saved
+    path can legally contain tabs, newlines and quotes.
   - **Surprise**: `niri-ipc` is `GPL-3.0-or-later` (verified from its own
     `Cargo.toml`, not just crates.io metadata) — the only non-`MIT OR
     Apache-2.0`-compatible-by-permissive-default dependency in the tree.
@@ -208,8 +251,9 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   Bare top-level keys, no `[capture]` wrapper table — the file is already
   capture's own, so there's no sibling config to disambiguate against:
   ```toml
-  save-dir = "~/Pictures/Screenshots"  # default: unset (storage.rs, Stage 5, falls back to ~/Pictures/Captures)
+  save-dir = "~/Pictures/Screenshots"  # default: unset (storage.rs falls back to ~/Pictures/Captures)
   image-format = "webp"                # "webp" | "png", default "webp"
+  webp-quality = 90                    # 1..=100, default 90 (WebP only; PNG is lossless) — added Stage 5
   png-also = false                     # default false
   video-preset = "hevc"                # "hevc" | "av1" | "h264", default "hevc"
   cursor = true                        # default true
@@ -221,23 +265,55 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   next to it logs a one-line migration hint naming both paths (a warning,
   not an error — `capture.kdl` is no longer read at all; defaults still
   apply until it's ported by hand).
+- **Saved captures and the history index** (`src/storage.rs`, Stage 5).
+  Files go to `--output` > `save-dir` > `~/Pictures/Captures` (created on
+  demand), named `Screenshot_YYYY-MM-DD_HH-MM-SS.<ext>` in **local** time,
+  with a `-1`, `-2`, … suffix on collision; every write is `.name.part` +
+  `rename`, so a failed write never leaves a truncated image. The clipboard
+  always gets **PNG** (`image/png` is what every paste target understands),
+  regardless of the saved format. The index is append-only **JSON Lines** at
+  `$XDG_DATA_HOME/saola/capture/history.jsonl` (default
+  `~/.local/share/saola/capture/history.jsonl`), one object per line with
+  `v/unix/path/png?/kind/format/width/height/scale/bytes` — readers must
+  ignore unknown keys and skip unparseable lines. Full spec on
+  `storage::HistoryEntry`; Stage 16's library is its consumer. Clipboard and
+  index failures **warn and continue** — the file is already on disk.
 - **One runtime**: `zbus 5` with `default-features = false, features =
   ["tokio"]`; never a second async runtime. The **PipeWire main loop is the
   one sanctioned extra thread** — it bridges to the daemon via a bounded
-  channel and is documented as the exception.
+  channel and is documented as the exception. Capture itself is *blocking*
+  (Wayland roundtrips, ~0.3 s of compositor blit, an encode): the daemon runs
+  it on `tokio::task::spawn_blocking`, guarded by `Handle::try_current()`
+  because `spawn_blocking` panics outside a runtime (`dbus::run_blocking`).
 - "Every module maps to a signal, not a poll." Modules follow the sibling
   shape: state struct + `view(&Theme) -> Element` + `subscription()` +
   nested `Message` enum.
 - **Testing**: pure logic (selection geometry, recorder state machine,
   config, undo/redo, swizzle/crop, blur kernels) unit-tested directly;
-  buses/compositors behind traits with fakes. **The nested-niri rule
+  buses/compositors behind traits with fakes. **Never `std::env::set_var`
+  in a test** (binding, learned the hard way in Stage 5): `cargo test` runs
+  every test in the binary on parallel threads of *one process*, so two
+  tests each redirecting `$XDG_DATA_HOME`/`$HOME` at their own temp dir
+  clobber each other — an intermittent ~1-in-15 failure that looks like a
+  filesystem flake. The shape to copy instead: the environment is read once
+  at a thin production wrapper (`storage::save_capture`,
+  `storage::history_path`, `CaptureConfig::resolve_path`), and the logic underneath
+  takes the resolved path as an argument (`storage::save_capture_indexing_to`,
+  `storage::history_dir`, `config::config_dir_from`); tests call the
+  argument-taking half. **The nested-niri rule
   (binding, from saola-lockscreen/CLAUDE.md)**: anything mapping overlay
   surfaces or grabbing the keyboard is live-tested against a nested niri
   first — spawn `niri -c /tmp/nested-niri.kdl &` *without* `--session`,
   override `NIRI_SOCKET` explicitly (your shell's points at the outer
   niri), run against the nested `WAYLAND_DISPLAY` only, tear down after.
   Never run input-grabbing tests in the real session without Jordan
-  present.
+  present. **Stage 5 earned this rule its keep**: the nested winit output's
+  `Flipped180` transform exposed a mirrored-capture bug that the real
+  session (transform `Normal`) could never have shown. Two nested-niri
+  gotchas found there: `niri msg output winit scale N` works, but
+  `... transform 90` is silently ignored (the winit backend pins its own
+  transform), so the rotation cases stay untested; and comparisons against
+  `grim` are only byte-exact at **scale 1** (see Architecture).
 - **Conventional Commits** (release-plz derives bumps); `chore:`/`ci:`/
   `docs:`/`test:` are changelog-invisible. Never hand-edit versions or
   `CHANGELOG.md`.

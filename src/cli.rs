@@ -76,6 +76,37 @@ pub enum Command {
     /// Open the app window (CLI convenience verb, same as `window` with no
     /// further action).
     Open,
+    /// **Internal.** Serve one blob of bytes as the Wayland clipboard
+    /// selection until something else takes it over, reading the blob from
+    /// stdin. Hidden from `--help`: it is an implementation detail of the
+    /// `--no-daemon` capture path, not a verb anyone should type.
+    ///
+    /// # Why this exists at all (teaching note)
+    ///
+    /// A Wayland clipboard "copy" is not a write into a shared buffer: the
+    /// copying client keeps a `wl_data_source` alive and *serves* the bytes
+    /// on demand every time something pastes. When that client exits, the
+    /// selection dies with it. `wl-clipboard-rs` handles this by spawning a
+    /// background **thread** that serves requests — which is exactly right
+    /// inside the long-lived daemon, and useless inside a `shot
+    /// --no-daemon` process that is about to exit.
+    ///
+    /// So the short-lived path spawns *this* verb, detached, and hands it
+    /// the bytes down a pipe. It is the same shape `wl-copy` uses (which is
+    /// why `wl-copy` appears to "return" while the clipboard keeps working),
+    /// implemented in-process so the clipboard doesn't become a third
+    /// external-binary dependency — see the `wl-clipboard-rs` survey in
+    /// `Cargo.toml` for why spawning `wl-copy` itself was rejected.
+    #[command(hide = true)]
+    ClipboardServe(ClipboardServeArgs),
+}
+
+/// Arguments for the hidden [`Command::ClipboardServe`] verb.
+#[derive(Args, Debug, Clone)]
+pub struct ClipboardServeArgs {
+    /// The MIME type to offer the bytes under (`image/png`).
+    #[arg(long, value_name = "type")]
+    pub mime: String,
 }
 
 /// `saola-capture window edit <path>` — jump straight into the annotation
@@ -341,6 +372,9 @@ pub struct CaptureOptions {
     pub kind: ShotKind,
     pub geometry: Option<Geometry>,
     pub format: ImageFormat,
+    /// libwebp's lossy quality, `1..=100`. Config-only (no CLI flag) —
+    /// see `config::CaptureConfig::webp_quality`.
+    pub webp_quality: u8,
     pub png_also: bool,
     /// `None` defers to `storage.rs`'s `~/Pictures/Captures` fallback
     /// (Stage 5) — neither `capture.toml`'s `save-dir` nor `--output` was
@@ -381,6 +415,7 @@ impl CaptureOptions {
             kind,
             geometry,
             format,
+            webp_quality: config.webp_quality,
             png_also: config.png_also,
             output_dir,
             delay,
@@ -404,6 +439,10 @@ impl CaptureOptions {
             "format".to_string(),
             OwnedValue::from(fixed_str(self.format.as_str())),
         );
+        options.insert(
+            "webp-quality".to_string(),
+            OwnedValue::from(u32::from(self.webp_quality)),
+        );
         options.insert("png-also".to_string(), OwnedValue::from(self.png_also));
         if let Some(dir) = &self.output_dir {
             options.insert(
@@ -426,6 +465,89 @@ impl CaptureOptions {
         }
         options
     }
+}
+
+/// The **decode** half of [`CaptureOptions::to_dbus_options`] — what the
+/// daemon does with the `a{sv}` map a CLI verb sent it (Stage 5; the Stage 3
+/// stub only counted the entries).
+///
+/// # Why this is deliberately forgiving (teaching note)
+///
+/// Every value here has already been resolved once, on the *caller's* side,
+/// against that caller's own `capture.toml` — the map is a record of a
+/// decision already made, not user input being validated for the first time.
+/// So a missing or wrong-typed key falls back to the same hardcoded default
+/// [`crate::config::CaptureConfig::default`] uses, rather than failing the
+/// call: a newer CLI talking to an older daemon (or a `busctl` invocation
+/// that sent five of the eight keys by hand) should still take a screenshot.
+///
+/// The one exception is `kind`, which is not an option at all but the
+/// method's own first argument, and has no sensible default — an
+/// unrecognized kind is a hard error.
+impl CaptureOptions {
+    pub fn from_dbus_options(
+        kind: &str,
+        options: &HashMap<String, OwnedValue>,
+    ) -> Result<Self, CliError> {
+        let defaults = CaptureConfig::default();
+
+        let kind = match kind {
+            "fullscreen" => ShotKind::Fullscreen,
+            "region" => ShotKind::Region,
+            "window" => ShotKind::Window,
+            other => {
+                return Err(CliError(format!(
+                    "unrecognized screenshot kind {other:?} (expected fullscreen, region, \
+                     or window)"
+                )))
+            }
+        };
+
+        let format = option_str(options, "format")
+            .and_then(|raw| ImageFormat::parse(&raw))
+            .unwrap_or(defaults.image_format);
+
+        // A `geometry` that doesn't parse is dropped rather than fatal, for
+        // the same "already validated upstream" reason — and dropping it
+        // means a `--region` falls through to the same clean "needs the
+        // overlay" error an omitted geometry would give, not a wrong crop.
+        let geometry = option_str(options, "geometry").and_then(|raw| Geometry::parse(&raw).ok());
+
+        Ok(CaptureOptions {
+            kind,
+            geometry,
+            format,
+            webp_quality: option_u32(options, "webp-quality")
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(|quality| (1..=100).contains(quality))
+                .unwrap_or(defaults.webp_quality),
+            png_also: option_bool(options, "png-also").unwrap_or(defaults.png_also),
+            output_dir: option_str(options, "output").map(PathBuf::from),
+            delay: option_u32(options, "delay").unwrap_or(defaults.delay),
+            cursor: option_bool(options, "cursor").unwrap_or(defaults.cursor),
+            copy: option_bool(options, "copy").unwrap_or(defaults.copy),
+            toast: option_bool(options, "toast").unwrap_or(defaults.toasts),
+            // `--no-daemon` never travels over the bus: by definition a call
+            // that reached the daemon did not take the no-daemon path.
+            no_daemon: false,
+        })
+    }
+}
+
+/// `zvariant` reading helpers. Each clones the `OwnedValue` because
+/// `TryFrom<OwnedValue>` consumes it, and each swallows a type mismatch into
+/// `None` so the caller's `unwrap_or(default)` is the single place the
+/// fallback is spelled out.
+fn option_str(options: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+    String::try_from(options.get(key)?.clone()).ok()
+}
+
+fn option_bool(options: &HashMap<String, OwnedValue>, key: &str) -> Option<bool> {
+    bool::try_from(options.get(key)?.clone()).ok()
+}
+
+fn option_u32(options: &HashMap<String, OwnedValue>, key: &str) -> Option<u32> {
+    u32::try_from(options.get(key)?.clone()).ok()
 }
 
 /// `zvariant::Str<'static>` from an owned `String`, the shape
