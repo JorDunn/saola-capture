@@ -81,13 +81,48 @@ pub const OBJECT_PATH: &str = "/io/saola/Capture1";
 const SPAWN_WAIT_BUDGET: Duration = Duration::from_secs(3);
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(150);
 
-/// The daemon-side interface implementation. Holds no state yet — every
-/// method is a stub — but the type exists (rather than serving a bare unit
-/// struct's `impl` inline) so its doc comment has somewhere to live and so
-/// Stage 5+ has an obvious place to add fields (a handle to the capture
-/// engine, the recording state machine, …) without changing the interface
-/// declaration below it.
-struct CaptureService;
+/// The daemon-side interface implementation. Stage 5 gave it no fields ("a
+/// handle to the capture engine, the recording state machine, … will land
+/// here without changing the interface declaration below it" — Stage 5's
+/// own words). Stage 6 is the first of those: [`Self::events`] is the
+/// bridge to the iced daemon's own surfaces — see [`DaemonEvent`].
+struct CaptureService {
+    /// Notifies `main.rs`'s iced `Daemon` (flash + toast) after a
+    /// successful screenshot. A `try_send` (never `.send().await`) at the
+    /// call site — see [`DaemonEvent`]'s doc comment for why this method
+    /// must never block on it.
+    events: iced::futures::channel::mpsc::Sender<DaemonEvent>,
+}
+
+/// An event crossing from this zbus-hosted service into `main.rs`'s iced
+/// `Daemon::update` (as `Message::CaptureTaken`) — the wiring Stage 6 adds
+/// ("Wire the PrintScr flow end-to-end: `shot --fullscreen` via daemon now
+/// flashes, toasts, ...").
+///
+/// **This is a purely in-process bridge type, not part of the
+/// `io.saola.Capture1` wire contract.** The actual D-Bus signal
+/// (`capture_taken`, below) is unchanged from Stage 5 and is what an
+/// external client (a future saola-notifications, `busctl --user monitor`)
+/// still sees. `DaemonEvent` exists because the flash/toast surfaces live
+/// in a *different* async task (iced's own executor, driven from
+/// `main.rs::dbus_worker_stream`) than the one dispatching this method call
+/// (zbus's `ObjectServer`), and carries a decoded thumbnail rather than a
+/// path so the toast can show one without a second file read + decode — the
+/// `Frame` is still in hand at the point this is built (see
+/// [`CaptureService::screenshot`]), which is exactly the trade
+/// `saola-lockscreen::wallpaper`'s decode-before-iced precedent makes.
+///
+/// Sent over `iced::futures::channel::mpsc` (already in the dependency tree
+/// via `iced`'s own `futures` re-export — see `main.rs`'s `dbus_worker_stream`)
+/// rather than adding `tokio`'s `sync` feature for a `tokio::sync::mpsc`
+/// that would do the same job: zero net new crates/features, matching this
+/// crate's habitual bar for a new dependency.
+pub enum DaemonEvent {
+    CaptureTaken {
+        path: String,
+        thumbnail: iced::widget::image::Handle,
+    },
+}
 
 /// A method that isn't implemented yet: log to stderr (so `daemon`'s own
 /// terminal, or its systemd journal once Stage 17 wires autostart, shows
@@ -105,14 +140,20 @@ fn not_yet_implemented(method: &str, stage: &str) -> zbus::fdo::Error {
 /// `main.rs`'s `--no-daemon` branch makes, in the same order, differing only
 /// in who ends up owning the clipboard selection.
 ///
+/// Returns the [`Frame`](crate::capture::Frame) alongside the
+/// [`SavedCapture`](crate::storage::SavedCapture) as of Stage 6 (Stage 5
+/// discarded it once `save_capture` returned) — [`CaptureService::screenshot`]
+/// needs it, still in memory, to build the toast's thumbnail without a
+/// second file read + decode.
+///
 /// Blocking; always called from [`run_blocking`].
 fn capture_and_save(
     options: &crate::cli::CaptureOptions,
-) -> Result<crate::storage::SavedCapture, String> {
+) -> Result<(crate::storage::SavedCapture, crate::capture::Frame), String> {
     let backend = crate::capture::screencopy::ScreencopyBackend::new();
     let frame =
         crate::capture::take_screenshot(&backend, options).map_err(|err| err.to_string())?;
-    crate::storage::save_capture(
+    let saved = crate::storage::save_capture(
         &frame,
         options,
         options.kind,
@@ -121,7 +162,8 @@ fn capture_and_save(
         // doc comment on why a Wayland "copy" needs somebody to stay alive.
         crate::storage::ClipboardOwner::ThisProcess,
     )
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+    Ok((saved, frame))
 }
 
 /// Runs a blocking closure without stalling the daemon's executor.
@@ -180,6 +222,17 @@ impl CaptureService {
     /// window process or `busctl`. A failed emission is logged, not
     /// propagated: the screenshot is already on disk and the caller is owed
     /// its path.
+    ///
+    /// **Stage 6: the `events` bridge.** After the signal, a
+    /// [`DaemonEvent::CaptureTaken`] is offered to [`Self::events`] via
+    /// `try_send` — never `.send().await`. Blocking a D-Bus method reply on
+    /// the iced daemon's own event loop draining a channel would be exactly
+    /// the kind of cross-task deadlock risk CLAUDE.md's backpressure posture
+    /// (the pipewire-thread rule: "never block ... drop and log when full")
+    /// warns about generally; `try_send`'s failure path (channel full, or
+    /// the receiving end gone) degrades to a logged warning, never a failed
+    /// screenshot — the file is already on disk and the D-Bus caller is
+    /// still owed its path either way.
     async fn screenshot(
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
@@ -194,7 +247,7 @@ impl CaptureService {
         let options = crate::cli::CaptureOptions::from_dbus_options(&kind, &options)
             .map_err(|err| zbus::fdo::Error::InvalidArgs(err.to_string()))?;
 
-        let saved = run_blocking(move || capture_and_save(&options))
+        let (saved, frame) = run_blocking(move || capture_and_save(&options))
             .await
             .map_err(|err| {
                 eprintln!("saola-capture: daemon: Screenshot failed: {err}");
@@ -205,6 +258,26 @@ impl CaptureService {
         if let Err(err) = Self::capture_taken(&emitter, &path, &kind).await {
             eprintln!("saola-capture: daemon: could not emit CaptureTaken: {err}");
         }
+
+        // 128 px is generous headroom over the toast's 36 px icon tile
+        // (`modules::toast::ICON_TILE_SIZE`) — enough that a HiDPI render
+        // still looks sharp, small enough that the GPU upload stays cheap.
+        let thumbnail = crate::modules::toast::thumbnail_handle(&frame, 128);
+        if self
+            .events
+            .clone()
+            .try_send(DaemonEvent::CaptureTaken {
+                path: path.clone(),
+                thumbnail,
+            })
+            .is_err()
+        {
+            eprintln!(
+                "saola-capture: daemon: could not notify the flash/toast surfaces (channel \
+                 full or the daemon's event loop is gone) — {path} is still saved"
+            );
+        }
+
         Ok(path)
     }
 
@@ -297,10 +370,13 @@ pub enum ServeOutcome {
 /// — either we get it immediately, or somebody else already has it and we
 /// report that back to the caller rather than parking in the ownership
 /// queue.
-pub async fn serve(connection: &Connection) -> zbus::Result<ServeOutcome> {
+pub async fn serve(
+    connection: &Connection,
+    events: iced::futures::channel::mpsc::Sender<DaemonEvent>,
+) -> zbus::Result<ServeOutcome> {
     connection
         .object_server()
-        .at(OBJECT_PATH, CaptureService)
+        .at(OBJECT_PATH, CaptureService { events })
         .await?;
 
     let claimed = connection

@@ -13,15 +13,22 @@ window, history library, annotation editor), and **CLI verbs** (`shot`,
 architecture, dependencies, or conventions updates this file in the same
 stage and says so in its handoff. A stale CLAUDE.md is a bug.
 
-> Status: Stages 1–5 landed (repo skeleton, dependency survey; every capture
+> Status: Stages 1–6 landed (repo skeleton, dependency survey; every capture
 > path proven with live evidence in `docs/CAPTURE-RESEARCH.md`; full CLI
 > parsing, `capture.toml` config, the `io.saola.Capture1` bus, a surfaceless
-> daemon boot, and — new in Stage 5 — a **real screenshot pipeline**).
+> daemon boot; Stage 5's **real screenshot pipeline**; and — new in Stage 6 —
+> the **PrintScr MVP**: the daemon now maps real layer-shell surfaces).
 > `shot --fullscreen` and `shot --region --geometry WxH+X+Y` now genuinely
 > capture, encode, save, copy and print a path, **both ways**: through the
 > daemon's `Screenshot` D-Bus method (which also emits `CaptureTaken`) and
 > in-process via `--no-daemon`. Both go through the same two library calls,
-> `capture::take_screenshot` → `storage::save_capture`.
+> `capture::take_screenshot` → `storage::save_capture`. As of Stage 6, the
+> daemon path additionally **flashes and toasts**: `src/modules/flash.rs` (a
+> full-output ivory fade, live-verified in nested niri) and
+> `src/modules/toast.rs` (the §6 notification card, stack of 3, click opens
+> the — still-stub — editor). Both are wired end to end and are this
+> repo's first surfaces to actually map pixels; see Conventions for two
+> binding gotchas Stage 6 found the hard way.
 > Still stubs, each answering with a clean error naming its stage:
 > `StartRecording`/`StopRecording` (Stages 10–11), `PickColor` (Stage 16),
 > `OpenWindow` and the `window` process (Stage 9), an interactive `--region`
@@ -74,9 +81,14 @@ stub `Error` until their stage lands (`src/dbus.rs` names which).
 
 Live-testing anything that maps overlay surfaces or grabs the keyboard
 happens in a **nested niri** (see Conventions), never the real session.
-Booting the daemon itself is safe in the real session — Stage 3's daemon
-is surfaceless (`StartMode::Background`, no shell role, no keyboard grab)
-and will stay that way until Stage 6/7 spawn the first on-demand surface.
+Booting the daemon itself is safe in the real session — as of Stage 6 the
+daemon does map real surfaces (the flash, permanently; the toast, while
+captures are recent), but neither grabs the keyboard
+(`KeyboardInteractivity::None` on both — see `main.rs`'s `flash_surface_settings`/
+`toast_surface_settings`), so this is still the one surface-mapping daemon
+behavior safe to boot in the real session. Stage 7's overlay is the first
+surface that *will* need `Exclusive` keyboard, and that's exactly the one
+that must never be live-tested outside nested niri.
 
 ## Architecture
 
@@ -100,6 +112,40 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   over the frozen frame; crop in memory. No self-capture race.
 - **Recording state lives in the daemon** and survives window closes; the
   PipeWire thread never blocks on the encoder (bounded channel, drop + log).
+- **Two iced_layershell surface gotchas, found live in Stage 6 and binding on
+  every future surface (the region overlay, recording chip, tray popovers if
+  any land here):**
+  - **The app-wide surface background must be set transparent explicitly**
+    (`.style(Daemon::style)` in `run_daemon`, returning
+    `iced::theme::Style { background_color: Color::TRANSPARENT, .. }`,
+    copied from `saola-panel::main::Panel::style`). Without it, iced clears
+    every surface to `to_iced_theme`'s `background` (`palette.ink`) before
+    drawing anything, so a surface that doesn't cover 100% of its own area
+    with an explicit style shows opaque ink through the gaps — invisible on
+    a surface that's mapped-and-torn-down within a couple hundred
+    milliseconds (which is why Stage 5's surfaceless daemon and Stage 6's
+    first flash draft never revealed it), but a permanent, obvious solid-ink
+    rectangle on any surface that stays mapped. Live-verified with `grim` +
+    pixel sampling in nested niri; see the Stage 6 handoff for the exact
+    repro.
+  - **A layer-shell surface spawned reactively (on the triggering event) can
+    lose its entire visible window to Wayland/GPU setup latency** — the
+    chain from "an event arrives" to "a pixel is composited" crosses several
+    scheduler hops (D-Bus/channel forwarding, iced's message queue,
+    `NewLayerShell`, the compositor's configure round trip, the first GPU
+    frame), and a surface whose *whole lifetime* is short (Stage 6's flash,
+    at ~140 ms) can be torn down before any of that finishes — live-verified
+    in nested niri: ten consecutive `grim` captures immediately after a
+    completed `shot --fullscreen`, zero showing the flash, with the exact
+    same code rendering correctly once given 5 s to work with. **Fix used
+    for the flash**: spawn once, at daemon boot, and never tear down —
+    toggle opacity/visibility instead of the surface's existence
+    (`Daemon::boot`, `SurfaceRole::Flash`). This only works for a surface
+    that's harmless to leave mapped indefinitely (click-through, invisible
+    at rest, no keyboard) — the toast (needs real input) and the future
+    region overlay (needs `Exclusive` keyboard) can't use the same trick and
+    must find their own answer to "is this surface reliably visible in time"
+    if it becomes a problem for them too.
 - `docs/CAPTURE-RESEARCH.md` is the evidence of record for every capture-path
   decision (shm vs dmabuf, window-capture mechanism, audio transport,
   verified ffmpeg command lines), with raw transcripts and probe sources in
@@ -167,6 +213,21 @@ PLAN.md's Architecture section is binding; read it first. Summary:
 - `src/icons.rs` copies saola-panel's pattern (stroke baked into assets,
   `include_bytes!`, svg tint via theme roles). Migrating icons to a shared
   saola-icons crate is **recorded debt**, not this repo's job.
+- **saola-theme v0.5.0 token/style gaps found in Stage 6** (documented and
+  worked around locally per the rule above's spirit — no tag bump yet, since
+  each was answered by deriving from *existing* tokens rather than needing a
+  genuinely new one; a future consolidated pass should still upstream them):
+  - No dedicated flash/shutter motion duration — `modules::flash::fade`
+    reuses `motion.hover` (140 ms).
+  - `saola_theme::style::container::card(theme, Surface::Ink)` paints the
+    *opposite* of what the ink notification card needs (an ivory card, not
+    an ink one) — `modules::toast::ink_card_style` composes the right thing
+    locally from `palette.ink`/`on_ink.primary`/`radii.card`/
+    `shadows.popover`.
+  - No `Sizes.icon_tile` field for the toast's 36 px icon tile, and no
+    life-rule-thickness field for its 3 px terracotta rule —
+    `modules::toast::ICON_TILE_SIZE`/`LIFE_RULE_HEIGHT` are the spec's
+    literal values, named and documented at their one definition site.
 
 ## Conventions
 
@@ -288,6 +349,31 @@ PLAN.md's Architecture section is binding; read it first. Summary:
 - "Every module maps to a signal, not a poll." Modules follow the sibling
   shape: state struct + `view(&Theme) -> Element` + `subscription()` +
   nested `Message` enum.
+- **The zbus-hosted D-Bus service and the iced daemon's own surfaces are
+  different async tasks** (Stage 6, `dbus_worker_stream`/`dbus::DaemonEvent`):
+  when a served method (`CaptureService::screenshot`) needs to poke the
+  daemon's `update` loop, the bridge is a small bounded
+  `iced::futures::channel::mpsc::channel` (never `tokio::sync::mpsc` — `iced`
+  already re-exports the `futures` crate, so this is **zero net new
+  crates/features**, matching this repo's habitual dependency bar). The
+  served method offers to it with `try_send`, never `.send().await` — a full
+  channel degrades to a logged warning, never a blocked D-Bus reply. Stage
+  10's PipeWire-thread-to-daemon bridge is the next place this pattern
+  almost certainly gets reused (or `tokio::sync`, if the pipewire thread
+  isn't itself async — decide there, this note is just "the precedent
+  exists").
+- **Mechanical iced 0.14.2 gotchas, found in Stage 6** (cheap to relearn
+  the hard way, cheaper to just know): `iced::widget::Space::new()` takes
+  **zero** arguments in this crate's resolved version — size it with
+  `.width(..)`/`.height(..)` builder calls, not `Space::new(w, h)` or a
+  `Space::with_width(w)` associated function (neither exists here, despite
+  looking plausible from memory of other iced versions).
+  `iced::widget::image::Handle` derives `Clone`/`PartialEq`/`Eq` but **not**
+  `Debug` (checked directly in `iced_core-0.14.0/src/image.rs`) — wrap it in
+  a local newtype with a hand-written `Debug` before putting it in any type
+  that needs to derive `Debug` (`main.rs`'s `Thumbnail` is the example; the
+  same problem will recur the moment a `Frame`/pixel buffer needs to ride in
+  a `Message`).
 - **Testing**: pure logic (selection geometry, recorder state machine,
   config, undo/redo, swizzle/crop, blur kernels) unit-tested directly;
   buses/compositors behind traits with fakes. **Never `std::env::set_var`
@@ -313,7 +399,17 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   gotchas found there: `niri msg output winit scale N` works, but
   `... transform 90` is silently ignored (the winit backend pins its own
   transform), so the rotation cases stay untested; and comparisons against
-  `grim` are only byte-exact at **scale 1** (see Architecture).
+  `grim` are only byte-exact at **scale 1** (see Architecture). **Stage 6
+  earned it again**: both Architecture bullets above (the transparent-
+  background requirement and the surface-creation-latency finding) were
+  invisible to `cargo test` and found only by mapping real surfaces in
+  nested niri. Two additions to the recipe: `niri msg layers` (not
+  `windows`, not `outputs`) lists layer-shell surfaces by namespace/output;
+  `magick -format "%[pixel:p{X,Y}]" info: file.png` (ImageMagick, already
+  installed) samples one pixel's color from a `grim` capture without opening
+  it, cheap enough to script into a tight loop for a "did this render in
+  time" check the way a single screenshot at an arbitrary offset can't
+  answer reliably.
 - **Conventional Commits** (release-plz derives bumps); `chore:`/`ci:`/
   `docs:`/`test:` are changelog-invisible. Never hand-edit versions or
   `CHANGELOG.md`.

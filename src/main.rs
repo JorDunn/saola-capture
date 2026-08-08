@@ -37,23 +37,27 @@ mod capture;
 mod cli;
 mod config;
 mod dbus;
+mod modules;
 mod storage;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::Parser;
 use iced::futures::channel::mpsc;
-use iced::futures::{SinkExt, Stream};
-use iced::widget::Space;
+use iced::futures::{SinkExt, Stream, StreamExt};
+use iced::widget::{image, Space};
 use iced::window;
 use iced::{Element, Subscription, Task};
 use iced_layershell::build_pattern::daemon;
-use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
+use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer, NewLayerShellSettings};
 use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 use iced_layershell::to_layer_message;
+use saola_theme::Theme;
 
 use cli::{Cli, Command};
 use config::CaptureConfig;
@@ -358,9 +362,34 @@ fn run_window(action: Option<&cli::WindowAction>) -> ExitCode {
 // ---------------------------------------------------------------------
 
 fn run_daemon() -> ExitCode {
+    // The one `Theme` this process ever builds — read here, before the
+    // `daemon(..)` builder call, purely so `default_font` (below) can be
+    // computed from it. `Daemon::boot` builds its own clone independently
+    // (`Theme::saola()`, via `#[derive(Default)]` — `saola_theme::Theme`'s
+    // own `Default` equals `saola()`, so the struct-level derive already
+    // does the right thing without a boot-closure argument like the
+    // panel's `Panel::new` needs); this crate has no config knob that
+    // overrides palette colors the way `panel.kdl`'s `colors { }` does, so
+    // there is nothing to thread between the two beyond staying in sync by
+    // construction.
+    let theme = Theme::saola();
+    let default_font = saola_theme::convert::ui_font(&theme);
+
     let result = daemon(Daemon::boot, "saola-capture", Daemon::update, Daemon::view)
         .subscription(Daemon::subscription)
+        .theme(Daemon::theme)
+        // Transparent app-wide background — see `Daemon::style`'s doc
+        // comment for the live-verified bug this fixes (an opaque ink
+        // rectangle covering the whole output without it).
+        .style(Daemon::style)
         .settings(Settings {
+            // See `saola-panel::main`'s comment on this exact field
+            // ordering: `default_font` must live *inside* this literal,
+            // never behind a separate `.default_font(..)` builder call
+            // before `.settings(..)` — that call's effect is clobbered by
+            // the `..Default::default()` in whichever literal actually
+            // lands last, and this one lands last.
+            default_font,
             layer_settings: LayerShellSettings {
                 // None of these matter for a `Background`-mode surface —
                 // it is a bare `wl_surface` with no shell role at all
@@ -401,36 +430,152 @@ fn run_daemon() -> ExitCode {
     }
 }
 
+/// PLAN.md Stage 6, task 4: `docs/SAOLA-STYLE-GUIDE.md` §11's checklist,
+/// walked for both surfaces this stage adds. Ten items, in order:
+///
+/// **The flash** (`modules::flash`):
+/// 1. Ink or ivory? Neither, exactly — it *is* `palette.paper` (ivory) at a
+///    fading opacity, which is the point: a camera flash reads as a wash of
+///    light, not a shell-chrome surface.
+/// 2. Terracotta element? None, and correctly so — the flash has zero
+///    interactive elements to accent.
+///
+/// Items 3–7 (controls/text/corners/serif/icons): no controls, no text, no
+/// corners (full-bleed, un-rounded — a scrim, not a card), no serif, no
+/// icons. All vacuously satisfied.
+///
+/// 8. Animates — is it one of the five sanctioned exceptions (notification,
+///    popover, hover, breathing status dot, opt-in marquee)? **Honestly,
+///    no** — a shutter flash isn't named in §5's list, because the list
+///    predates this app. PLAN.md's own Stage 6 task ("a ~150 ms ivory
+///    fade") specifies it anyway; recorded here as a deliberate,
+///    spec-directed addition to the animation set for *this app only*,
+///    not a violation to silently wave through.
+/// 9. N/A — not a popover.
+/// 10. Added a colour? No — `palette.paper` only, one of the three.
+///
+/// **The toast** (`modules::toast`):
+/// 1. Ink — §6 verbatim (`ink_card_style`; see that function's doc comment
+///    for the `saola_theme::style::container::card` gap this uncovered).
+/// 2. Terracotta element — the life rule, and it *is* the live one (a
+///    real-time countdown), matching the checklist's "is it the live one"
+///    test exactly.
+/// 3. N/A as stated — there's no button chrome on a toast card, the whole
+///    card is the click target (`mouse_area`), ink fill with ivory text
+///    per §6's own spec rather than the general at-rest-ivory control rule.
+/// 4. Title `typography.size.body` (13.5, Sans 500) ≥ 13px ✓; app name and
+///    body sit at `size.meta`/`size.secondary` (12/12.5, Sans 400), which
+///    is §3's own Metadata/Secondary rows, not the panel-bar floor — the
+///    13px hard minimum is scoped to "panel and bar text" and a
+///    notification card is neither. No countable readout on the card, so
+///    no tabular-numeral question arises.
+/// 5. `radii.card` (26px) ✓.
+/// 6. Zero serif — Sans throughout, matching §3's own notification-card row.
+/// 7. **Deviation, deliberate**: no Lucide glyph. §6 specifies "36px icon
+///    tile (ivory, ink glyph)" for a generic notification; this app's
+///    notification already has something better to show in that tile — the
+///    screenshot's own thumbnail (`modules::toast::thumbnail_handle`) —
+///    so a generic glyph would be strictly less useful. Recorded as an
+///    intentional substitution, not an oversight.
+/// 8. Animates — **yes**, and this one *is* named: §5's own motion table
+///    lists "Notification popup" as a sanctioned timed animation.
+/// 9. N/A — not a popover (no "only one at a time" rule; §6's own "stack of
+///    three, fourth replaces oldest" is the toast's actual sibling rule,
+///    and `ToastStack::push` implements exactly that).
+/// 10. Added a colour? No — ink, ivory, terracotta only. The thumbnail's
+///     own pixels are user content (the screenshot itself), not a
+///     design-system colour choice — exempt for the same reason an avatar
+///     photo is exempt in `saola-lockscreen::modules::reveal`.
+///
 /// Registry of live layer-shell surfaces, keyed by iced's `window::Id`, and
 /// what each one is *for* — the shape `saola-panel::main::SurfaceRole`
-/// established, copied here ahead of any surface actually existing
-/// (PLAN.md Stage 3, task 4: "the SurfaceRole registry in place (no
-/// surfaces yet)").
-///
-/// Currently uninhabited on purpose, rather than a placeholder variant:
-/// Stage 6 (flash/toast) and Stage 7 (overlay) add real variants here as
-/// they start spawning surfaces, and an uninhabited enum still supports an
-/// exhaustive, zero-arm `match` (see `Daemon::view` below) — so the
-/// *pattern* this registry uses is proven out now, and adding the first
-/// real variant later is a compile error at every match site that isn't
-/// updated, never a silently-wrong fallthrough.
+/// established (PLAN.md Stage 3, task 4: "the SurfaceRole registry in
+/// place"). Stage 6 gives it its first two real variants; Stage 7 adds a
+/// third (the region-selection overlay).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SurfaceRole {}
+enum SurfaceRole {
+    /// The full-output camera-flash fade (`modules::flash`). **Spawned once,
+    /// at boot** (`Daemon::boot`), and kept mapped for the daemon's whole
+    /// life — see `Daemon::boot`'s doc comment for why a per-capture
+    /// spawn/unmap (Stage 6's first draft) turned out to be the wrong shape.
+    /// Idle, it renders fully transparent (`Flash::opacity` is `0.0`) and is
+    /// click-through (`events_transparent: true`), so a permanently-mapped
+    /// surface costs nothing visible or interactive between screenshots.
+    Flash,
+    /// The notification stack (`modules::toast`). Mapped by
+    /// [`Daemon::sync_toast_surface`] on the first toast, resized (by
+    /// unmap-then-respawn — see that method's doc comment) whenever the
+    /// card count changes, and unmapped once the last toast expires.
+    Toast,
+}
 
-/// The daemon's whole state. Empty today — `windows` is always empty until
-/// Stage 6/7 spawn a surface — but the field exists now so later stages
-/// extend this struct instead of inventing where the registry lives.
+/// The daemon's whole state.
 #[derive(Debug, Default)]
 struct Daemon {
-    windows: std::collections::HashMap<window::Id, SurfaceRole>,
+    windows: HashMap<window::Id, SurfaceRole>,
+    /// The Saola theme — every color/size the flash and toast surfaces
+    /// draw comes from here. `#[derive(Default)]` on this struct already
+    /// does the right thing (`saola_theme::Theme`'s own `Default` equals
+    /// `Theme::saola()`), so `Daemon::boot` doesn't need to construct it
+    /// by hand — see `run_daemon`'s comment on why the *other* `Theme`
+    /// this process builds (for `default_font`, before the daemon exists)
+    /// doesn't need to be threaded in here either.
+    theme: Theme,
+    flash: modules::flash::Flash,
+    toasts: modules::toast::ToastStack,
+    /// The toast surface's Id, while one is mapped.
+    toast_surface: Option<window::Id>,
+    /// How many cards the *currently mapped* toast surface was sized for.
+    /// Compared against `toasts.len()` on every sync so a card being added
+    /// or expiring (which changes the surface's declared height — see
+    /// `toast_surface_settings`) is noticed even though the surface's own
+    /// Id doesn't change on its own. See `Daemon::sync_toast_surface`.
+    toast_surface_count: usize,
 }
 
 impl Daemon {
-    /// `iced_layershell::build_pattern::daemon`'s boot closure: no
-    /// surfaces to spawn yet, so nothing to do beyond building the default
-    /// state.
+    /// `iced_layershell::build_pattern::daemon`'s boot closure: builds the
+    /// default state, then spawns the flash surface immediately — the same
+    /// `(State, Task<Message>)` boot-time-surface shape
+    /// `saola-panel::main::Panel::spawn_boot_surfaces` uses for its own
+    /// always-on surfaces.
+    ///
+    /// **Why the flash is pre-warmed instead of spawned per capture (a
+    /// finding from this stage's own nested-niri live check, not a
+    /// hypothetical):** the first draft spawned a fresh layer-shell surface
+    /// on every `CaptureTaken` and tore it down once
+    /// [`modules::flash::Flash::is_active`] went false — mirroring how the
+    /// toast surface still works. Live-tested against the nested niri
+    /// instance (`niri msg layers` immediately after triggering `shot
+    /// --fullscreen`, plus repeated `grim` captures timed against the
+    /// trigger), the *toast* reliably appeared — it stays mapped for up to
+    /// 6.35 s, plenty of time to absorb a first surface's Wayland
+    /// configure/ack_configure round trip and its first GPU frame — but the
+    /// *flash*, whose entire budget is `modules::flash::fade`'s ~140 ms,
+    /// never once rendered a visible frame in ten consecutive `grim`
+    /// captures taken immediately after a completed `shot`. The chain from
+    /// "`CaptureService::screenshot` sends a `DaemonEvent`" to "a pixel is
+    /// on screen" crosses several independent scheduler hops (the events
+    /// channel, `dbus_worker_stream`'s forward, iced's own message queue,
+    /// `NewLayerShell`, the compositor's configure round trip, first
+    /// `wgpu` frame) — on this test machine that chain alone eats a
+    /// meaningful fraction of 140 ms before a single pixel is composited,
+    /// so a surface created *after* the trigger can lose the entire fade
+    /// window to setup latency and never be seen at all.
+    ///
+    /// Spawning the surface once, at boot, removes surface-creation latency
+    /// from every capture after the first: by the time any screenshot ever
+    /// happens, the flash surface has already existed (and almost
+    /// certainly already rendered at least one transparent frame) for the
+    /// daemon's entire uptime, so `Flash::trigger` only has to change an
+    /// *already-mapped* surface's opacity, not create one from scratch.
+    /// It's click-through and fully transparent at rest
+    /// (`flash_surface_settings`), so a surface that outlives every
+    /// individual flash costs nothing between screenshots.
     fn boot() -> (Self, Task<Message>) {
-        (Self::default(), Task::none())
+        let mut daemon = Self::default();
+        let (_id, task) = daemon.spawn_surface(SurfaceRole::Flash, flash_surface_settings());
+        (daemon, task)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -446,6 +591,44 @@ impl Daemon {
                 // reused here for the signal-shutdown case too.
                 iced::exit()
             }
+            // The PrintScr flow's tail (PLAN.md Stage 6, task 3): a
+            // screenshot was just saved (`dbus.rs`'s `CaptureService::
+            // screenshot` already emitted the `CaptureTaken` D-Bus signal
+            // and printed the path back to the caller — this is purely the
+            // in-process flash+toast reaction on top of that). The flash
+            // surface already exists (`Daemon::boot`), so triggering it is
+            // just a state change — no `Task` of its own, unlike the toast
+            // (which still spawns/resizes reactively; see
+            // `sync_toast_surface`'s doc comment for why the two surfaces
+            // don't share that lifecycle).
+            Message::CaptureTaken { path, thumbnail } => {
+                let now = Instant::now();
+                self.flash.trigger(now);
+                self.toasts
+                    .push(PathBuf::from(path), thumbnail.0, &self.theme, now);
+                self.sync_toast_surface()
+            }
+            // A fade tick changes nothing in `self` — `Flash::view` reads
+            // `Instant::now()` itself on every render (the same "Tick's
+            // only job is to wake rendering" shape `modules::flash::
+            // Message::Tick`'s own doc comment describes) — so this falls
+            // through to the wildcard `Task::none()` arm below rather than
+            // getting one of its own; it's called out here only so a
+            // reader grepping for `Message::Flash` finds this note instead
+            // of concluding the variant is unhandled.
+            Message::Toast(inner) => {
+                let now = Instant::now();
+                let action = self.toasts.update(inner, now, &self.theme);
+                if let modules::toast::Action::Open(path) = action {
+                    if let Err(err) = spawn_editor(&path) {
+                        eprintln!(
+                            "saola-capture: daemon: could not open the editor for {}: {err}",
+                            path.display()
+                        );
+                    }
+                }
+                self.sync_toast_surface()
+            }
             // The macro-injected layer-shell control variants (see
             // `Message`'s doc comment) never reach here — this is the
             // same catch-all `saola-panel::main::Panel::update` ends with,
@@ -454,32 +637,243 @@ impl Daemon {
         }
     }
 
-    /// No surface this stage ever registers a role for, so every `id` this
-    /// is called with (in practice: none — see `LayerShellSettings`'s
-    /// `start_mode` comment) falls through to an empty element. The
-    /// `Some` arm's `match *role {}` is an exhaustive zero-arm match over
-    /// [`SurfaceRole`] — it can never actually run (the map is always
-    /// empty until Stage 6/7), but it's the shape those stages' real
-    /// `match` arms will replace, kept here as documentation of the
-    /// pattern rather than left implicit.
+    /// Every `id` this is called with is either a surface this daemon
+    /// spawned itself (registered synchronously in [`Self::spawn_surface`]
+    /// — see that method's doc comment for why there's no window between
+    /// "asked for a surface" and "know which surface it is") or the boot
+    /// surface from `run_daemon`'s `Settings` (surfaceless, `Background`
+    /// mode, never registered — see `LayerShellSettings`'s `start_mode`
+    /// comment), which falls through to the empty `None` arm exactly as
+    /// Stage 3 left it.
     fn view(&self, id: window::Id) -> Element<'_, Message> {
         match self.windows.get(&id) {
-            Some(role) => match *role {},
+            Some(SurfaceRole::Flash) => self
+                .flash
+                .view(
+                    &self.theme,
+                    Instant::now(),
+                    modules::flash::fade(&self.theme),
+                )
+                .map(Message::Flash),
+            Some(SurfaceRole::Toast) => self
+                .toasts
+                .view(&self.theme, Instant::now())
+                .map(Message::Toast),
             None => Space::new().into(),
         }
     }
 
-    /// Two independent workers, batched: the D-Bus service (which owns the
-    /// bus name for the daemon's whole life, or reports why it couldn't)
-    /// and the SIGTERM/SIGINT wait. Both funnel into the same
-    /// `Message::Shutdown` — see that variant's doc comment for why a
-    /// unified exit path is the point.
+    /// Three independent workers, batched: the D-Bus service (which owns
+    /// the bus name for the daemon's whole life, or reports why it
+    /// couldn't), the SIGTERM/SIGINT wait, and — new in Stage 6 — the
+    /// flash/toast animation ticks, each gated to run only while its
+    /// surface actually needs to redraw (see
+    /// `modules::flash::Flash::subscription` / `modules::toast::ToastStack::
+    /// subscription`), so an idle daemon between screenshots burns zero
+    /// extra timer wakeups. `Instant::now()` is read once per subscription
+    /// rebuild (cheap, and iced only rebuilds this when `Daemon`'s state
+    /// actually changed) rather than threaded in — see `modules::flash`'s
+    /// module doc comment on why the *modules* themselves never read the
+    /// clock, which this call site is the one sanctioned exception to.
     fn subscription(&self) -> Subscription<Message> {
+        let now = Instant::now();
         Subscription::batch([
             Subscription::run(dbus_worker_stream),
             Subscription::run(shutdown_signal_stream),
+            self.flash
+                .subscription(now, modules::flash::fade(&self.theme))
+                .map(Message::Flash),
+            self.toasts.subscription().map(Message::Toast),
         ])
     }
+
+    /// `saola_theme::to_iced_theme` for whichever surface `_id` is —
+    /// there's only one `Theme` in this daemon (no per-surface palette),
+    /// so every Id gets the same answer. Wired via `.theme(Daemon::theme)`
+    /// in `run_daemon`, mirroring `saola-panel::main::Panel::theme`.
+    fn theme(&self, _id: window::Id) -> iced::Theme {
+        saola_theme::to_iced_theme(&self.theme)
+    }
+
+    /// The app-wide surface background — **must** be transparent, copied
+    /// verbatim from `saola-panel::main::Panel::style`. Live-verified the
+    /// hard way (nested niri, this stage): without this, iced clears every
+    /// surface to `to_iced_theme`'s `background` (`palette.ink`) before
+    /// drawing anything, so the flash surface's own semi-transparent ivory
+    /// container — correct in isolation — was being alpha-blended over an
+    /// *opaque* ink base rather than true Wayland transparency. At rest
+    /// (opacity `0.0`) that composited to solid ink, which was invisible
+    /// while the flash surface was still spawned-and-torn-down per capture
+    /// (Stage 6's first draft — gone again before anyone looked), but
+    /// became a permanent ink rectangle covering the whole output the
+    /// moment `Daemon::boot` started keeping the surface mapped forever
+    /// (this same stage's fix for the *other* flash bug — see `Daemon::
+    /// boot`'s doc comment). Caught by `grim` sampling a pixel a full
+    /// second after a capture, when the flash should long since have faded
+    /// back to nothing. Wired via `.style(Daemon::style)` in `run_daemon`.
+    fn style(&self, theme: &iced::Theme) -> iced::theme::Style {
+        iced::theme::Style {
+            background_color: iced::Color::TRANSPARENT,
+            ..iced::theme::default(theme)
+        }
+    }
+
+    /// Ask the compositor for a new layer-shell surface in the given
+    /// `role`, and register the role against the Id the surface will have
+    /// — copied verbatim from `saola-panel::main::Panel::spawn_surface`
+    /// (see that method's doc comment for the full teaching note on why
+    /// `Message::layershell_open` mints the Id itself, closing the window
+    /// in which `view` could be called with an Id this registry can't
+    /// classify).
+    fn spawn_surface(
+        &mut self,
+        role: SurfaceRole,
+        settings: NewLayerShellSettings,
+    ) -> (window::Id, Task<Message>) {
+        let (id, task) = Message::layershell_open(settings);
+        self.windows.insert(id, role);
+        (id, task)
+    }
+
+    /// Ask the compositor to destroy the surface identified by `id`, and
+    /// forget its role — copied verbatim from `saola-panel::main::Panel::
+    /// remove_surface`.
+    fn remove_surface(&mut self, id: window::Id) -> Task<Message> {
+        self.windows.remove(&id);
+        Task::done(Message::RemoveWindow(id))
+    }
+
+    /// Map, resize, or unmap the toast surface to match
+    /// `self.toasts.len()`.
+    ///
+    /// **Resizing is unmap-then-respawn, not a live `SizeChange`.** A
+    /// layer-shell surface with `events_transparent: false` (the toast
+    /// surface — it has to be clickable) takes pointer input across its
+    /// *entire* declared area, reserved or not (the same all-or-nothing
+    /// input-region constraint `saola-panel::main::IslandKind`'s doc
+    /// comment discovered the hard way). If the surface stayed sized for
+    /// three cards while only one was showing, the blank space below that
+    /// one card would silently swallow clicks meant for whatever window is
+    /// underneath it — every time the toast stack isn't full, which is
+    /// most of the time. Respawning at exactly the height
+    /// `modules::toast::card_stack_height` wants for the
+    /// *current* count keeps the surface's clickable footprint always
+    /// matching what's actually drawn on it. The toast has no keyboard
+    /// focus and no cross-frame animation state that a fresh surface would
+    /// lose (its `Instant`s live on `Daemon`, not the surface), so the
+    /// respawn is invisible to the user.
+    fn sync_toast_surface(&mut self) -> Task<Message> {
+        let needed = self.toasts.len();
+        match (self.toast_surface, needed) {
+            (None, 0) => Task::none(),
+            (None, _) => {
+                let (id, task) = self.spawn_surface(
+                    SurfaceRole::Toast,
+                    toast_surface_settings(&self.theme, needed),
+                );
+                self.toast_surface = Some(id);
+                self.toast_surface_count = needed;
+                task
+            }
+            (Some(id), 0) => {
+                self.toast_surface = None;
+                self.toast_surface_count = 0;
+                self.remove_surface(id)
+            }
+            (Some(id), n) if n != self.toast_surface_count => {
+                self.toast_surface_count = n;
+                let remove = self.remove_surface(id);
+                let (new_id, spawn) =
+                    self.spawn_surface(SurfaceRole::Toast, toast_surface_settings(&self.theme, n));
+                self.toast_surface = Some(new_id);
+                Task::batch([remove, spawn])
+            }
+            // Already mapped at the right size.
+            _ => Task::none(),
+        }
+    }
+}
+
+/// The flash surface's layer-shell settings: the whole output, click
+/// through, no keyboard, no reservation. `Layer::Overlay` — the same layer
+/// `saola-panel::popover.rs` uses for "must sit above everything else,
+/// including a fullscreen window" — so the flash is visible over whatever
+/// was just captured. Single-output only (no `output_option` override, so
+/// this targets the currently active output like the boot surface does);
+/// CLAUDE.md's Architecture section already documents this as an
+/// acceptable v0.1 limitation shared with the not-yet-built region overlay.
+///
+/// Called exactly once, from `Daemon::boot` — see that method's doc comment
+/// for the live nested-niri finding that moved the flash surface's spawn
+/// from "on the first `CaptureTaken`" (this stage's first draft) to boot
+/// time: a surface created fresh per capture can lose its entire ~140 ms
+/// fade window to Wayland/GPU setup latency before ever compositing a
+/// pixel, which is exactly what was observed (ten consecutive `grim`
+/// captures immediately after a completed `shot --fullscreen`, none showing
+/// the flash) until the surface was made permanent.
+fn flash_surface_settings() -> NewLayerShellSettings {
+    NewLayerShellSettings {
+        anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
+        layer: Layer::Overlay,
+        // `(0, 0)` stretches to fill — legal because all four edges are
+        // anchored (`SurfaceGeometry`'s own doc comment in the panel
+        // explains the same rule for its one-axis case).
+        size: Some((0, 0)),
+        margin: Some((0, 0, 0, 0)),
+        exclusive_zone: Some(0),
+        keyboard_interactivity: KeyboardInteractivity::None,
+        events_transparent: true,
+        ..Default::default()
+    }
+}
+
+/// The toast surface's layer-shell settings, sized for `count` cards (see
+/// `modules::toast::card_stack_height`). Anchored top-right with
+/// the same vertical offset (`sizes.popover_top`) `saola-panel`'s popover
+/// uses below its own bar, so a toast never collides with wherever the
+/// panel puts itself; `sizes.island_gap` insets it from the right edge by
+/// the same modest amount islands use between each other. `exclusive_zone:
+/// 0` mirrors the popover's own choice — reserve nothing, but let the
+/// compositor keep the surface out of anyone else's reserved strip.
+fn toast_surface_settings(theme: &Theme, count: usize) -> NewLayerShellSettings {
+    let width = theme.sizes.notification_card_width.round() as u32;
+    let height = modules::toast::card_stack_height(theme, count);
+    let top = theme.sizes.popover_top.round() as i32;
+    let right = theme.sizes.island_gap.round() as i32;
+
+    NewLayerShellSettings {
+        anchor: Anchor::Top | Anchor::Right,
+        layer: Layer::Overlay,
+        size: Some((width, height)),
+        margin: Some((top, right, 0, 0)),
+        exclusive_zone: Some(0),
+        keyboard_interactivity: KeyboardInteractivity::None,
+        // Unlike the flash, the toast has to receive clicks/hover — see
+        // `Daemon::sync_toast_surface`'s doc comment for how the surface
+        // is kept sized so this doesn't swallow clicks meant for anything
+        // else.
+        events_transparent: false,
+        ..Default::default()
+    }
+}
+
+/// Spawns `saola-capture window edit <path>` detached — a toast click
+/// (PLAN.md Stage 6, task 2). Same shape as `dbus::spawn_daemon_detached`
+/// and `storage::spawn_clipboard_helper`: `current_exe()`, redirected
+/// stdio, dropped `Child` handle. The window process is still Stage 9's
+/// stub (`run_window` — it prints and exits 0 today), which is fine: this
+/// call site only has to *ask*, not depend on what answers.
+fn spawn_editor(path: &Path) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg("window")
+        .arg("edit")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 /// The daemon's message type. `#[to_layer_message(multi)]` appends
@@ -493,6 +887,25 @@ impl Daemon {
 /// 2's D9) — the same shape the panel's Islands layout uses, and the reason
 /// this crate adopts `multi` from the start rather than migrating to it
 /// later.
+/// A thumbnail image, wrapped so [`Message`] can keep its plain
+/// `#[derive(Debug, Clone)]`: `iced::widget::image::Handle` derives `Clone`
+/// but **not** `Debug` (verified directly in `iced_core-0.14.0/src/image.rs`
+/// — `#[derive(Clone, PartialEq, Eq)]`, no `Debug`), so embedding it in
+/// `Message` bare would fail to compile the moment `#[to_layer_message]`'s
+/// `Debug` requirement is checked. `Thumbnail`'s hand-written `Debug` prints
+/// a placeholder rather than the pixel data, mirroring
+/// `saola-lockscreen::modules::reveal::Message`'s own hand-written `Debug`
+/// (there, redacting a password; here, just avoiding a `Handle` that has
+/// nothing useful to print).
+#[derive(Clone)]
+struct Thumbnail(image::Handle);
+
+impl fmt::Debug for Thumbnail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Thumbnail(..)")
+    }
+}
+
 #[to_layer_message(multi)]
 #[derive(Debug, Clone)]
 enum Message {
@@ -503,6 +916,17 @@ enum Message {
     /// no-panic rule means "just let it hang" is not an acceptable
     /// alternative to any of them.
     Shutdown(ShutdownReason),
+    /// A screenshot was just saved — `dbus.rs`'s `CaptureService::screenshot`
+    /// forwarded a [`dbus::DaemonEvent::CaptureTaken`] through
+    /// `dbus_worker_stream`. Stage 6's PrintScr wiring: triggers the flash
+    /// and pushes a toast (`Daemon::update`'s arm for this variant).
+    CaptureTaken { path: String, thumbnail: Thumbnail },
+    /// Wraps [`modules::flash::Message`] (just `Tick`) — the fade's own
+    /// gated animation timer.
+    Flash(modules::flash::Message),
+    /// Wraps [`modules::toast::Message`] — the stack's tick, hover and
+    /// click messages.
+    Toast(modules::toast::Message),
 }
 
 #[derive(Debug, Clone)]
@@ -546,19 +970,25 @@ impl ShutdownReason {
 
 /// The D-Bus worker: connect to the session bus, claim `io.saola.Capture1`
 /// (or discover someone already has it), then hold the connection open for
-/// the rest of the daemon's life.
+/// the rest of the daemon's life while forwarding `dbus.rs`'s
+/// [`dbus::DaemonEvent`]s into this daemon's own `Message` stream.
 ///
-/// Teaching note (why this `.await`s forever on success): once
-/// `dbus::serve` has registered the object and claimed the name, there is
-/// nothing left for *this* task to poll — zbus's `ObjectServer` dispatches
-/// every incoming method call on its own, off the `Connection`'s internal
-/// reader task, the moment a message arrives. This stream's only remaining
-/// job is to keep `connection` (and therefore the `ObjectServer`) alive
-/// for as long as the daemon runs; `std::future::pending::<()>()` is an
-/// explicit, self-documenting way to do that, rather than an accidental
-/// side effect of some other `.await` that happens to never resolve.
+/// **Stage 6 teaching note (why this no longer `.await`s a bare
+/// `pending::<()>()`):** Stage 3–5's version parked here doing nothing once
+/// serving started, purely to keep `connection` (and therefore the
+/// `ObjectServer`) alive for the daemon's whole life — zbus dispatches
+/// every incoming method call on its own, off the connection's internal
+/// reader task, so there was nothing left for *this* task to poll. Stage 6
+/// gives it a real job that keeps exactly the same property: looping on
+/// `events_rx.next()` still holds `connection` in scope for as long as the
+/// loop runs (forever, on the `Serving` path — `events_tx` is never
+/// dropped, since `dbus::serve` moved a clone of it into the long-lived
+/// `CaptureService`), while also relaying every [`dbus::DaemonEvent`] a
+/// `Screenshot` call sends into `sender` as the matching `Message` variant.
+/// If `sender.send(..)` ever fails (the iced runtime shut down), the loop
+/// simply stops — there's nothing further to forward to.
 fn dbus_worker_stream() -> impl Stream<Item = Message> {
-    iced::stream::channel(1, async |mut sender: mpsc::Sender<Message>| {
+    iced::stream::channel(8, async |mut sender: mpsc::Sender<Message>| {
         let connection = match zbus::Connection::session().await {
             Ok(connection) => connection,
             Err(err) => {
@@ -571,9 +1001,28 @@ fn dbus_worker_stream() -> impl Stream<Item = Message> {
             }
         };
 
-        match dbus::serve(&connection).await {
+        // A small bounded channel: `CaptureService::screenshot` only ever
+        // offers to it via `try_send` (never blocks a D-Bus reply on this
+        // loop keeping up — see that method's doc comment), so a full
+        // channel degrades to a logged, dropped event rather than backing
+        // up method calls.
+        let (events_tx, mut events_rx) = mpsc::channel::<dbus::DaemonEvent>(8);
+
+        match dbus::serve(&connection, events_tx).await {
             Ok(dbus::ServeOutcome::Serving) => {
-                std::future::pending::<()>().await;
+                while let Some(event) = events_rx.next().await {
+                    let message = match event {
+                        dbus::DaemonEvent::CaptureTaken { path, thumbnail } => {
+                            Message::CaptureTaken {
+                                path,
+                                thumbnail: Thumbnail(thumbnail),
+                            }
+                        }
+                    };
+                    if sender.send(message).await.is_err() {
+                        break;
+                    }
+                }
             }
             Ok(dbus::ServeOutcome::AlreadyRunning) => {
                 let _ = sender
