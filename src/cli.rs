@@ -641,16 +641,6 @@ pub enum RecordActionKind {
     Toggle,
 }
 
-impl RecordActionKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Start => "start",
-            Self::Stop => "stop",
-            Self::Toggle => "toggle",
-        }
-    }
-}
-
 /// The fully resolved options for one `record` invocation. `audio` has no
 /// config-file counterpart (`capture.toml` carries no audio knob) — it is
 /// `None` unless `--audio` was given, meaning "record video only."
@@ -672,6 +662,25 @@ pub struct RecordOptions {
     /// and Stage 12 will decide the real wire shape for a window recording
     /// target when it builds one.
     pub window_id: Option<u64>,
+    /// `cursor` from `capture.toml` — whether the pointer is composited into
+    /// the cast (`screencast::CursorMode`). **Added in Stage 11.** No CLI
+    /// flag of its own yet: `shot`'s `--cursor`/`--no-cursor` live on
+    /// `ShotArgs`, and adding the pair to `record` is a Stage 12 UX decision,
+    /// not something a recording pipeline needs to invent.
+    pub cursor: bool,
+    /// `save-dir` from `capture.toml`. Recordings land beside screenshots —
+    /// see `storage::allocate_recording_path`. **Added in Stage 11.**
+    pub output_dir: Option<PathBuf>,
+    /// `vaapi-device` from `capture.toml`. **Added in Stage 11.**
+    ///
+    /// Travels over the bus for the same reason every other knob does: the
+    /// **CLI process** is the one that reads `capture.toml` (including any
+    /// `--config-dir` override), and the daemon deliberately loads no config
+    /// of its own — an option map is "a record of a decision already made"
+    /// (see [`CaptureOptions::from_dbus_options`]'s teaching note). Keeping
+    /// that true for recording means `--config-dir` works for `record` exactly
+    /// as it does for `shot`, with no second config-loading path to drift.
+    pub vaapi_device: Option<PathBuf>,
 }
 
 impl RecordOptions {
@@ -720,6 +729,51 @@ impl RecordOptions {
             audio,
             dry_run,
             window_id,
+            cursor: config.cursor,
+            output_dir: config.save_dir.clone(),
+            vaapi_device: config.vaapi_device.clone(),
+        })
+    }
+
+    /// The **decode** half of [`Self::to_dbus_options`] — the daemon's
+    /// `StartRecording` (Stage 11). Same deliberately forgiving posture as
+    /// [`CaptureOptions::from_dbus_options`]: every value was already resolved
+    /// against the caller's own `capture.toml`, so a missing or wrong-typed
+    /// key falls back to the same default rather than failing the call.
+    ///
+    /// `kind` is the method's own first argument. Only `"fullscreen"` is
+    /// accepted today — `region`/`window` recording is Stage 12
+    /// (CAPTURE-RESEARCH D8), and an unrecognized kind is a hard error rather
+    /// than a silent fullscreen recording nobody asked for.
+    pub fn from_dbus_options(
+        kind: &str,
+        options: &HashMap<String, OwnedValue>,
+    ) -> Result<Self, CliError> {
+        let defaults = CaptureConfig::default();
+
+        if kind != "fullscreen" {
+            return Err(CliError(format!(
+                "recording kind {kind:?} is not supported yet — only \"fullscreen\" works today \
+                 (region and window recording land in Stage 12)"
+            )));
+        }
+
+        let preset = option_str(options, "preset")
+            .and_then(|raw| VideoPreset::parse(&raw))
+            .unwrap_or(defaults.video_preset);
+        let audio = option_str(options, "audio").and_then(|raw| AudioSource::parse(&raw));
+
+        Ok(RecordOptions {
+            action: RecordActionKind::Start,
+            preset,
+            audio,
+            // Neither travels over the bus, by construction — a dry run never
+            // reaches the daemon and window targets are Stage 12.
+            dry_run: false,
+            window_id: None,
+            cursor: option_bool(options, "cursor").unwrap_or(defaults.cursor),
+            output_dir: option_str(options, "output").map(PathBuf::from),
+            vaapi_device: option_str(options, "vaapi-device").map(PathBuf::from),
         })
     }
 
@@ -735,6 +789,19 @@ impl RecordOptions {
             options.insert(
                 "audio".to_string(),
                 OwnedValue::from(fixed_str(audio.as_str())),
+            );
+        }
+        options.insert("cursor".to_string(), OwnedValue::from(self.cursor));
+        if let Some(dir) = &self.output_dir {
+            options.insert(
+                "output".to_string(),
+                OwnedValue::from(fixed_str(dir.to_string_lossy().into_owned())),
+            );
+        }
+        if let Some(device) = &self.vaapi_device {
+            options.insert(
+                "vaapi-device".to_string(),
+                OwnedValue::from(fixed_str(device.to_string_lossy().into_owned())),
             );
         }
         options

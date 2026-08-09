@@ -349,13 +349,71 @@ fn default_save_dir(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
 /// filename an hour off from the clock in the corner of the screen is a
 /// small daily papercut.
 fn timestamp_stem() -> String {
+    timestamp_stem_named(SCREENSHOT_PREFIX)
+}
+
+/// The filename prefix for a still image, and (Stage 11) for a recording.
+/// Two different words rather than one generic "Capture" because a directory
+/// holding both wants them to sort into groups, and because the name is the
+/// only thing distinguishing the two once they are on disk.
+const SCREENSHOT_PREFIX: &str = "Screenshot";
+const RECORDING_PREFIX: &str = "Recording";
+
+/// [`timestamp_stem`] with the prefix chosen by the caller.
+fn timestamp_stem_named(prefix: &str) -> String {
     match local_civil_time(unix_now()) {
-        Some(parts) => format_stem(parts),
+        Some(parts) => format_stem(prefix, parts),
         // `localtime_r` failing means no usable timezone database. Falling
         // back to the raw epoch second keeps captures uniquely named and
         // chronologically sortable, which is what the stem is actually for.
-        None => format!("Screenshot_{}", unix_now()),
+        None => format!("{prefix}_{}", unix_now()),
     }
+}
+
+/// Every extension a still capture can occupy, for collision checking.
+const IMAGE_EXTENSIONS: &[&str] = &["webp", "png"];
+
+/// Every extension a recording can occupy — both containers, for the same
+/// reason [`unique_stem_among`] checks both image extensions: a `.mkv` from
+/// one run and a `.mp4` from the next must not share a stem.
+const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4"];
+
+/// Where a recording is about to be written — **Stage 11**.
+///
+/// The video counterpart of the first three steps of [`save_capture_indexing_to`]
+/// (resolve the directory, create it, find a free name), stopping short of
+/// writing anything: unlike a still image, the bytes do not exist yet and will
+/// not exist in this process at all. `encode::ffmpeg_cli` hands this path
+/// straight to ffmpeg, which writes it incrementally over the whole recording
+/// — see `encode::RecordSpec::path` for why that is deliberately *not* routed
+/// through [`write_atomically`].
+///
+/// `explicit` is the same `--output`/`save-dir` override screenshots take, so
+/// recordings land beside them in `~/Pictures/Captures` by default. A
+/// dedicated `video-dir` knob is not a Stage 11 decision; nothing has asked
+/// for one.
+///
+/// **Recordings are not written to the history index.** `HistoryEntry`'s
+/// documented schema fixes `format` to `"webp" | "png"` and carries
+/// still-image-only fields (`png`, `scale`), and Stage 16's library is written
+/// against that. Adding videos means a schema decision (a `v: 2`, or a `type`
+/// key), which belongs to whichever stage actually builds the library's video
+/// half — not to a stage that would be guessing at its reader.
+pub fn allocate_recording_path(
+    explicit: Option<&Path>,
+    extension: &str,
+) -> Result<PathBuf, StorageError> {
+    let dir = resolve_save_dir(explicit)?;
+    fs::create_dir_all(&dir).map_err(|source| StorageError::CreateDir {
+        path: dir.clone(),
+        source,
+    })?;
+    let stem = unique_stem_among(
+        &dir,
+        &timestamp_stem_named(RECORDING_PREFIX),
+        VIDEO_EXTENSIONS,
+    )?;
+    Ok(dir.join(format!("{stem}.{extension}")))
 }
 
 /// Seconds since the Unix epoch. Pre-1970 clocks (a machine with a dead RTC)
@@ -419,12 +477,12 @@ fn local_civil_time(unix: i64) -> Option<CivilTime> {
     })
 }
 
-/// `Screenshot_YYYY-MM-DD_HH-MM-SS`. Dashes rather than colons in the time:
+/// `<prefix>_YYYY-MM-DD_HH-MM-SS`. Dashes rather than colons in the time:
 /// a colon is legal on Linux but breaks the moment the file is copied to a
 /// FAT or SMB share, which screenshots routinely are.
-fn format_stem(time: CivilTime) -> String {
+fn format_stem(prefix: &str, time: CivilTime) -> String {
     format!(
-        "Screenshot_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
+        "{prefix}_{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
         time.year, time.month, time.day, time.hour, time.minute, time.second
     )
 }
@@ -437,8 +495,16 @@ fn format_stem(time: CivilTime) -> String {
 /// sharing a stem, which would make the history index ambiguous about which
 /// PNG belongs to which capture.
 fn unique_stem(dir: &Path, base: &str) -> Result<String, StorageError> {
+    unique_stem_among(dir, base, IMAGE_EXTENSIONS)
+}
+
+/// [`unique_stem`] over an arbitrary set of extensions — Stage 11 added the
+/// video pair (`mkv`/`mp4`) alongside the original image pair.
+fn unique_stem_among(dir: &Path, base: &str, extensions: &[&str]) -> Result<String, StorageError> {
     let free = |stem: &str| {
-        !dir.join(format!("{stem}.webp")).exists() && !dir.join(format!("{stem}.png")).exists()
+        !extensions
+            .iter()
+            .any(|extension| dir.join(format!("{stem}.{extension}")).exists())
     };
 
     if free(base) {
@@ -995,14 +1061,17 @@ mod tests {
 
     #[test]
     fn the_stem_is_sortable_and_free_of_filesystem_hostile_characters() {
-        let stem = format_stem(CivilTime {
-            year: 2026,
-            month: 8,
-            day: 8,
-            hour: 17,
-            minute: 4,
-            second: 9,
-        });
+        let stem = format_stem(
+            SCREENSHOT_PREFIX,
+            CivilTime {
+                year: 2026,
+                month: 8,
+                day: 8,
+                hour: 17,
+                minute: 4,
+                second: 9,
+            },
+        );
         assert_eq!(stem, "Screenshot_2026-08-08_17-04-09");
         assert!(
             !stem.contains(':') && !stem.contains('/') && !stem.contains(' '),
@@ -1016,16 +1085,62 @@ mod tests {
         // race every other test in this binary), so this asserts the shape:
         // same length, same separator positions, all digits where digits go.
         let stem = timestamp_stem();
-        let reference = format_stem(CivilTime {
-            year: 2026,
-            month: 8,
-            day: 8,
-            hour: 17,
-            minute: 4,
-            second: 9,
-        });
+        let reference = format_stem(
+            SCREENSHOT_PREFIX,
+            CivilTime {
+                year: 2026,
+                month: 8,
+                day: 8,
+                hour: 17,
+                minute: 4,
+                second: 9,
+            },
+        );
         assert_eq!(stem.len(), reference.len(), "{stem} vs {reference}");
         assert!(stem.starts_with("Screenshot_"));
+    }
+
+    /// **Stage 11.** Recordings get their own prefix so a capture directory
+    /// sorts into two groups, and their own extension pair so a `.mkv` and a
+    /// `.mp4` from two runs one second apart cannot collide.
+    #[test]
+    fn a_recording_path_is_named_and_deconflicted_separately_from_screenshots() {
+        let dir = TempDir::new("recording-path");
+        let first =
+            allocate_recording_path(Some(dir.path()), "mkv").expect("a writable scratch dir");
+        let name = first
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(name.starts_with("Recording_"), "{name}");
+        assert!(name.ends_with(".mkv"), "{name}");
+        assert_eq!(first.parent(), Some(dir.path()));
+
+        // Occupying the *other* container's name still pushes the next
+        // allocation to a suffix — the same rule screenshots have for
+        // webp/png.
+        fs::write(first.with_extension("mp4"), b"x").expect("write");
+        let second =
+            allocate_recording_path(Some(dir.path()), "mkv").expect("a writable scratch dir");
+        assert_ne!(first, second);
+        let second_name = second
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(second_name.contains("-1."), "{second_name}");
+    }
+
+    #[test]
+    fn a_recording_path_creates_the_save_directory_on_demand() {
+        let dir = TempDir::new("recording-mkdir");
+        let nested = dir.path().join("does/not/exist/yet");
+        let path = allocate_recording_path(Some(&nested), "mp4").expect("created on demand");
+        assert!(nested.is_dir());
+        assert_eq!(path.parent(), Some(nested.as_path()));
+        // Allocating a path must not create the file itself — ffmpeg does.
+        assert!(!path.exists());
     }
 
     #[test]

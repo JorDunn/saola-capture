@@ -19,4 +19,5 @@ pub mod app;
 pub mod countdown;
 pub mod flash;
 pub mod overlay;
+pub mod recorder;
 pub mod toast;

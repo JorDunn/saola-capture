@@ -101,8 +101,33 @@ stage and says so in its handoff. A stale CLAUDE.md is a bug.
 > documented self-destructing session as a clean error). Nothing in Stage 10
 > touches the daemon, the tray, or any surface; `StartRecording` is still a
 > stub until Stage 11 adds the encoder.
-> Still stubs, each answering with a clean error naming its stage:
-> `StartRecording`/`StopRecording` (Stage 11), `PickColor` (Stage 16).
+> **Stage 11 closes the recording loop — `record start|stop|toggle` genuinely
+> records the focused output.** Three pieces: `src/encode/mod.rs` (the
+> `EncoderSink` trait, `EncodePreset`/`VideoEncoder`, CAPTURE-RESEARCH §3.7's
+> argument table *as data*, and `select_encoder` — the runtime VAAPI choice,
+> written as a pure function over an injected capability oracle so it is
+> unit-tested with fakes); `src/encode/ffmpeg_cli.rs` (the one v0.1 sink: an
+> `ffmpeg` child fed packed BGRx on stdin, stderr drained by a thread that
+> also keeps the last 40 lines for the error message, kill-and-reap on
+> `Drop`, `ffmpeg`-missing detected *up front*, plus the `/dev/dri/renderD*`
+> discovery and the trial-encode probe that answers the oracle); and
+> `src/modules/recorder.rs` (the daemon's `RecorderState` — Idle → Starting →
+> Recording → Stopping — and `pump_frames`, the blocking frame loop).
+> `StartRecording`/`StopRecording` are no longer stubs, and the interface
+> gained one additive read-only property, `Recording b`, because `toggle`
+> cannot be implemented correctly without it. **Live-verified against the
+> real session, 2026-08-09**: a 10 s fullscreen capture at 2560×1600 encoded
+> by `hevc_vaapi` (`VAEntrypointEncSlice` in the log — real hardware, on
+> `/dev/dri/renderD128`, the only render node present that day), **10.12 s of
+> Matroska for 10.01 s of wall clock** and 0 dropped frames; `av1` (software
+> `libsvtav1` — no AV1 encode entrypoint anywhere, §3.3 again) and `h264`
+> (`h264_vaapi` → MP4 with `+faststart`) both produced clean, decodable
+> files; and the awkward paths — stop-while-starting, a SIGKILLed encoder
+> mid-recording, a missing ffmpeg, a non-`fullscreen` kind, `--audio` — were
+> each driven live and each came back with one honest sentence and a clean
+> teardown. See the Stage 11 handoff for the transcripts.
+> Still a stub, answering with a clean error naming its stage: `PickColor`
+> (Stage 16).
 > PLAN.md is the staged build plan. Sections marked *(pending Stage N)* fill
 > in as later stages land.
 >
@@ -135,6 +160,15 @@ cargo run -- shot --window --window-id 42  # scriptable: an explicit niri-ipc wi
 cargo run -- shot --fullscreen --delay 3   # any shot kind: countdown pill, then flash+toast
 cargo run -- shot --fullscreen --no-daemon --format=webp --output=/tmp  # headless/scriptable
 cargo run -- record start|stop|toggle [--preset hevc|av1|h264] [--audio mic|system|both]
+                                   # real as of Stage 11, for the focused output. `start` returns
+                                   # once the recording is live; `stop` blocks until ffmpeg has
+                                   # flushed and prints the saved path (~0.2 s, measured);
+                                   # `toggle` reads the daemon's `Recording` property first.
+                                   # `--audio` is refused until Stage 13 rather than ignored.
+SAOLA_CAPTURE_FFMPEG_LOGLEVEL=verbose cargo run -- daemon   # the daemon's ffmpeg children run at
+                                   # -loglevel warning by default; `verbose` is what prints the
+                                   # `Using VAAPI entrypoint VAEntrypointEncSlice (6).` line that
+                                   # *proves* a recording was hardware-encoded (CAPTURE-RESEARCH §3.1)
 cargo run -- record start --dry-run          # Stage 10: negotiate a real screencast, log the
                                              # SPA format + 5 s of frame cadence, write NOTHING,
                                              # tear down. Never contacts the daemon.
@@ -165,10 +199,14 @@ Every CLI verb above except `--no-daemon` shots and `record --dry-run` is a
 real D-Bus client of the daemon as of Stage 3 (auto-spawning it detached, retrying once, if the bus
 name is unowned) — `busctl --user introspect io.saola.Capture1
 /io/saola/Capture1` shows the live interface once a daemon is running. As of
-Stage 5 `Screenshot` is real, and as of Stage 9 so is `OpenWindow`; the
-remaining served methods (`StartRecording`, `StopRecording`, `PickColor`)
-still answer with a stub `Error` until their stage lands (`src/dbus.rs`
-names which).
+Stage 5 `Screenshot` is real, as of Stage 9 `OpenWindow`, and as of Stage 11
+`StartRecording`/`StopRecording`; **`PickColor` is the last stub** (Stage 16;
+`src/dbus.rs` says so in its own error). Stage 11 also added the interface's
+one **property**, `Recording b` (read-only, true while anything is starting,
+recording *or* stopping) — an additive extension, not a change to the frozen
+signal contract, and the only way `record toggle` can choose a branch without
+parsing an error string. Nothing emits `PropertiesChanged` for it yet;
+Stage 12's tray item is the first consumer that will want that.
 
 **`Screenshot` can block for minutes, on purpose** (Stage 7): an interactive
 `region` call does not return until the user confirms or cancels — the same
@@ -179,6 +217,15 @@ error (`the region selection was cancelled`), so `shot --region` exits **1**
 with nothing saved. A second `shot --region` while one is up is refused
 immediately (`a region selection is already in progress`) rather than
 stacking a second exclusive-keyboard surface.
+
+**`StopRecording` blocks too, for the same reason and with the same
+safety** (Stage 11): it does not return until ffmpeg has flushed and the cast
+is torn down, so its reply *is* the saved path. Measured at ~0.22 s for a
+10 s Matroska recording; an MP4 is slower because `+faststart` rewrites the
+whole file, which is why `FINISH_WAIT` is 30 s before the SIGINT escalation.
+`StartRecording`, by contrast, returns as soon as the recording is **live**
+(negotiated, ffmpeg spawned, first frame written) — ~0.33 s measured, most of
+it the VAAPI device probe on a cold daemon.
 
 Live-testing anything that maps overlay surfaces or grabs the keyboard
 happens in a **nested niri** (see Conventions), never the real session.
@@ -211,6 +258,24 @@ interface: the dry run maps no surface, grabs no keyboard, injects no input,
 writes no file, never touches the daemon or the clipboard, and its teardown
 was verified (`niri msg casts` → "No screencasts", no leftover PipeWire
 node). It does briefly cast the screen into memory and discard it.
+**Stage 11's real recordings sit on the same side of that line, with one
+addition: they write files and spawn a child process.** A recording maps no
+surface, grabs no keyboard and injects no input, so nested niri is still both
+impossible (no ScreenCast there) and unnecessary — but the isolation that
+matters shifts from "don't touch the display" to "don't touch Jordan's data".
+The recipe Stage 11 used, and the one to copy: check `busctl --user list |
+grep io.saola.Capture1` **first** — if a real daemon owns the name, do not
+kill it, and note that a private `dbus-daemon` bus is *not* an escape hatch
+here, because niri serves `org.gnome.Mutter.ScreenCast` on the session bus
+and the daemon reaches it over that same `Connection`, so isolating the bus
+isolates the cast away too. With the name unowned, run the test daemon on the
+real session bus with `XDG_DATA_HOME` pointed at a temp dir and a
+`--config-dir` whose `capture.toml` sets `save-dir` to a temp dir (the
+**daemon's** environment decides where files land, but `save-dir` travels
+from the *CLI's* config over the bus — see `RecordOptions::to_dbus_options`).
+Teardown checklist grows one item: `niri msg casts` → "No screencasts",
+`pw-dump` shows no `Video/Source` beyond the webcams, **and `pgrep -x ffmpeg`
+is empty**.
 
 ## Architecture
 
@@ -229,7 +294,17 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   - `EncoderSink` (`src/encode/mod.rs`): ffmpeg CLI (`ffmpeg_cli.rs`,
     rawvideo on stdin, `hevc_vaapi`→MKV primary, SVT-AV1 and H.264/MP4
     presets) is the only v0.1 implementation; the trait is what lets
-    in-process encoders replace it later.
+    in-process encoders replace it later. **Real as of Stage 11**, with two
+    deliberate deviations from PLAN.md's trait sketch, both documented at
+    `encode/mod.rs`'s head: there is **no `pts` argument** on `write_video`
+    (D6 pins `-use_wallclock_as_timestamps 1`, so a `pts` would be a
+    parameter every implementation must ignore — a worse lie than not having
+    it), and **no `write_audio`** (D7 settled audio as an `-f pulse` input
+    ffmpeg opens *itself*, so no PCM ever crosses this trait; the §4.4
+    escalation to PCM on `pipe:3` is the stage that should add it, with a
+    real body rather than a `todo!()`). `start(...)` is an inherent
+    constructor per implementation, not a trait method — a constructor cannot
+    be dispatched through `dyn`.
 - **Region capture freezes first**: capture the output, then map the overlay
   over the frozen frame; crop in memory. No self-capture race. **Real as of
   Stage 7**, and the sequence is fixed at exactly three hops:
@@ -297,6 +372,60 @@ PLAN.md's Architecture section is binding; read it first. Summary:
     at call time and only self-destructs later (§5.3) — that is a
     three-way `tokio::select!` between the node id, `Closed`, and a 5 s
     timeout, and the three outcomes are deliberately different errors.
+  **Stage 11 built the rest of it** (`modules/recorder.rs` + `dbus.rs`), and
+  adds four rules of its own:
+  - **The full teardown order is consumer → encoder → producer**, extending
+    Stage 10's two-step: `PipeWireStream::stop()`, *then* `sink.finish()`
+    (which closes ffmpeg's stdin and waits for the flush), *then*
+    `CastSession::close()`. The first two are blocking and run on the pump's
+    `spawn_blocking` task; the third is a D-Bus call and runs on the async
+    supervisor that awaits it. That split is why a recording is two tasks and
+    not one.
+  - **Exactly one finalization site.** A recording can end without anyone
+    asking (a dead encoder, a compositor-closed cast), so the supervisor —
+    not `StopRecording` — is what emits the signal, raises the toast and
+    returns the machine to `Idle`. A waiting `StopRecording` parks on a
+    oneshot registered *under the same lock that sets the stop flag*, which
+    is what stops the supervisor from finishing in between and concluding
+    nobody was listening.
+  - **`Starting` and `Stopping` are phases because they take real time**, and
+    the guarded `Idle → Starting` transition is taken *before* any slow work.
+    That one transition is the whole defence against two concurrent
+    recordings. Stop-while-starting is therefore expressible (the stop is
+    remembered; the start unwinds itself on arrival) and was driven live.
+  - **A mid-recording renegotiation is fatal, on purpose.** ffmpeg's
+    `-video_size` is fixed for a process's life and the raw pipe carries no
+    framing, so a second `param_changed` at a different size would shear the
+    video rather than fail. `encode::NegotiatedGuard` ends the recording with
+    a stated error instead; a re-announcement of the *same* size is ignored.
+- **The VAAPI device is discovered at encoder start, never hardcoded**
+  (CAPTURE-RESEARCH D6's 2026-08-08 amendment, real in Stage 11):
+  `ffmpeg_cli::render_nodes` enumerates `/dev/dri/renderD*` **sorted** (so
+  ties are deterministic and the iGPU — which is driving the display, so its
+  encoder reads the frames without a cross-device copy — keeps winning), and
+  `probe_encoder` answers "can this node open this encoder?" with a **tiny
+  real trial encode** (`-f lavfi -i color=…` → `hwupload` → encoder →
+  `-f null -`), cached per `(device, encoder)` for the process's life. ffmpeg
+  stays the sole external CLI; there is no runtime `vainfo`. Three things
+  worth not rediscovering:
+  - **The trial frame must be ≥130×128.** The first draft probed at 64×64 and
+    *every* codec on *every* node "failed" — with
+    `Hardware does not support encoding at size 64x64 (constraints: width
+    130-8192 height 128-4352)`, a size rejection that is indistinguishable
+    from a missing entrypoint if you only check the exit status.
+    `PROBE_SIZE` is 256 and a test guards it.
+  - **A trial encode answers a strictly better question than `vainfo`.**
+    `vainfo` reports what the driver advertises; the probe reports what *this
+    ffmpeg build, on this device, right now* can open. §3.3's AV1 case is
+    exactly that gap — the driver advertises `VAProfileAV1Profile0` and the
+    encode still fails, because the profile is decode-only.
+  - **Measured live (2026-08-09):** one node, `/dev/dri/renderD128`;
+    `av1_vaapi` → no (179 ms), `hevc_vaapi` → yes (150 ms), `h264_vaapi` →
+    yes (125 ms); `hevc` resolved in 330 ms total on a cold daemon, ~0 ms
+    warm. The `av1` preset therefore falls back to software `libsvtav1`,
+    which is the only preset that works with **no** usable render node at
+    all — `hevc`/`h264` fail there with an error naming `--preset av1` and
+    the `vaapi-device` knob.
 - **Two iced_layershell surface gotchas, found live in Stage 6 and binding on
   every future surface (the region overlay, recording chip, tray popovers if
   any land here):**
@@ -369,7 +498,17 @@ PLAN.md's Architecture section is binding; read it first. Summary:
     fast), GPU colour conversion with the matrix pinned
     (`scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=tv`), and an
     explicit crop to even dimensions (`hevc_vaapi` silently resizes odd
-    inputs).
+    inputs). **All of it is implemented and live-confirmed as of Stage 11**
+    (`encode::ffmpeg_args`/`filter_chain`), with three refinements the table
+    itself doesn't state: `-fps_mode**:v**` is stream-qualified so a Stage 13
+    audio input isn't caught by it; `-video_size` carries the **negotiated**
+    size while the `crop` filter carries the **even** one (swapping them
+    shears the video instead of failing, which is why they are separate
+    concepts in `VideoSpec`); and `-y` is mandatory because ffmpeg's stdin
+    *is* the video pipe, so a `-n` overwrite prompt could never be answered.
+    Measured end to end: 10.01 s of wall clock → 10.12 s of Matroska, PTS
+    starting at 0 and monotonic — the fast-forward §4.2 warns about is
+    genuinely absent.
   - **`iced_layershell` is confirmed viable for the overlay** (Exclusive
     keyboard, Escape, pixel-exact drag, frozen-frame background — all
     live-tested in nested niri). Multi-output is source-verified only, and
@@ -473,7 +612,12 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   landed the TOML crate survey; Stage 5 landed the `libc` and `serde_json`
   surveys (essays live in `Cargo.toml`; outcomes below).
   Stage 10 landed the `pipewire` survey (outcome below), closing the last
-  survey PLAN.md deferred.
+  survey PLAN.md deferred. **Stage 11 added no dependency at all** — the
+  whole encoder is `std::process` plus one `libc::kill` for the SIGINT that
+  `std::process::Child` cannot send (it only offers SIGKILL, which for ffmpeg
+  means an unfinalized file), and `libc` was already in the tree. That is the
+  `EncoderSink` boundary paying for itself: ffmpeg stays a CLI, so no
+  `ffmpeg-sys`/`libav` link ever enters the graph.
   Stage 8 confirmed CAPTURE-RESEARCH §5.2's prediction: window capture
   (`capture/screencopy.rs`'s `capture_window`/`focused_window`) is entirely
   `niri_ipc::Request::Windows`/`FocusedWindow`/`Action::ScreenshotWindow` —
@@ -572,6 +716,16 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   webp-quality = 90                    # 1..=100, default 90 (WebP only; PNG is lossless) — added Stage 5
   png-also = false                     # default false
   video-preset = "hevc"                # "hevc" | "av1" | "h264", default "hevc"
+  vaapi-device = "/dev/dri/renderD129" # default: unset = discover it (Stage 11). An explicit
+                                       # render node for the hardware presets. Deliberately NOT
+                                       # validated by config.rs — "is this a usable render node?"
+                                       # is a hardware question, not a parse question; a path
+                                       # that doesn't exist warns and falls back to full
+                                       # discovery in ffmpeg_cli::choose_encoder, which is the
+                                       # same warn-and-default rule applied at the layer that can
+                                       # actually check. A path that *does* exist is used **on
+                                       # its own**, so the override genuinely overrides rather
+                                       # than merely reordering.
   cursor = true                        # default true
   delay = 0                            # whole seconds, default 0
   toasts = true                        # the saola-notifications kill-switch, default true
@@ -594,6 +748,32 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   ignore unknown keys and skip unparseable lines. Full spec on
   `storage::HistoryEntry`; Stage 16's library is its consumer. Clipboard and
   index failures **warn and continue** — the file is already on disk.
+- **Recordings share that directory and almost nothing else** (Stage 11,
+  `storage::allocate_recording_path`). They are named
+  `Recording_YYYY-MM-DD_HH-MM-SS.<mkv|mp4>` — a different prefix so one
+  directory sorts into two groups, and collision-checked against **both**
+  video extensions so a `.mkv` and a `.mp4` a second apart cannot share a
+  stem. Three deliberate differences from the still-image path:
+  - **No `.part`+`rename`.** `storage::write_atomically` exists because a
+    screenshot is encoded in memory and written in one shot, so "complete" is
+    knowable; a recording is written incrementally by an external process
+    over minutes, and a rename would only make a recording interrupted by a
+    crash *disappear* instead of being recoverable. Matroska is designed to
+    survive truncation, which is part of why it is the primary container.
+    **Caveat found live**: that only helps once bytes have actually reached
+    the disk — ffmpeg's own AVIO buffer flushed roughly every ~250 KB in the
+    measured run, so a recording SIGKILLed after 3.8 s had written *nothing*
+    yet, and `FfmpegSink`'s zero-byte cleanup (which removes only
+    zero-length files, never a partial one) correctly took it away.
+  - **No clipboard.** Nothing pastes a video.
+  - **No history-index row.** `HistoryEntry`'s documented schema fixes
+    `format` to `"webp" | "png"` and carries still-image-only fields
+    (`png`, `scale`), and Stage 16's library is written against that. Adding
+    videos is a schema decision (a `v: 2`, or a `type` key) that belongs to
+    whichever stage builds the library's video half, not to one that would be
+    guessing at its reader. Verified live: a run with an isolated
+    `XDG_DATA_HOME` produced four recordings and **no** `history.jsonl` at
+    all.
 - **One runtime**: `zbus 5` with `default-features = false, features =
   ["tokio"]`; never a second async runtime. The **PipeWire main loop is the
   one sanctioned extra thread** — it bridges to the daemon via a bounded
@@ -601,6 +781,16 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   (Wayland roundtrips, ~0.3 s of compositor blit, an encode): the daemon runs
   it on `tokio::task::spawn_blocking`, guarded by `Handle::try_current()`
   because `spawn_blocking` panics outside a runtime (`dbus::run_blocking`).
+  **Stage 11 adds a second long-lived thread, and it needs no sanction**:
+  `encode::ffmpeg_cli`'s stderr drain (one per live ffmpeg). It runs no
+  executor, owns nothing but an `Arc<Mutex<VecDeque<String>>>`, and exits
+  when the pipe closes. It is not an optimisation — **a child whose stderr
+  pipe fills blocks in `write`, stops reading its own stdin, and the whole
+  recording deadlocks with nothing having failed**. The alternative,
+  `Stdio::inherit()`, needs no thread but throws away the tail, which is
+  exactly where "No space left on device" appears. The recording *pump* is
+  not a thread of its own either: it is `spawn_blocking` work, held for the
+  whole recording, which is what tokio's blocking pool is for.
 - "Every module maps to a signal, not a poll." Modules follow the sibling
   shape: state struct + `view(&Theme) -> Element` + `subscription()` +
   nested `Message` enum.
@@ -788,6 +978,15 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   all absent. Verify teardown afterwards every time: `niri msg casts` must
   say "No screencasts", and `pw-dump` must show no leftover `Video/Source`
   node beyond the webcams. Stage 10's own runs did, four times.
+  **Stage 11 adds one live-testing trap that cost two runs**: `pkill -f
+  <pattern>` matches **the test script's own command line**, because the
+  script text contains the pattern — so `pkill -KILL -f hevc_vaapi` inside a
+  script kills the script. Both times it looked like the daemon had hung.
+  Build the pattern at runtime (`KILLPAT=$(printf 'hevc_%s' 'vaapi')`) or
+  match by process name (`pkill -x ffmpeg`), never by a literal that also
+  appears in the script. Same class of foot-gun as Stage 8's missing
+  `WAYLAND_DISPLAY` prefix, and the same fix: make the wrong thing
+  unexpressible rather than remembering not to write it.
 - **Conventional Commits** (release-plz derives bumps); `chore:`/`ci:`/
   `docs:`/`test:` are changelog-invisible. Never hand-edit versions or
   `CHANGELOG.md`.

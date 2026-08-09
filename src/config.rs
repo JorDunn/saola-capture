@@ -167,6 +167,25 @@ pub struct CaptureConfig {
     pub webp_quality: u8,
     pub png_also: bool,
     pub video_preset: VideoPreset,
+    /// `vaapi-device = "/dev/dri/renderD129"` — an explicit render node for
+    /// the hardware encode presets. **Added in Stage 11** (PLAN.md Stage 11
+    /// task 3, and CAPTURE-RESEARCH D6's 2026-08-08 amendment).
+    ///
+    /// `None`, the default, means "discover it": `encode::ffmpeg_cli` probes
+    /// every `/dev/dri/renderD*` with a tiny trial encode and picks the best
+    /// one. This knob exists for the cases discovery cannot know about — a
+    /// machine where the *other* GPU should do the encoding (a dGPU that is
+    /// idle while the iGPU drives the panel, say), or one where a node is
+    /// present but misbehaving.
+    ///
+    /// Deliberately **not validated here**: whether a path is a usable render
+    /// node is a runtime question about hardware, not a parse question about
+    /// a config file, and this module has a firm rule about only reporting
+    /// what the file said. A path that doesn't exist warns and falls back to
+    /// full discovery at encoder start (`ffmpeg_cli::choose_encoder`), which
+    /// is the same warn-and-default posture every other knob gets, applied at
+    /// the layer that can actually check.
+    pub vaapi_device: Option<PathBuf>,
     pub cursor: bool,
     pub delay: u32,
     pub toasts: bool,
@@ -192,6 +211,7 @@ impl Default for CaptureConfig {
             webp_quality: DEFAULT_WEBP_QUALITY,
             png_also: false,
             video_preset: VideoPreset::default(),
+            vaapi_device: None,
             cursor: true,
             delay: 0,
             toasts: true,
@@ -309,6 +329,11 @@ impl CaptureConfig {
             .and_then(|value| match_or_warn(value, "video-preset", VideoPreset::parse))
             .unwrap_or_default();
 
+        // Same `expand_tilde` treatment `save-dir` gets: nothing else in the
+        // process will expand it, and `~/dev/...` is a plausible thing to
+        // write even though render nodes live under `/dev`.
+        let vaapi_device = read_str(&body, "vaapi-device").map(expand_tilde);
+
         let cursor = read_bool(&body, "cursor").unwrap_or(true);
 
         let delay = read_delay(&body).unwrap_or(0);
@@ -323,6 +348,7 @@ impl CaptureConfig {
             webp_quality,
             png_also,
             video_preset,
+            vaapi_device,
             cursor,
             delay,
             toasts,
@@ -501,6 +527,7 @@ mod tests {
             webp-quality = 72
             png-also = true
             video-preset = "av1"
+            vaapi-device = "/dev/dri/renderD129"
             cursor = false
             delay = 3
             toasts = false
@@ -516,6 +543,10 @@ mod tests {
         assert_eq!(config.webp_quality, 72);
         assert!(config.png_also);
         assert_eq!(config.video_preset, VideoPreset::Av1);
+        assert_eq!(
+            config.vaapi_device,
+            Some(PathBuf::from("/dev/dri/renderD129"))
+        );
         assert!(!config.cursor);
         assert_eq!(config.delay, 3);
         assert!(!config.toasts);
@@ -538,9 +569,32 @@ mod tests {
         assert_eq!(config.save_dir, None);
         assert!(!config.png_also);
         assert_eq!(config.video_preset, VideoPreset::default());
+        assert_eq!(config.vaapi_device, None);
         assert!(config.cursor);
         assert!(config.toasts);
         assert!(config.copy);
+    }
+
+    /// A `vaapi-device` that isn't a string falls through to `None` —
+    /// discovery — rather than failing the whole document, the same
+    /// per-knob rule every other knob gets. **Stage 11.**
+    #[test]
+    fn a_non_string_vaapi_device_falls_back_to_discovery() {
+        let config = CaptureConfig::parse("vaapi-device = 128").expect("well-formed TOML");
+        assert_eq!(config.vaapi_device, None);
+    }
+
+    /// Whether the path is a real render node is deliberately *not* this
+    /// module's question — see the field's doc comment. A nonsense path
+    /// parses fine here and is warned about (and ignored) at encoder start.
+    #[test]
+    fn a_vaapi_device_that_cannot_exist_still_parses() {
+        let config =
+            CaptureConfig::parse(r#"vaapi-device = "/dev/dri/renderD999""#).expect("valid TOML");
+        assert_eq!(
+            config.vaapi_device,
+            Some(PathBuf::from("/dev/dri/renderD999"))
+        );
     }
 
     /// Syntactically invalid TOML is the one case `parse` itself rejects.

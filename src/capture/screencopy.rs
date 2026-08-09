@@ -1700,7 +1700,16 @@ mod tests {
         let writer_path = path.clone();
         let writer = std::thread::spawn(move || {
             std::thread::sleep(WINDOW_SCREENSHOT_READ_RETRY_DELAY * 2);
-            fs::write(&writer_path, b"showed up late").expect("write");
+            // Write-then-rename, not a bare `fs::write`: the reader polls
+            // concurrently, and `fs::write` creates the file *before* the
+            // bytes land — a poll in that window reads an empty file and
+            // the assert below fails (caught as a real ~1-in-5 flake).
+            // Rename is atomic, matching both storage.rs's own `.part` +
+            // rename idiom and how niri's finished screenshot behaves
+            // (Stage 8: "once found, complete and byte-valid").
+            let part = writer_path.with_extension("part");
+            fs::write(&part, b"showed up late").expect("write");
+            fs::rename(&part, &writer_path).expect("rename");
         });
 
         let result = read_window_screenshot_with_retry(&path);

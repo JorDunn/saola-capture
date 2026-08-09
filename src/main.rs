@@ -54,6 +54,7 @@ mod capture;
 mod cli;
 mod config;
 mod dbus;
+mod encode;
 mod modules;
 mod storage;
 
@@ -300,13 +301,18 @@ fn run_clipboard_serve(mime: &str) -> ExitCode {
     }
 }
 
-/// `record start|stop|toggle`. `toggle` is forwarded as `StartRecording`
-/// for now — deciding "start or stop?" needs the daemon's own recorder
-/// state (`modules/recorder.rs`'s state machine, Stage 11/12), which
-/// doesn't exist yet. Harmless at this stage: `StartRecording` always
-/// answers with the same stub `Error` regardless of which action asked
-/// for it, so nothing here can silently do the wrong thing — Stage 12 is
-/// what makes `toggle` query real state before choosing.
+/// `record start|stop|toggle` — **all three real as of Stage 11**, for
+/// fullscreen.
+///
+/// `toggle` reads the daemon's `Recording` property and picks a branch (see
+/// `dbus::CaptureService::recording` for why that property was added rather
+/// than inferring the answer from an error). There is a theoretical race —
+/// the state could change between the read and the call — and it does not
+/// matter: this is a keybind on a single-user desktop, and both losing
+/// branches fail cleanly ("a recording is already in progress" / "nothing is
+/// recording") rather than doing the wrong thing. A daemon too old to have
+/// the property reads as "not recording", so a toggle degrades to a start,
+/// which is the same behaviour Stage 10 shipped.
 fn run_record(config_dir: Option<&Path>, args: cli::RecordArgs) -> Result<String, CliRunError> {
     let config = load_config(config_dir);
     let options = cli::RecordOptions::resolve(&config, &args)?;
@@ -325,24 +331,30 @@ fn run_record(config_dir: Option<&Path>, args: cli::RecordArgs) -> Result<String
         let connection = connect_to_daemon().await?;
         let proxy = dbus::Capture1Proxy::new(&connection).await?;
 
-        match options.action {
-            cli::RecordActionKind::Stop => {
-                let path = proxy.stop_recording().await?;
-                Ok(path)
-            }
-            cli::RecordActionKind::Start | cli::RecordActionKind::Toggle => {
-                // "fullscreen" is the only kind Stage 3's CLI can express —
-                // `--region`/`--window` recording targets are Stage 12.
-                proxy
-                    .start_recording("fullscreen", options.to_dbus_options())
-                    .await?;
-                Ok(format!(
-                    "recording {} requested (preset={})",
-                    options.action.as_str(),
-                    options.preset
-                ))
-            }
+        let stop = match options.action {
+            cli::RecordActionKind::Stop => true,
+            cli::RecordActionKind::Start => false,
+            // A daemon that doesn't serve the property (or a bus hiccup)
+            // reads as "not recording" — degrade to a start rather than
+            // failing the keybind outright.
+            cli::RecordActionKind::Toggle => proxy.recording().await.unwrap_or(false),
+        };
+
+        if stop {
+            // The saved path, printed to stdout by `report` — the same
+            // contract `shot` has.
+            return Ok(proxy.stop_recording().await?);
         }
+
+        // "fullscreen" is the only kind the CLI can express — `--region`/
+        // `--window` recording targets are Stage 12 (CAPTURE-RESEARCH D8).
+        proxy
+            .start_recording("fullscreen", options.to_dbus_options())
+            .await?;
+        Ok(format!(
+            "recording started (preset={}) — stop it with `saola-capture record stop`",
+            options.preset
+        ))
     })
 }
 
@@ -809,6 +821,16 @@ impl Daemon {
                         );
                     }
                 }
+                self.sync_toast_surface()
+            }
+            // Stage 11: a recording died. The same toast machinery a saved
+            // screenshot uses, with a message instead of a file — see
+            // `modules::toast::ToastKind::Notice`. Nobody is watching a
+            // terminal when a keybind started the recording, which is the
+            // whole reason this is a surface and not just a log line.
+            Message::RecordingFailed(message) => {
+                self.toasts
+                    .push_notice("Recording failed", message, &self.theme, Instant::now());
                 self.sync_toast_surface()
             }
             // Stage 8's delayed-capture countdown pill.
@@ -1421,6 +1443,13 @@ enum Message {
     /// gated redraw-and-recheck timer, the same shape [`Message::Flash`]
     /// uses for the flash's fade.
     Countdown(modules::countdown::Message),
+    /// **Stage 11.** A recording ended badly — `dbus.rs`'s
+    /// [`dbus::DaemonEvent::RecordingFailed`], forwarded through
+    /// `dbus_worker_stream`. Raises a notice toast
+    /// (`modules::toast::ToastStack::push_notice`); the matching
+    /// `io.saola.Capture1` `Error` signal was already emitted by the daemon's
+    /// recording supervisor, so this variant is purely the on-screen half.
+    RecordingFailed(String),
 }
 
 /// Everything one interactive region selection needs to start, bundled so
@@ -1545,6 +1574,9 @@ fn dbus_worker_stream() -> impl Stream<Item = Message> {
                         }),
                         dbus::DaemonEvent::CountdownStarted { seconds } => {
                             Message::CountdownStarted(seconds)
+                        }
+                        dbus::DaemonEvent::RecordingFailed { message } => {
+                            Message::RecordingFailed(message)
                         }
                     };
                     if sender.send(message).await.is_err() {

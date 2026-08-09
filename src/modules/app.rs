@@ -461,7 +461,7 @@ impl App {
                 }
             }
             CaptureMode::Record => {
-                let options = record_options(self.preset, self.audio.to_option());
+                let options = record_options(&self.config, self.preset, self.audio.to_option());
                 Task::perform(
                     request_recording(connection, options),
                     Message::RecordingRequested,
@@ -690,13 +690,19 @@ fn resolve_capture_options(
 }
 
 /// The Record tab's UI state, folded into a [`cli::RecordOptions`] — no
-/// `ShotArgs`-style synthetic-args detour needed here since
-/// `RecordOptions`'s fields are already exactly what the UI tracks (no
-/// config-file precedence to replay: `capture.toml` carries no audio knob,
-/// per `cli::RecordOptions`'s own doc comment, and the preset picker's
-/// initial value already came from `config.video_preset` in
-/// [`App::boot`]).
-fn record_options(preset: VideoPreset, audio: Option<AudioSource>) -> cli::RecordOptions {
+/// `ShotArgs`-style synthetic-args detour needed here since the two knobs the
+/// UI actually tracks (preset, audio) map straight across. Everything else
+/// comes from `config` unchanged, which is the same thing
+/// `cli::RecordOptions::resolve` does for the `record` verb — **Stage 11**
+/// added three such fields (`cursor`, `output_dir`, `vaapi_device`), and they
+/// are read from the same `capture.toml` this process already loaded at boot
+/// rather than re-derived, so the app window and the CLI start identical
+/// recordings.
+fn record_options(
+    config: &CaptureConfig,
+    preset: VideoPreset,
+    audio: Option<AudioSource>,
+) -> cli::RecordOptions {
     cli::RecordOptions {
         action: cli::RecordActionKind::Start,
         preset,
@@ -708,6 +714,9 @@ fn record_options(preset: VideoPreset, audio: Option<AudioSource>) -> cli::Recor
         // recording, which is also when this tab grows a target picker).
         dry_run: false,
         window_id: None,
+        cursor: config.cursor,
+        output_dir: config.save_dir.clone(),
+        vaapi_device: config.vaapi_device.clone(),
     }
 }
 
@@ -1052,7 +1061,11 @@ mod tests {
 
     #[test]
     fn record_options_always_requests_start() {
-        let options = record_options(VideoPreset::Av1, Some(AudioSource::Both));
+        let options = record_options(
+            &CaptureConfig::default(),
+            VideoPreset::Av1,
+            Some(AudioSource::Both),
+        );
         assert_eq!(options.action, cli::RecordActionKind::Start);
         assert_eq!(options.preset, VideoPreset::Av1);
         assert_eq!(options.audio, Some(AudioSource::Both));

@@ -155,12 +155,40 @@ pub fn thumbnail_handle(frame: &Frame, max_dim: u32) -> image::Handle {
 // One toast, and the stack
 // ---------------------------------------------------------------------
 
+/// What a card is about.
+///
+/// **Stage 11** split this out of [`Toast`]: a recording that dies mid-stream
+/// has to reach the user somehow (PLAN.md Stage 11 task 2 — "disk-full and
+/// mid-stream-death surfaced as `Error` signal + toast"), and it has no file,
+/// no thumbnail, and nothing an editor could open.
+#[derive(Debug, Clone)]
+enum ToastKind {
+    /// A saved screenshot: the §6 card with the capture's own thumbnail in
+    /// the icon tile, clickable to open the editor.
+    Capture {
+        path: PathBuf,
+        thumbnail: image::Handle,
+    },
+    /// A message with no artefact behind it. Clicking does nothing —
+    /// deliberately: a card whose click target does nothing *visible* is
+    /// better than one that opens an editor on a file that was never written.
+    ///
+    /// **Style note (§11 checklist item 7).** The style guide's generic
+    /// notification puts a Lucide glyph in the 36 px ivory icon tile. This
+    /// crate still has no `src/icons.rs` (see CLAUDE.md's Design language
+    /// section — the capture toast substitutes the screenshot's own thumbnail
+    /// and therefore never needed one), so a notice renders the tile as a
+    /// plain ivory square. Recorded as the same *deliberate substitution*
+    /// the capture card already documents, not an oversight; whichever stage
+    /// first needs a real icon set fills it in here.
+    Notice { title: String, body: String },
+}
+
 /// One notification card's state.
 #[derive(Debug, Clone)]
 struct Toast {
     id: u64,
-    path: PathBuf,
-    thumbnail: image::Handle,
+    kind: ToastKind,
     /// The pausable stopwatch — see this module's doc comment.
     elapsed_at_last_change: Duration,
     resumed_at: Option<Instant>,
@@ -219,12 +247,35 @@ impl ToastStack {
     /// at `motion.toast_max_stack`, the oldest card is dropped first — §6's
     /// "stack at most three; the fourth replaces the oldest".
     pub fn push(&mut self, path: PathBuf, thumbnail: image::Handle, theme: &Theme, now: Instant) {
+        self.push_kind(ToastKind::Capture { path, thumbnail }, theme, now);
+    }
+
+    /// Push a message with no file behind it — **Stage 11**'s recording
+    /// failures ("Recording failed" / the encoder's own last words). Same
+    /// timing, same stack rule, same card; see [`ToastKind::Notice`].
+    pub fn push_notice(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        theme: &Theme,
+        now: Instant,
+    ) {
+        self.push_kind(
+            ToastKind::Notice {
+                title: title.into(),
+                body: body.into(),
+            },
+            theme,
+            now,
+        );
+    }
+
+    fn push_kind(&mut self, kind: ToastKind, theme: &Theme, now: Instant) {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         self.toasts.push(Toast {
             id,
-            path,
-            thumbnail,
+            kind,
             elapsed_at_last_change: Duration::ZERO,
             resumed_at: Some(now),
         });
@@ -258,8 +309,12 @@ impl ToastStack {
                 Action::None
             }
             Message::Clicked(id) => match self.toasts.iter().find(|toast| toast.id == id) {
-                Some(toast) => Action::Open(toast.path.clone()),
-                None => Action::None,
+                Some(Toast {
+                    kind: ToastKind::Capture { path, .. },
+                    ..
+                }) => Action::Open(path.clone()),
+                // A notice has nothing to open (Stage 11).
+                Some(_) | None => Action::None,
             },
         }
     }
@@ -412,23 +467,43 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
     let body_size = theme.typography.size.secondary;
     let gap = theme.sizes.pill_gap;
 
-    let file_name = toast
-        .path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| toast.path.display().to_string());
+    let (title_text, body_text) = match &toast.kind {
+        ToastKind::Capture { path, .. } => (
+            "Screenshot saved".to_string(),
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+        ),
+        ToastKind::Notice { title, body } => (title.clone(), body.clone()),
+    };
 
-    let thumb = container(
-        image(toast.thumbnail.clone())
+    let tile: Element<'static, Message> = match &toast.kind {
+        ToastKind::Capture { thumbnail, .. } => image(thumbnail.clone())
             .width(Length::Fixed(ICON_TILE_SIZE))
             .height(Length::Fixed(ICON_TILE_SIZE))
-            .content_fit(iced::ContentFit::Cover),
-    )
-    .width(Length::Fixed(ICON_TILE_SIZE))
-    .height(Length::Fixed(ICON_TILE_SIZE));
+            .content_fit(iced::ContentFit::Cover)
+            .into(),
+        // See `ToastKind::Notice`: an ivory tile, no glyph, until this crate
+        // has an icon set.
+        ToastKind::Notice { .. } => {
+            let paper = scale_alpha(theme.palette.paper.into_iced());
+            container(Space::new())
+                .width(Length::Fixed(ICON_TILE_SIZE))
+                .height(Length::Fixed(ICON_TILE_SIZE))
+                .style(move |_: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(paper)),
+                    ..container::Style::default()
+                })
+                .into()
+        }
+    };
+
+    let thumb = container(tile)
+        .width(Length::Fixed(ICON_TILE_SIZE))
+        .height(Length::Fixed(ICON_TILE_SIZE));
 
     let header = row![
-        text("Screenshot saved")
+        text(title_text)
             .font(title_font)
             .size(title_size)
             .color(text_primary),
@@ -440,7 +515,7 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
     ]
     .align_y(Center);
 
-    let body = text(file_name)
+    let body = text(body_text)
         .font(body_font)
         .size(body_size)
         .color(text_secondary);
@@ -568,11 +643,25 @@ mod tests {
     fn toast_at(now: Instant) -> Toast {
         Toast {
             id: 0,
-            path: PathBuf::from("/tmp/Screenshot_test.webp"),
-            thumbnail: thumbnail_handle(&synthetic_frame(4, 4), 36),
+            kind: ToastKind::Capture {
+                path: PathBuf::from("/tmp/Screenshot_test.webp"),
+                thumbnail: thumbnail_handle(&synthetic_frame(4, 4), 36),
+            },
             elapsed_at_last_change: Duration::ZERO,
             resumed_at: Some(now),
         }
+    }
+
+    /// Every card's path, for the stack-order assertions. A notice has none.
+    fn stack_paths(stack: &ToastStack) -> Vec<PathBuf> {
+        stack
+            .toasts
+            .iter()
+            .filter_map(|toast| match &toast.kind {
+                ToastKind::Capture { path, .. } => Some(path.clone()),
+                ToastKind::Notice { .. } => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -646,7 +735,7 @@ mod tests {
         }
 
         assert_eq!(stack.len(), 3, "capped at motion.toast_max_stack");
-        let paths: Vec<_> = stack.toasts.iter().map(|t| t.path.clone()).collect();
+        let paths = stack_paths(&stack);
         assert_eq!(
             paths,
             vec![
@@ -656,6 +745,64 @@ mod tests {
             ],
             "the oldest (shot-0) was dropped; the newest three survive, oldest-first"
         );
+    }
+
+    /// **Stage 11.** A notice shares the card, the stack rule and the timing,
+    /// and differs in exactly two places: it has no file, and clicking it
+    /// does nothing.
+    #[test]
+    fn a_notice_toast_stacks_like_a_capture_but_opens_nothing() {
+        let theme = theme();
+        let now = Instant::now();
+        let mut stack = ToastStack::default();
+
+        stack.push(
+            PathBuf::from("/tmp/shot.webp"),
+            thumbnail_handle(&synthetic_frame(4, 4), 36),
+            &theme,
+            now,
+        );
+        stack.push_notice(
+            "Recording failed",
+            "ffmpeg exited with status 1: No space left on device",
+            &theme,
+            now,
+        );
+        assert_eq!(stack.len(), 2);
+        assert_eq!(stack_paths(&stack), vec![PathBuf::from("/tmp/shot.webp")]);
+
+        // Clicking the capture opens it…
+        let capture_id = stack.toasts[0].id;
+        assert_eq!(
+            stack.update(Message::Clicked(capture_id), now, &theme),
+            Action::Open(PathBuf::from("/tmp/shot.webp"))
+        );
+        // …and clicking the notice does nothing at all.
+        let notice_id = stack.toasts[1].id;
+        assert_eq!(
+            stack.update(Message::Clicked(notice_id), now, &theme),
+            Action::None
+        );
+    }
+
+    /// A notice expires on the same clock every other card does, so a failed
+    /// recording does not leave a card up forever.
+    #[test]
+    fn a_notice_toast_expires_like_any_other() {
+        let theme = theme();
+        let now = Instant::now();
+        let mut stack = ToastStack::default();
+        stack.push_notice("Recording failed", "disk full", &theme, now);
+
+        let total = Duration::from_millis(theme.motion.toast_total.into());
+        stack.update(Message::Tick, now + total / 2, &theme);
+        assert_eq!(stack.len(), 1);
+        stack.update(
+            Message::Tick,
+            now + total + Duration::from_millis(1),
+            &theme,
+        );
+        assert!(stack.is_empty());
     }
 
     // -- ToastStack::update ---------------------------------------------------
