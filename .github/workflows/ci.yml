@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # System libraries the build links against: xkbcommon (smithay-client-toolkit,
+  # pulled in by iced_layershell) and wayland (the same client stack, also used
+  # directly for screencopy and wl-clipboard-rs). libwebp is NOT here — the
+  # `webp` crate vendors and compiles libwebp's C sources via `cc`, so it only
+  # needs the runner's preinstalled C toolchain. Every job that compiles the
+  # crate needs these — only fmt gets away without them. Stage 10 (pipewire)
+  # will add clang/libclang for bindgen plus libpipewire headers.
+  APT_BUILD_DEPS: libxkbcommon-dev libwayland-dev
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $APT_BUILD_DEPS
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
