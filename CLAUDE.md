@@ -13,13 +13,14 @@ window, history library, annotation editor), and **CLI verbs** (`shot`,
 architecture, dependencies, or conventions updates this file in the same
 stage and says so in its handoff. A stale CLAUDE.md is a bug.
 
-> Status: Stages 1–9 landed (repo skeleton, dependency survey; every capture
+> Status: Stages 1–10 landed (repo skeleton, dependency survey; every capture
 > path proven with live evidence in `docs/CAPTURE-RESEARCH.md`; full CLI
 > parsing, `capture.toml` config, the `io.saola.Capture1` bus, a surfaceless
 > daemon boot; Stage 5's **real screenshot pipeline**; Stage 6's **PrintScr
 > MVP**; Stage 7's **region selection overlay**; Stage 8's **window capture
-> and a visible delayed-capture countdown**; and — new in Stage 9 — the
-> **main app window process**).
+> and a visible delayed-capture countdown**; Stage 9's **main app window
+> process**; and — new in Stage 10 — the **ScreenCast session + PipeWire
+> frame pipeline**).
 > `shot --fullscreen`, `shot --region [--geometry WxH+X+Y]` and (as of Stage
 > 8) `shot --window [--window-id ID]` all genuinely capture, encode, save,
 > copy and print a path. Fullscreen, `--geometry` region and `--window` all
@@ -83,8 +84,25 @@ stage and says so in its handoff. A stale CLAUDE.md is a bug.
 > already alive-but-hidden, so a second `open` mid-capture spawns a second
 > process — a recorded v0.1 gap, not an oversight (see the Stage 9
 > handoff).
+> **Stage 10 makes the video capture path real, up to (not including) the
+> encoder**: `src/capture/screencast.rs` is the whole
+> `org.gnome.Mutter.ScreenCast` → PipeWire chain — `CreateSession` →
+> `RecordMonitor`/`RecordWindow` → subscribe → `Start` → node id
+> (`CastSession`), then a **dedicated OS thread** running the PipeWire main
+> loop that negotiates the dmabuf/LINEAR format, mmaps each frame, and pushes
+> **packed** BGRx copies down a bounded channel (`PipeWireStream`,
+> `VideoFrame`). `record start --dry-run` is the user-visible half: it
+> negotiates, watches frames for five seconds, prints the negotiated format
+> plus the frame cadence, writes nothing, and tears everything down —
+> **live-verified against the real session** (see the Stage 10 handoff for
+> the transcripts: fullscreen negotiated `BGRx 2560x1600 modifier 0x0`, a
+> `--window-id` cast negotiated `2507x1457` at stride 10240 and came back
+> pixel-perfect, and a bogus window id produced CAPTURE-RESEARCH §5.3's
+> documented self-destructing session as a clean error). Nothing in Stage 10
+> touches the daemon, the tray, or any surface; `StartRecording` is still a
+> stub until Stage 11 adds the encoder.
 > Still stubs, each answering with a clean error naming its stage:
-> `StartRecording`/`StopRecording` (Stages 10–11), `PickColor` (Stage 16).
+> `StartRecording`/`StopRecording` (Stage 11), `PickColor` (Stage 16).
 > PLAN.md is the staged build plan. Sections marked *(pending Stage N)* fill
 > in as later stages land.
 >
@@ -94,9 +112,10 @@ stage and says so in its handoff. A stale CLAUDE.md is a bug.
 > §8's stage pointers, handoffs 1–3 — use the old numbering: add 1 to any
 > stage reference ≥ 4. This file's references are current.
 >
-> Stage 10's clang prerequisite is **cleared** — Jordan installed clang 22.1.8
-> (2026-08-08, verified live), so `pipewire` 0.10's bindgen build is unblocked
-> (see CAPTURE-RESEARCH §2.0/D5).
+> Stage 10's clang prerequisite is **cleared and now spent** — Jordan
+> installed clang 22.1.8 (2026-08-08, verified live), and Stage 10 confirmed
+> `pipewire` 0.10 builds here end to end (see CAPTURE-RESEARCH §2.0/D5 and
+> the `pipewire` survey in `Cargo.toml`).
 
 ## Commands
 
@@ -116,6 +135,11 @@ cargo run -- shot --window --window-id 42  # scriptable: an explicit niri-ipc wi
 cargo run -- shot --fullscreen --delay 3   # any shot kind: countdown pill, then flash+toast
 cargo run -- shot --fullscreen --no-daemon --format=webp --output=/tmp  # headless/scriptable
 cargo run -- record start|stop|toggle [--preset hevc|av1|h264] [--audio mic|system|both]
+cargo run -- record start --dry-run          # Stage 10: negotiate a real screencast, log the
+                                             # SPA format + 5 s of frame cadence, write NOTHING,
+                                             # tear down. Never contacts the daemon.
+cargo run -- record start --dry-run --window-id 16  # cast one window instead of the focused output
+                                                    # (dry-run only until Stage 12)
 cargo run -- pick-color
 cargo run -- open                  # raises the app window (spawns it detached — Stage 9)
 cargo run -- window                # the app window process — Screenshot/Record tabs, real as of Stage 9
@@ -130,8 +154,15 @@ selection until something else claims it. It is an implementation detail of
 requests, and a CLI verb exits immediately) — spawned detached by
 `storage.rs`, never typed by hand, hidden from `--help`.
 
-Every CLI verb above except `--no-daemon` shots is a real D-Bus client of the
-daemon as of Stage 3 (auto-spawning it detached, retrying once, if the bus
+`record start --dry-run` is the second exception to "every verb is a daemon
+client" (after `--no-daemon` shots): it talks straight to niri's
+`org.gnome.Mutter.ScreenCast` and to PipeWire, in-process, and never looks
+the daemon up — see `capture::screencast::dry_run`'s doc comment for the
+three reasons. That makes it safe to run while Jordan's real daemon (and a
+real recording, once Stage 11 lands) is up.
+
+Every CLI verb above except `--no-daemon` shots and `record --dry-run` is a
+real D-Bus client of the daemon as of Stage 3 (auto-spawning it detached, retrying once, if the bus
 name is unowned) — `busctl --user introspect io.saola.Capture1
 /io/saola/Capture1` shows the live interface once a daemon is running. As of
 Stage 5 `Screenshot` is real, and as of Stage 9 so is `OpenWindow`; the
@@ -169,6 +200,17 @@ capture half via `--no-daemon --window` (real niri, read-only, no synthetic
 input; see the Stage 8 handoff for what that run caught and fixed). A
 `--window` shot — with or without `--window-id`, through the daemon or
 `--no-daemon` — never maps a surface at all and is equally safe.
+**Stage 10's `record start --dry-run` is on the safe side of that line too,
+and it has to be**: a nested niri started *without* `--session` does **not
+serve `org.gnome.Mutter.ScreenCast` at all** (verified live in Stage 10 —
+`busctl --user list` on the private bus shows nothing from the nested
+compositor, and the dry run fails with `ServiceUnknown`), so the nested-niri
+recipe simply cannot exercise the recording path. Testing it means the real
+session, which is what the Stage 2 probes already did for the same
+interface: the dry run maps no surface, grabs no keyboard, injects no input,
+writes no file, never touches the daemon or the clipboard, and its teardown
+was verified (`niri msg casts` → "No screencasts", no leftover PipeWire
+node). It does briefly cast the screen into memory and discard it.
 
 ## Architecture
 
@@ -229,6 +271,32 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   every lifecycle above, unrelated to `main.rs`'s surface-spawning code.
 - **Recording state lives in the daemon** and survives window closes; the
   PipeWire thread never blocks on the encoder (bounded channel, drop + log).
+  **Real as of Stage 10 for everything up to the encoder**
+  (`capture/screencast.rs`), with three rules Stage 11+ must not rediscover:
+  - **The pw main loop is a plain OS thread and everything PipeWire stays
+    inside it.** `MainLoopRc`/`ContextRc`/`CoreRc`/`StreamBox` are all `Rc`
+    and therefore not `Send`. Two channels cross the boundary outward
+    (`std::sync::mpsc`: an unbounded control channel that must never drop,
+    and a `sync_channel(4)` frame channel that drops with `try_send` +
+    a counter), and exactly one crosses inward
+    (`pipewire::channel::Sender`, whose receiver is attached to the loop as
+    an event source — **the only correct way to poke a running pw loop from
+    another thread**; calling `quit()` from outside would race a non-`Sync`
+    object).
+  - **Teardown order is fixed: consumer first, producer second.**
+    `PipeWireStream::stop()` (quit the loop → `pw_stream_disconnect` → join)
+    and only *then* `CastSession::close()` (`Session.Stop`). The other order
+    makes the node vanish under a live consumer and logs a scary
+    `StreamState::Error` for what was a clean stop. And **never `Stop` a
+    session the compositor already closed** (CAPTURE-RESEARCH D8) —
+    `CastSession::closed()` is a non-blocking poll of the retained
+    `Session.Closed` signal stream, and `close()` consults it first.
+  - **Subscribe before `Start`.** `PipeWireStreamAdded` fires ~immediately
+    after `Start`; subscribing afterwards loses the race. `Session.Closed`
+    is subscribed even earlier, because a bad `RecordWindow` id is accepted
+    at call time and only self-destructs later (§5.3) — that is a
+    three-way `tokio::select!` between the node id, `Closed`, and a 5 s
+    timeout, and the three outcomes are deliberately different errors.
 - **Two iced_layershell surface gotchas, found live in Stage 6 and binding on
   every future surface (the region overlay, recording chip, tray popovers if
   any land here):**
@@ -273,7 +341,15 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   - **Recording is dmabuf-only.** shm is refused by niri's cast node at both
     the format and the buffer-allocation layer — there is no shm fallback to
     write. Request modifier `LINEAR` and mmap the fd; use `chunk->stride`
-    (not `width * 4`) and ignore `maxsize`/`chunk->size`.
+    (not `width * 4`) and ignore `maxsize`/`chunk->size`. **All of this is
+    implemented and live-confirmed as of Stage 10**
+    (`capture/screencast.rs`): a non-dmabuf buffer is a first-class
+    `CastControl::Error`, not a fallback; the mapping length comes from
+    `lseek(fd, 0, SEEK_END)`; `copy_packed_rows` is the single place the
+    stride is applied and it is unit-tested; and a live `--window-id` cast
+    negotiated **2507×1457 at stride 10240** (= the 2560-px *output* pitch)
+    and produced a pixel-perfect, unsheared frame. `PW_STREAM_FLAG_MAP_
+    BUFFERS` still does not map dmabufs — the mmap is by hand.
   - **Window screenshots go through niri-ipc `ScreenshotWindow`**, not a
     geometry crop: niri exposes no pixel position for tiled windows, so the
     crop rectangle is not computable. It also clobbers the clipboard
@@ -396,12 +472,8 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   Stage 1 landed the WebP encoder, clipboard, and CLI parser surveys; Stage 4
   landed the TOML crate survey; Stage 5 landed the `libc` and `serde_json`
   surveys (essays live in `Cargo.toml`; outcomes below).
-  *(Survey pending Stage 10: pipewire —
-  Stage 1 recorded version/SPA notes only, per PLAN.md, without adding the
-  dependency yet. Stage 2 added the decisive build fact: `pipewire-sys` runs
-  bindgen, so it needs **libclang at build time** — Jordan installed clang
-  22.1.8 (2026-08-08), so the local build is unblocked; it remains a
-  `makedepends`/CI build-dep entry in Stage 17.)*
+  Stage 10 landed the `pipewire` survey (outcome below), closing the last
+  survey PLAN.md deferred.
   Stage 8 confirmed CAPTURE-RESEARCH §5.2's prediction: window capture
   (`capture/screencopy.rs`'s `capture_window`/`focused_window`) is entirely
   `niri_ipc::Request::Windows`/`FocusedWindow`/`Action::ScreenshotWindow` —
@@ -445,6 +517,35 @@ PLAN.md's Architecture section is binding; read it first. Summary:
     only, **no `#[derive(Serialize)]`**, matching `config.rs`'s hand-walked
     posture. Chosen over a hand-rolled TSV specifically for escaping: a saved
     path can legally contain tabs, newlines and quotes.
+  - **pipewire** (Stage 10, `pipewire = { version = "0.10", features =
+    ["v0_3_33"] }`) — the official pipewire-rs bindings, the only
+    maintained Rust binding for `pw_stream`. **Not** zero-net-new-crates
+    (unlike `libc`/`serde_json`): it adds `pipewire`, `pipewire-sys`,
+    `libspa`, `libspa-sys` plus a build-time-only tail (`bindgen`,
+    `clang-sys`, `system-deps`, and a second `toml` 1.1.4 that is a build
+    dependency of a build script and never linked, so the "one resolved
+    runtime `toml`" reasoning above still holds). Justified because there is
+    no lighter way to speak PipeWire and PipeWire is the only video
+    transport niri offers. Rejected: hand-rolled FFI (would mean
+    hand-writing the SPA pod builder/parser, where a wrong byte layout fails
+    at *negotiation*, not compile time), `gstreamer` + `pipewiresrc` (a
+    second large media framework alongside the ffmpeg CLI boundary), and
+    `ashpd` (portals are forbidden by Boundaries).
+    - **`libspa` is not declared separately** — `pipewire` re-exports it as
+      `pipewire::spa`, so one line makes a version skew impossible. Raw SPA
+      constants come through `pipewire::spa::sys::*`.
+    - **The feature gate is a floor, not a version stamp.** `v0_3_33` is the
+      *minimum* that provides the one gated item this code needs
+      (`PropertyFlags::DONT_FIXATE`, which CAPTURE-RESEARCH D4's modifier
+      property is written in terms of). Jordan's PipeWire is 1.6.8 so
+      `v1_2_0` would also build, but picking it would raise the required
+      system libpipewire for every other machine in exchange for API this
+      crate never calls. Bump the gate when a stage needs something newer,
+      and say which item forced it.
+    - **Packaging (Stage 17):** it *links* the system PipeWire via
+      `system-deps`/pkg-config rather than vendoring it (the opposite of
+      `webp`), so `pipewire` is a real PKGBUILD `depends` entry, plus
+      `clang` in `makedepends` and `libclang-dev` in CI for the bindgen run.
   - **Surprise**: `niri-ipc` is `GPL-3.0-or-later` (verified from its own
     `Cargo.toml`, not just crates.io metadata) — the only non-`MIT OR
     Apache-2.0`-compatible-by-permissive-default dependency in the tree.
@@ -511,11 +612,20 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   already re-exports the `futures` crate, so this is **zero net new
   crates/features**, matching this repo's habitual dependency bar). The
   served method offers to it with `try_send`, never `.send().await` — a full
-  channel degrades to a logged warning, never a blocked D-Bus reply. Stage
-  10's PipeWire-thread-to-daemon bridge is the next place this pattern
-  almost certainly gets reused (or `tokio::sync`, if the pipewire thread
-  isn't itself async — decide there, this note is just "the precedent
-  exists").
+  channel degrades to a logged warning, never a blocked D-Bus reply.
+  **Stage 10 decided the PipeWire side differently, on purpose**: the pw
+  thread is *not* async (a C event loop calling synchronous callbacks — no
+  executor to `.await` on, no `Waker` to wake), and Stage 11's consumer is a
+  blocking write into ffmpeg's stdin, so both ends of a futures channel's
+  reason to exist are unused. `capture/screencast.rs` therefore uses
+  **`std::sync::mpsc`** — also zero new crates — with the same `try_send`
+  posture: `sync_channel(4)` for frames (drop + count + log on full, per
+  PLAN.md's backpressure rule) and a *separate unbounded* channel for
+  control messages (the negotiated format, a fatal error, end-of-stream),
+  because merging them would let "the queue was briefly full" swallow the
+  negotiated format. The rule to carry forward is the posture, not the
+  crate: **never block a producer on a consumer; pick the channel that fits
+  the thread you are on.**
 - **Mechanical iced 0.14.2 gotchas, found in Stage 6** (cheap to relearn
   the hard way, cheaper to just know): `iced::widget::Space::new()` takes
   **zero** arguments in this crate's resolved version — size it with
@@ -665,6 +775,19 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   so a forgotten prefix is a hard error, not a silent fallback to whatever
   display happened to be ambient. Whoever runs live input-injection tests
   next should build that guard into the tool before using it, not after.
+  **Stage 10 found the rule's first genuine limit**: a nested niri started
+  without `--session` serves **no D-Bus interfaces at all** on the private
+  bus — `busctl --user list` against it shows neither
+  `org.gnome.Mutter.ScreenCast` nor `org.gnome.Mutter.DisplayConfig`, and a
+  `record start --dry-run` aimed at it fails with `ServiceUnknown`. So the
+  entire recording path (Stages 10–13) **cannot** be exercised in nested
+  niri; it must be tested against the real session, exactly as the Stage 2
+  probes were. That is acceptable specifically because a screencast maps no
+  surface, grabs no keyboard, needs no injected input and (in dry-run form)
+  writes nothing — the three things the nested rule exists to contain are
+  all absent. Verify teardown afterwards every time: `niri msg casts` must
+  say "No screencasts", and `pw-dump` must show no leftover `Video/Source`
+  node beyond the webcams. Stage 10's own runs did, four times.
 - **Conventional Commits** (release-plz derives bumps); `chore:`/`ci:`/
   `docs:`/`test:` are changelog-invisible. Never hand-edit versions or
   `CHANGELOG.md`.

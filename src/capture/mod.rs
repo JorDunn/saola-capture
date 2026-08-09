@@ -53,6 +53,7 @@
 //! map and reports a clean, actionable error instead of guessing a
 //! rectangle.
 
+pub mod screencast;
 pub mod screencopy;
 
 use std::fmt;

@@ -11,8 +11,13 @@
 //! stable contract that component will consume"). What is *not* final yet
 //! is the behavior behind each method: `capture/screencopy.rs` (Stage 5),
 //! `capture/screencast.rs` (Stage 10) and `modules/picker.rs` (Stage 16)
-//! don't exist yet, so every method here logs the call and returns a clean
-//! D-Bus error naming the stage that will implement it. This is the same
+//! didn't exist yet, so every method here logged the call and returned a
+//! clean D-Bus error naming the stage that would implement it.
+//! `Screenshot` (Stage 5) and `OpenWindow` (Stage 9) are real now;
+//! `StartRecording`/`StopRecording` stay stubs through Stage 10 — that
+//! stage built the *capture* half (`capture/screencast.rs`) but not the
+//! encoder, and `record start --dry-run` exercises it without coming
+//! through this file at all. This is the same
 //! "stub, never `todo!()`" discipline `main.rs`'s Stage 1 body used —
 //! CLAUDE.md's no-panic rule applies to a served D-Bus method exactly as it
 //! does to a CLI verb: a caller (a keybind, the window process) that gets a
@@ -532,8 +537,14 @@ impl CaptureService {
         Ok(path)
     }
 
-    /// `StartRecording(kind s, options a{sv})`. Stage 10/11 wire this to
-    /// `capture/screencast.rs` + `encode/ffmpeg_cli.rs`.
+    /// `StartRecording(kind s, options a{sv})`. **Stage 11** wires this to
+    /// the two halves it now has: `capture/screencast.rs` (real as of Stage
+    /// 10 — session, node, frames) and `encode/ffmpeg_cli.rs` (not written
+    /// yet). Deliberately still a stub after Stage 10: a `StartRecording`
+    /// that captured frames and threw them away would be a worse lie than
+    /// one that says it isn't implemented. `record start --dry-run` is the
+    /// path that exercises the Stage 10 half today, and it never comes
+    /// through here — see `capture::screencast::dry_run`.
     async fn start_recording(
         &self,
         kind: String,
@@ -543,11 +554,11 @@ impl CaptureService {
             "saola-capture: daemon: StartRecording(kind={kind:?}, {} option(s))",
             options.len()
         );
-        Err(not_yet_implemented("StartRecording", "Stage 10/11"))
+        Err(not_yet_implemented("StartRecording", "Stage 11"))
     }
 
     /// `StopRecording() -> s` — returns the saved recording's path. Stage
-    /// 10 wires this to `modules/recorder.rs`'s state machine.
+    /// 11 wires this to `modules/recorder.rs`'s state machine.
     async fn stop_recording(&self) -> zbus::fdo::Result<String> {
         eprintln!("saola-capture: daemon: StopRecording()");
         Err(not_yet_implemented("StopRecording", "Stage 11"))

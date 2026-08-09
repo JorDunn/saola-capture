@@ -332,6 +332,58 @@ a corrupt recording. **Stage 9 must treat "negotiation produced no format" as a
 first-class, user-visible error path**, since that is the shape every unsupported case
 takes.
 
+### 2.5 Stage 10 addendum — the Rust implementation, live (2026-08-09)
+
+Everything in §2.1–§2.4 was proven with a **C** probe. Stage 10 rebuilt the same
+negotiation in Rust (`pipewire` 0.10 / `libspa` via `pipewire::spa`,
+`src/capture/screencast.rs`) and ran it against the same live session through
+`saola-capture record start --dry-run`. Four new facts, none of which contradicts
+anything above:
+
+1. **The Rust offer negotiates identically to the C one.** A monitor cast on eDP-1
+   reported `BGRx 2560x1600 modifier 0x0 framerate 0/1 maxFramerate 60000/1000` — the
+   same pod §2.2's transcript shows, built from `pipewire::spa::pod::{Object, Property,
+   PropertyFlags, Value}` + `PodSerializer` rather than `spa_pod_builder`. The
+   `MANDATORY|DONT_FIXATE` modifier property is gated behind the crate's `v0_3_33`
+   cargo feature; without that feature the flag does not exist and the offer silently
+   becomes the shm-shaped one §2.1 proved is refused.
+2. **§2.3's stride gotcha reproduces exactly, and is now proven *visually* fixed.** A
+   `--window-id 16` cast negotiated **2507×1457** — the same odd, non-output-aligned
+   size §2.3 measured — while the buffers were allocated at the 2560-px output pitch
+   (stride 10240). A temporarily instrumented build dumped one such frame to PNG: it is
+   pixel-perfect and unsheared, with correct BGRx→RGB colour. Deriving the stride from
+   the negotiated width (10028) would have offset every row by 53 px and produced an
+   obvious diagonal skew, so this is a positive, not merely a non-crash.
+3. **`Stream.Parameters` is meaningless for a window cast.** On a monitor cast it
+   reports the real logical geometry (`size (1706, 1066)`, `position (0, 0)` — matching
+   the pre-plan probe). On a **window** cast it reports `size (1, 1)` at `(0, 0)`. Stage
+   12's region/window crop math must therefore take window geometry from niri-ipc, not
+   from this property.
+4. **Measured cadence on an idle desktop** (5-second windows, three monitor runs):
+   41–42 frames, i.e. **8.2–8.4 fps**, gaps 68–203 ms; first frame 219–286 ms after
+   attaching. A window cast of an idle terminal gave **5 frames in 5 s** with ~1 s gaps
+   (the shell's cursor blink). This is §2.3 gotcha 4 in ordinary use: the number is
+   damage, not a frame rate, and a recorder must never read a low number as a fault.
+   *(Not measured: a busy screen approaching the 60 fps cap — no safe way to generate
+   sustained damage without injecting input into the live session. That is the one
+   remaining human-verify item from Stage 10.)*
+
+Two operational findings that cost time to discover:
+
+- **A nested niri started without `--session` serves no D-Bus interfaces at all.**
+  `busctl --user list` against a private bus with a nested niri attached shows neither
+  `org.gnome.Mutter.ScreenCast` nor `org.gnome.Mutter.DisplayConfig`, and a dry run aimed
+  at it fails with `ServiceUnknown`. **The recording path cannot be exercised in nested
+  niri** — Stages 10–13 must test against the real session, exactly as this document's
+  own probes did. That is acceptable because a screencast maps no surface, grabs no
+  keyboard and needs no injected input.
+- **CAPTURE-RESEARCH §5.3's "`Start` succeeds for a bogus window id, then the session
+  self-destructs" reproduces exactly**, and is now handled: `--dry-run --window-id
+  999999` returns a clean error in well under a second, driven by the `Session.Closed`
+  signal rather than a timeout, and does **not** call `Session.Stop` on the dead session
+  (D8). Teardown was verified after every run — `niri msg casts` → "No screencasts", and
+  `pw-dump` shows no leftover `Video/Source` node.
+
 ---
 
 ## 3. ffmpeg encode chain
@@ -941,11 +993,13 @@ pitch** (it is the output pitch, not `width * 4`, on window casts) and never tru
 `maxsize`/`chunk->size` on the dmabuf path (§2.3). `PW_STREAM_FLAG_MAP_BUFFERS` does not
 map dmabufs. Negotiation failure is a user-visible `Error`, not a silent degrade.
 
-### D5 — Stage 9 install prerequisite — **cleared 2026-08-08**
+### D5 — Stage 9 install prerequisite — **cleared 2026-08-08, spent 2026-08-09**
 
 `pipewire` 0.10 could not build here because `libclang` was missing (§2.0). Jordan has
 since installed clang (22.1.8, verified live) — Stage 9 does not need to print-and-wait;
-the bindgen build is unblocked.
+the bindgen build is unblocked. PLAN.md's Stage 10 has now added the dependency and
+confirmed it builds and runs here end to end (§2.5); the cargo feature gate landed at
+`v0_3_33`, the minimum that provides `PropertyFlags::DONT_FIXATE`.
 
 Still true for Stage 16: `clang` in PKGBUILD `makedepends`, `libclang-dev` in CI build
 deps.

@@ -29,9 +29,12 @@
 //! and the `window edit <path>` stub editor), and `dbus.rs`'s `OpenWindow`
 //! spawns it detached instead of answering with a stub error.
 //!
-//! What is still a stub: `record` (Stages 10–11) and `pick-color`
-//! (Stage 16) — each reporting a clean error naming its stage rather than
-//! failing silently.
+//! What is still a stub: `record start|stop|toggle` (Stage 11 — the daemon
+//! has no encoder yet) and `pick-color` (Stage 16) — each reporting a clean
+//! error naming its stage rather than failing silently. **`record start
+//! --dry-run` is not a stub as of Stage 10**: it runs the whole
+//! ScreenCast-plus-PipeWire negotiation in this process (`run_record_dry_run`
+//! → `capture::screencast::dry_run`) and never contacts the daemon at all.
 //!
 //! # The two process shapes in this file
 //!
@@ -59,7 +62,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use iced::futures::channel::mpsc;
@@ -138,6 +141,13 @@ enum CliRunError {
     Capture(capture::CaptureError),
     /// The in-process capture succeeded but could not be saved.
     Storage(storage::StorageError),
+    /// **Stage 10.** A `record start --dry-run` could not negotiate a
+    /// screencast — no `org.gnome.Mutter.ScreenCast`, no PipeWire node, no
+    /// PipeWire daemon. Its own arm rather than folding into `Bus` because
+    /// `capture::screencast::CastError` already carries the actionable half
+    /// of each message (which `busctl`/`systemctl` line to try), and
+    /// flattening it into a bare `zbus::Error` would throw that away.
+    Cast(capture::screencast::CastError),
 }
 
 impl fmt::Display for CliRunError {
@@ -149,6 +159,7 @@ impl fmt::Display for CliRunError {
             CliRunError::Runtime(err) => write!(f, "could not start an async runtime: {err}"),
             CliRunError::Capture(err) => write!(f, "{err}"),
             CliRunError::Storage(err) => write!(f, "{err}"),
+            CliRunError::Cast(err) => write!(f, "{err}"),
         }
     }
 }
@@ -300,6 +311,16 @@ fn run_record(config_dir: Option<&Path>, args: cli::RecordArgs) -> Result<String
     let config = load_config(config_dir);
     let options = cli::RecordOptions::resolve(&config, &args)?;
 
+    // **Stage 10.** `--dry-run` short-circuits before any daemon contact —
+    // see `capture::screencast::dry_run`'s doc comment for why it runs
+    // in-process rather than over the bus. It is checked here rather than
+    // inside the `run_async` block below so that the auto-spawn in
+    // `connect_to_daemon` never happens for a diagnostic that has nothing
+    // to ask the daemon for.
+    if options.dry_run {
+        return run_record_dry_run(&config, &options);
+    }
+
     run_async(async move {
         let connection = connect_to_daemon().await?;
         let proxy = dbus::Capture1Proxy::new(&connection).await?;
@@ -323,6 +344,57 @@ fn run_record(config_dir: Option<&Path>, args: cli::RecordArgs) -> Result<String
             }
         }
     })
+}
+
+/// How long `record start --dry-run` watches the stream. PLAN.md Stage 10
+/// task 4 fixes this at five seconds: long enough that a 60 Hz cast shows a
+/// stable cadence, short enough that a human runs it without hesitating.
+const DRY_RUN_DURATION: Duration = Duration::from_secs(5);
+
+/// `record start --dry-run` (PLAN.md Stage 10 task 4): negotiate a real
+/// screencast against the focused output, log the negotiated SPA format and
+/// the frame cadence for five seconds, write nothing, tear it all down.
+///
+/// Without `--window-id` the target is the focused monitor, resolved through
+/// the **same** `CaptureBackend` a screenshot uses
+/// (`ScreencopyBackend::focused_output`), so "which monitor does a bare
+/// `record start` mean?" has exactly one answer in this codebase rather than
+/// two that can drift. With `--window-id` it casts that window instead — see
+/// `cli::RecordStartArgs::window_id` for why a dry run can do that when a
+/// real recording (Stage 12) can't yet. Region recording is a monitor cast
+/// cropped in ffmpeg (CAPTURE-RESEARCH D8), so it is not a target here and
+/// never will be.
+fn run_record_dry_run(
+    config: &CaptureConfig,
+    options: &cli::RecordOptions,
+) -> Result<String, CliRunError> {
+    use capture::screencast::{CastTarget, CursorMode};
+    use capture::CaptureBackend;
+
+    let target = match options.window_id {
+        Some(id) => CastTarget::Window { id },
+        None => {
+            let backend = capture::screencopy::ScreencopyBackend::new();
+            CastTarget::Monitor {
+                connector: backend.focused_output()?.name,
+            }
+        }
+    };
+    let cursor = CursorMode::from_cursor_option(config.cursor);
+
+    eprintln!(
+        "saola-capture: dry run: casting {target} (cursor {cursor:?}, preset {} — the preset is \
+         logged for completeness only; a dry run never starts an encoder)",
+        options.preset
+    );
+
+    let report = run_async(async move {
+        capture::screencast::dry_run(target, cursor, DRY_RUN_DURATION)
+            .await
+            .map_err(CliRunError::Cast)
+    })?;
+
+    Ok(report.to_string())
 }
 
 /// `pick-color`: call the daemon, format the RGB triple as a hex swatch.

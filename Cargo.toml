@@ -239,19 +239,70 @@ libc = "0.2"
 #   write would mean re-reading and re-serializing the whole history, which is O(n) per
 #   screenshot and loses the crash-safety an append gives for free.
 serde_json = "1"
-# Recording pipeline survey, 2026-08-08 — **not added as a dependency yet**, per
-# PLAN.md Stage 1 (Stage 9 adds it once Stage 2's shm/dmabuf evidence is in hand).
-# Latest: `pipewire` 0.10.0 (rust-version 1.80), companion `spa` crate carries the SPA
-# pod/type system. Version-gated compositor-feature cargo features
-# (`v0_3_32` .. `v1_0_0`, cumulative) select which PipeWire API surface is available —
-# Jordan's machine runs PipeWire 1.6.8 (PLAN.md Context), well past `v1_0_0`, so the
-# newest feature gate is available once added. `pipewire-sys` links the *system*
-# `libpipewire` via `system_deps`/pkg-config and generates bindings with `bindgen`
-# (verified in its `build.rs`) — a build-time `libclang` + pipewire dev-headers
-# requirement, no vendored C compilation (unlike the WebP case above: this links
-# against the already-live system PipeWire, it doesn't bundle a copy). Stage 9 records
-# the exact feature-gate pin and any SPA pod gotchas found once real negotiation code
-# exists.
+# Recording pipeline survey, 2026-08-08 (opened in Stage 1 as a *note only*, **closed
+# and the dependency added in Stage 10**, once Stage 2's shm/dmabuf evidence was in
+# hand and Jordan had installed clang — see CAPTURE-RESEARCH §2.0/D5).
+#
+# What it is for: `src/capture/screencast.rs` consumes the PipeWire node niri's
+# `org.gnome.Mutter.ScreenCast` hands back after `Start` — the *only* video path this
+# app has (Boundaries forbids portals; niri serves Mutter.ScreenCast itself).
+#
+# Options weighed:
+# - `pipewire` 0.10.0 (this pick, `features = ["v0_3_33"]`) — the official
+#   pipewire-rs bindings, and the only maintained Rust binding for `pw_stream`. Its
+#   companion `libspa` crate (the SPA pod/type system, buffer and format types) is
+#   **not declared separately here**: `pipewire` re-exports it as `pipewire::spa`
+#   (verified in its `src/lib.rs`: `pub use spa;`), so consuming it through the parent
+#   crate is one dependency line instead of two *and* makes a version skew between the
+#   two impossible by construction. Everything Stage 10 needs is reachable that way —
+#   `pipewire::spa::pod::{Object, Property, PropertyFlags, Value, ChoiceValue,
+#   serialize::PodSerializer}`, `pipewire::spa::param::video::VideoInfoRaw`,
+#   `pipewire::spa::buffer::{Data, DataType}`, and the raw constants via
+#   `pipewire::spa::sys::*`.
+# - Hand-rolled FFI against `libpipewire-0.3` — what the Stage 2 probe did, deliberately,
+#   *in C* (CAPTURE-RESEARCH §2.0), because the Rust crate could not build here at the
+#   time. Rejected now that it can: doing it from Rust would mean hand-writing the SPA
+#   pod builder/parser (`spa_pod_builder_push_object`/`push_choice`/`spa_format_parse`)
+#   and the `pw_stream` event-callback vtable plumbing, which is precisely the layer
+#   this crate already wraps — and getting a pod byte layout subtly wrong fails at
+#   *negotiation*, i.e. as a runtime "no more input formats", not at compile time.
+# - `gstreamer` + `pipewiresrc` — rejected outright: a second, very large media
+#   framework alongside the ffmpeg CLI boundary, with its own plugin-discovery runtime
+#   failure modes, to do one thing this crate does directly. PLAN.md Context also
+#   records that GStreamer *encode* plugins aren't installed on this machine.
+# - `ashpd` (xdg-desktop-portal) — forbidden by CLAUDE.md Boundaries ("No portals"),
+#   and broken by configuration on this machine anyway (PLAN.md Context).
+#
+# **Build/runtime facts, all verified rather than assumed:**
+# - `pipewire-sys` and `libspa-sys` run `bindgen` (read their `build.rs`), so
+#   **libclang is a build-time requirement** — cleared 2026-08-08 (clang 22.1.8).
+#   Stage 17 packaging: `clang` in PKGBUILD `makedepends`, `libclang-dev` in CI.
+# - They `links = "pipewire-0.3"` / resolve `libpipewire-0.3` + `libspa-0.2` through
+#   `system-deps`/pkg-config, i.e. they **link the system PipeWire** rather than
+#   vendoring it (the opposite of the `webp` case above). So Stage 17's PKGBUILD needs
+#   `pipewire` as a real `depends` entry, not just a `makedepends` one.
+# - **Feature gate: `v0_3_33`, deliberately not the newest.** These features are
+#   cumulative version gates that decide which *newer* libpipewire API surface is
+#   compiled; picking one sets a floor on the system libpipewire this binary can be
+#   built and run against. The single gated item this stage actually needs is
+#   `spa::pod::PropertyFlags::DONT_FIXATE` (`#[cfg(feature = "v0_3_33")]` in
+#   `libspa-0.10.0/src/pod/mod.rs`), which CAPTURE-RESEARCH D4's `MANDATORY|DONT_FIXATE`
+#   modifier property is written in terms of. Jordan's PipeWire is 1.6.8, so `v1_2_0`
+#   would also build — but it would raise the floor for every other machine for API
+#   this crate does not call. Bump the gate when a stage needs something newer, and say
+#   so; do not bump it because a newer one exists. (No `default-features = false` here:
+#   `pipewire` 0.10 declares no `default` feature at all — verified in its manifest —
+#   so writing it would only imply a carve-out that doesn't exist.)
+# - **Not** zero-net-new-crates, unlike the `libc`/`serde_json` picks above: this adds
+#   `pipewire`, `pipewire-sys`, `libspa`, `libspa-sys` plus a **build-time-only** tail
+#   (`bindgen`, `clang-sys`, `system-deps`, `cexpr`, `nom`, `regex*`, `shlex`,
+#   `target-lexicon`, `version-compare`, `annotate-snippets`, `cookie-factory`, and a
+#   second `toml` — 1.1.4, pulled by `system-deps`, `cargo tree -i` confirms it is a
+#   build-dependency of a build script and never linked into the binary, so it does
+#   *not* undo the "one resolved runtime `toml`" reasoning in the `toml` essay above).
+#   Justified because there is no lighter way to speak PipeWire, and PipeWire is the
+#   only video transport niri offers.
+pipewire = { version = "0.10", features = ["v0_3_33"] }
 # Stage 3, 2026-08-08 — `tokio` as a **direct** dependency, not just the transitive copy
 # iced's/zbus's own `tokio` cargo features already pull in. Architecture's CLI-verb
 # process is a plain async function with no iced event loop (`daemon`/`window` get a

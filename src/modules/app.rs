@@ -48,8 +48,9 @@
 //!   signal stream, so Stage 12 will need its own answer to that regardless.
 //!   Stage 9 wires the Record tab's button to the same "hide, await the
 //!   reply, re-show" shape as the Screenshot tab for now — today that reply
-//!   is `StartRecording`'s stub `Error` (`dbus.rs` — Stage 10/11 land the
-//!   real thing), so pressing it hides the window for a moment and shows
+//!   is `StartRecording`'s stub `Error` (`dbus.rs` — Stage 11 lands the
+//!   real thing; Stage 10 built the capture half but deliberately left this
+//!   method a stub), so pressing it hides the window for a moment and shows
 //!   that stub message, which is the correct, honest behavior for a method
 //!   that isn't implemented yet (CLAUDE.md's no-panic/no-silent-stub rule).
 //!
@@ -560,7 +561,7 @@ impl App {
                 // value reaches `RecordOptions::to_dbus_options`); what's
                 // inert is the daemon side — `StartRecording` doesn't
                 // consume `audio` yet, same stub posture as everything else
-                // Stage 10/11/13 land.
+                // Stage 11/13 land.
                 sections.push(section_label(theme, "Audio"));
                 sections.push(segmented_row(
                     theme,
@@ -700,6 +701,13 @@ fn record_options(preset: VideoPreset, audio: Option<AudioSource>) -> cli::Recor
         action: cli::RecordActionKind::Start,
         preset,
         audio,
+        // The app window starts *real* recordings; `--dry-run` (Stage 10)
+        // is a terminal diagnostic that never reaches the daemon, so there
+        // is nothing here for it to mean — and `window_id` rides along with
+        // it (it is dry-run-only until Stage 12 builds real window
+        // recording, which is also when this tab grows a target picker).
+        dry_run: false,
+        window_id: None,
     }
 }
 

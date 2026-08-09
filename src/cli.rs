@@ -229,6 +229,24 @@ pub struct RecordStartArgs {
     /// (CAPTURE-RESEARCH: never hardcoded) — omit for a silent recording.
     #[arg(long, value_name = "mic|system|both")]
     pub audio: Option<String>,
+    /// Negotiate a screencast, log the format and frame cadence for five
+    /// seconds, then tear everything down. **Writes nothing**, saves
+    /// nothing, and never touches the daemon — the diagnostic for "does
+    /// screen recording work on this machine at all?" (PLAN.md Stage 10).
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Cast one window (a niri-ipc window id, the same id space
+    /// `shot --window --window-id` uses) instead of the focused monitor.
+    ///
+    /// **Only accepted together with `--dry-run` today.** Real window
+    /// recording is Stage 12; this exists because `RecordWindow` has its own
+    /// documented failure mode — CAPTURE-RESEARCH §5.3: a bogus id is
+    /// accepted at `RecordWindow` time and the session then self-destructs
+    /// — and a diagnostic that cannot reach that path cannot diagnose it.
+    /// Window casts are also damage-driven and can go seconds between
+    /// frames (§2.3), which is worth seeing before Stage 12 relies on it.
+    #[arg(long, value_name = "ID")]
+    pub window_id: Option<u64>,
 }
 
 // -- resolution: flags + config -> the values the rest of the app uses --
@@ -641,6 +659,19 @@ pub struct RecordOptions {
     pub action: RecordActionKind,
     pub preset: VideoPreset,
     pub audio: Option<AudioSource>,
+    /// `--dry-run` (Stage 10). **Deliberately absent from
+    /// [`Self::to_dbus_options`]**: a dry run never reaches the daemon, so
+    /// putting it on the wire would add a key to the frozen
+    /// `io.saola.Capture1` contract that nothing would ever read. Only
+    /// meaningful with `start`/`toggle`; `record stop` has no args at all,
+    /// so clap rejects `--dry-run` there before this type sees it.
+    pub dry_run: bool,
+    /// `--window-id` (Stage 10, dry-run only — see [`RecordStartArgs::
+    /// window_id`]). Also absent from [`Self::to_dbus_options`], for the
+    /// same reason `dry_run` is: nothing on the daemon side reads it yet,
+    /// and Stage 12 will decide the real wire shape for a window recording
+    /// target when it builds one.
+    pub window_id: Option<u64>,
 }
 
 impl RecordOptions {
@@ -669,10 +700,26 @@ impl RecordOptions {
             None => None,
         };
 
+        let dry_run = start_args.is_some_and(|a| a.dry_run);
+        let window_id = start_args.and_then(|a| a.window_id);
+        // Rejected rather than ignored: a flag that silently does nothing is
+        // the shape of bug this repo's per-knob-error convention exists to
+        // prevent, and a script that asked to record a specific window needs
+        // to learn it recorded the whole monitor instead.
+        if window_id.is_some() && !dry_run {
+            return Err(CliError(
+                "--window-id: window recording lands in Stage 12 — today this flag is only \
+                 accepted with --dry-run"
+                    .to_string(),
+            ));
+        }
+
         Ok(RecordOptions {
             action,
             preset,
             audio,
+            dry_run,
+            window_id,
         })
     }
 
@@ -920,6 +967,7 @@ mod tests {
             action: RecordAction::Start(RecordStartArgs {
                 preset: Some("av1".to_string()),
                 audio: Some("both".to_string()),
+                ..RecordStartArgs::default()
             }),
         };
         let options = RecordOptions::resolve(&config, &args).unwrap();
@@ -948,7 +996,7 @@ mod tests {
         let args = RecordArgs {
             action: RecordAction::Start(RecordStartArgs {
                 preset: Some("prores".to_string()),
-                audio: None,
+                ..RecordStartArgs::default()
             }),
         };
         assert!(RecordOptions::resolve(&config, &args).is_err());
@@ -959,11 +1007,93 @@ mod tests {
         let config = CaptureConfig::default();
         let args = RecordArgs {
             action: RecordAction::Start(RecordStartArgs {
-                preset: None,
                 audio: Some("bluetooth".to_string()),
+                ..RecordStartArgs::default()
             }),
         };
         assert!(RecordOptions::resolve(&config, &args).is_err());
+    }
+
+    // -- --dry-run / --window-id (Stage 10) ---------------------------------
+
+    #[test]
+    fn record_start_defaults_to_a_real_run_on_the_focused_monitor() {
+        let config = CaptureConfig::default();
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs::default()),
+        };
+        let options = RecordOptions::resolve(&config, &args).unwrap();
+        assert!(!options.dry_run);
+        assert_eq!(options.window_id, None);
+    }
+
+    #[test]
+    fn dry_run_survives_resolution_on_start_and_toggle() {
+        let config = CaptureConfig::default();
+        for action in [
+            RecordAction::Start(RecordStartArgs {
+                dry_run: true,
+                ..RecordStartArgs::default()
+            }),
+            RecordAction::Toggle(RecordStartArgs {
+                dry_run: true,
+                ..RecordStartArgs::default()
+            }),
+        ] {
+            let options = RecordOptions::resolve(&config, &RecordArgs { action }).unwrap();
+            assert!(options.dry_run);
+        }
+    }
+
+    #[test]
+    fn a_window_id_is_accepted_only_alongside_dry_run() {
+        let config = CaptureConfig::default();
+
+        let allowed = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs {
+                dry_run: true,
+                window_id: Some(16),
+                ..RecordStartArgs::default()
+            }),
+        };
+        assert_eq!(
+            RecordOptions::resolve(&config, &allowed).unwrap().window_id,
+            Some(16)
+        );
+
+        // Rejected, not silently ignored — a script that asked for a window
+        // must not quietly get the whole monitor instead.
+        let refused = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs {
+                window_id: Some(16),
+                ..RecordStartArgs::default()
+            }),
+        };
+        let err = RecordOptions::resolve(&config, &refused).unwrap_err();
+        assert!(err.to_string().contains("--window-id"), "{err}");
+        assert!(err.to_string().contains("--dry-run"), "{err}");
+    }
+
+    #[test]
+    fn neither_dry_run_nor_window_id_travels_over_dbus() {
+        // Both are CLI-process-only (Stage 10); adding either to the `a{sv}`
+        // map would grow the frozen `io.saola.Capture1` contract with a key
+        // nothing reads.
+        let config = CaptureConfig::default();
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs {
+                dry_run: true,
+                window_id: Some(16),
+                ..RecordStartArgs::default()
+            }),
+        };
+        let map = RecordOptions::resolve(&config, &args)
+            .unwrap()
+            .to_dbus_options();
+        assert!(!map.contains_key("dry-run"));
+        assert!(!map.contains_key("dry_run"));
+        assert!(!map.contains_key("window-id"));
+        assert!(!map.contains_key("window_id"));
     }
 
     // -- a{sv} option maps --------------------------------------------------
@@ -1009,8 +1139,8 @@ mod tests {
         let config = CaptureConfig::default();
         let args = RecordArgs {
             action: RecordAction::Start(RecordStartArgs {
-                preset: None,
                 audio: Some("system".to_string()),
+                ..RecordStartArgs::default()
             }),
         };
         let options = RecordOptions::resolve(&config, &args).unwrap();
