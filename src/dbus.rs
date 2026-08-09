@@ -563,11 +563,31 @@ impl CaptureService {
     }
 
     /// `OpenWindow(mode s)` — `mode` is `"main"` or `"edit:<path>"` (see
-    /// `cli::WindowAction`). Stage 9 wires this to spawning/raising the
-    /// separate window process.
+    /// `cli::WindowAction::dbus_mode`, the sending side's own encoder).
+    ///
+    /// **Real as of Stage 9**: spawns a detached `saola-capture window
+    /// [edit <path>]` process — the same fire-and-forget shape
+    /// [`spawn_daemon_detached`] (this file) and `main.rs`'s `spawn_editor`
+    /// (the toast-click flow, unchanged since Stage 6) already use, for the
+    /// same reason: a Wayland toplevel window needs a live process behind
+    /// it, and this method's own caller (a keybind, `open`, the future tray
+    /// menu) is not that process.
+    ///
+    /// **Does not try to *reuse* an already-running-but-hidden window
+    /// process** — `modules::app`'s hide-on-capture model (see that
+    /// module's doc comment) means a window can be alive-but-invisible, and
+    /// this daemon keeps no registry of that (unlike the toast/overlay/
+    /// countdown surfaces, a window process's liveness isn't daemon state
+    /// at all in v0.1). A second `OpenWindow` while one is already hidden
+    /// spawns a second process. Recorded as an acceptable v0.1 gap in the
+    /// Stage 9 handoff, not a silent oversight — closing it means the
+    /// daemon tracking window-process liveness, which is more than this
+    /// stage's task list asks for.
     async fn open_window(&self, mode: String) -> zbus::fdo::Result<()> {
         eprintln!("saola-capture: daemon: OpenWindow(mode={mode:?})");
-        Err(not_yet_implemented("OpenWindow", "Stage 9"))
+        spawn_window_process(&mode).map_err(|err| {
+            zbus::fdo::Error::Failed(format!("could not open the app window: {err}"))
+        })
     }
 
     /// Emitted after a screenshot is saved. The future
@@ -793,5 +813,27 @@ fn spawn_daemon_detached() -> Result<(), ClientError> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(ClientError::Spawn)?;
+    Ok(())
+}
+
+/// Spawn `saola-capture window [edit <path>]` detached —
+/// [`CaptureService::open_window`]'s real implementation (Stage 9). `mode`
+/// is the wire string `cli::WindowAction::dbus_mode` produces on the
+/// sending side (`"main"` or `"edit:<path>"`); this is that function's
+/// inverse, kept deliberately tiny (one `strip_prefix`) rather than shared
+/// code — the two ends of a D-Bus string argument only need to agree on its
+/// shape, not share a parser to do it.
+fn spawn_window_process(mode: &str) -> Result<(), std::io::Error> {
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(exe);
+    command.arg("window");
+    if let Some(path) = mode.strip_prefix("edit:") {
+        command.arg("edit").arg(path);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     Ok(())
 }

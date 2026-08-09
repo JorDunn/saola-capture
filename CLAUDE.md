@@ -13,12 +13,13 @@ window, history library, annotation editor), and **CLI verbs** (`shot`,
 architecture, dependencies, or conventions updates this file in the same
 stage and says so in its handoff. A stale CLAUDE.md is a bug.
 
-> Status: Stages 1–8 landed (repo skeleton, dependency survey; every capture
+> Status: Stages 1–9 landed (repo skeleton, dependency survey; every capture
 > path proven with live evidence in `docs/CAPTURE-RESEARCH.md`; full CLI
 > parsing, `capture.toml` config, the `io.saola.Capture1` bus, a surfaceless
 > daemon boot; Stage 5's **real screenshot pipeline**; Stage 6's **PrintScr
-> MVP**; Stage 7's **region selection overlay**; and — new in Stage 8 —
-> **window capture and a visible delayed-capture countdown**).
+> MVP**; Stage 7's **region selection overlay**; Stage 8's **window capture
+> and a visible delayed-capture countdown**; and — new in Stage 9 — the
+> **main app window process**).
 > `shot --fullscreen`, `shot --region [--geometry WxH+X+Y]` and (as of Stage
 > 8) `shot --window [--window-id ID]` all genuinely capture, encode, save,
 > copy and print a path. Fullscreen, `--geometry` region and `--window` all
@@ -57,9 +58,33 @@ stage and says so in its handoff. A stale CLAUDE.md is a bug.
 > to sleep for `2 × --delay` (once in `take_screenshot`'s old top-level
 > sleep, again inside `freeze_focused_output`); delay now has exactly one
 > owner per shot kind.
+> **Stage 9 makes the `window` process and `OpenWindow` real**:
+> `src/modules/app.rs` is a plain `iced::application` (not `iced_layershell`
+> — a normal `Surface::Paper` niri toplevel, a separate process from the
+> daemon, per Architecture's forced process split) with Screenshot/Record
+> mode tabs, a target picker, delay/cursor/format/preset/audio options (all
+> segmented controls — no new saola-theme gaps), and a Capture/Start
+> Recording button. Pressing it hides the window
+> (`iced::window::Mode::Hidden`), calls the daemon exactly the way `shot`/
+> `record` already do, and re-shows on the reply — see the module's own doc
+> comment for why Screenshot's wait is already complete (the `Screenshot`
+> method itself blocks until done) while Record's is deliberately only a
+> stub-reply wait for now (a real "hidden until `RecordingFinished`" wait
+> needs recorder-state awareness and a connection-keyed signal subscription
+> that PLAN.md assigns to Stage 12, not this one — `zbus::Connection` isn't
+> `Hash`, which is part of why). `window edit <path>` now boots straight
+> into a stub editor view (image decoded synchronously, shown at
+> `ContentFit::Contain`, a "tools land in Stage 14" note, no canvas) instead
+> of printing and exiting. `dbus.rs`'s `OpenWindow` spawns
+> `saola-capture window [edit <path>]` detached instead of erroring — the
+> `open` CLI verb, the toast's own (unchanged) direct spawn, and (once
+> Stage 12 builds it) the tray menu are the three "reopen" paths this
+> enables; none of them can currently tell whether a window process is
+> already alive-but-hidden, so a second `open` mid-capture spawns a second
+> process — a recorded v0.1 gap, not an oversight (see the Stage 9
+> handoff).
 > Still stubs, each answering with a clean error naming its stage:
-> `StartRecording`/`StopRecording` (Stages 10–11), `PickColor` (Stage 16),
-> `OpenWindow` and the `window` process (Stage 9).
+> `StartRecording`/`StopRecording` (Stages 10–11), `PickColor` (Stage 16).
 > PLAN.md is the staged build plan. Sections marked *(pending Stage N)* fill
 > in as later stages land.
 >
@@ -92,8 +117,9 @@ cargo run -- shot --fullscreen --delay 3   # any shot kind: countdown pill, then
 cargo run -- shot --fullscreen --no-daemon --format=webp --output=/tmp  # headless/scriptable
 cargo run -- record start|stop|toggle [--preset hevc|av1|h264] [--audio mic|system|both]
 cargo run -- pick-color
-cargo run -- open
-cargo run -- window [edit <path>]  # the app window / editor process
+cargo run -- open                  # raises the app window (spawns it detached — Stage 9)
+cargo run -- window                # the app window process — Screenshot/Record tabs, real as of Stage 9
+cargo run -- window edit <path>    # boots straight into the (stub) editor view on that file
 cargo run -- --config-dir ~/scratch shot --fullscreen  # capture.toml from an alternate dir
 ```
 
@@ -108,8 +134,10 @@ Every CLI verb above except `--no-daemon` shots is a real D-Bus client of the
 daemon as of Stage 3 (auto-spawning it detached, retrying once, if the bus
 name is unowned) — `busctl --user introspect io.saola.Capture1
 /io/saola/Capture1` shows the live interface once a daemon is running. As of
-Stage 5 `Screenshot` is real; the other served methods still answer with a
-stub `Error` until their stage lands (`src/dbus.rs` names which).
+Stage 5 `Screenshot` is real, and as of Stage 9 so is `OpenWindow`; the
+remaining served methods (`StartRecording`, `StopRecording`, `PickColor`)
+still answer with a stub `Error` until their stage lands (`src/dbus.rs`
+names which).
 
 **`Screenshot` can block for minutes, on purpose** (Stage 7): an interactive
 `region` call does not return until the user confirms or cancels — the same
@@ -193,7 +221,12 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   the keyboard risk, so (per the same latency reasoning) a `--delay 1`
   countdown is the shortest-lived reactive surface in the daemon and the
   first one worth measuring if a very short delay ever looks like it flashed
-  too briefly.
+  too briefly. **The app window (Stage 9, `modules::app`) is not a fifth
+  entry in this registry** — it isn't a layer-shell surface at all, has no
+  `SurfaceRole`, and isn't owned by `Daemon`; it's a separate process
+  running a plain `iced::application`, a normal niri toplevel. Its own
+  "hide/show" (`iced::window::set_mode`) is a different mechanism from
+  every lifecycle above, unrelated to `main.rs`'s surface-spawning code.
 - **Recording state lives in the daemon** and survives window closes; the
   PipeWire thread never blocks on the encoder (bounded channel, drop + log).
 - **Two iced_layershell surface gotchas, found live in Stage 6 and binding on
@@ -520,6 +553,31 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   - The dashed selection edge is `canvas::Path::rounded_rectangle` +
     `canvas::Stroke { line_dash: LineDash { segments, offset }, .. }`; both
     exist and work. There is no widget-level dashed border.
+- **Mechanical iced gotchas found in Stage 9** (the app window — a plain
+  `iced::application`, not `iced_layershell`, so some of these are new
+  territory rather than repeats):
+  - **`iced::widget::image` (the module/fn) shadows the `image` crate's own
+    name** the instant `use iced::widget::image;` is in scope (needed for
+    `image::Handle`) — a bare `image::open(path)` then resolves against the
+    iced widget module (which has no `open`), not the crate. A leading `::`
+    forces crate-root resolution: `::image::open(path)`
+    (`modules::app::load_image`). No prior module needed both the iced
+    widget half and the external crate's decode half in the same file.
+  - **A plain `iced::application`'s `Message` needs `#[derive(Clone)]`**,
+    the same requirement the daemon's `Message` has for an unrelated reason
+    (`#[to_layer_message(multi)]`) — here it's `button`/`mouse_area`'s own
+    bound when built through the `row!`/`container` helpers. Found by
+    letting the compiler's own "consider annotating with `#[derive(Clone)]`"
+    suggestion do the work, not by predicting it.
+  - **`iced::Subscription::run_with<D: Hash>` cannot take a
+    `zbus::Connection` as its keying data** — `Connection` isn't `Hash`.
+    This is why `modules::app`'s Record tab doesn't (yet) subscribe to the
+    `RecordingFinished` signal per-connection; Stage 12 needs a different
+    shape (a connection-independent key, or a hand-rolled
+    `iced::stream::channel` worker like `main.rs::dbus_worker_stream`).
+  - `window::open_events()` is enough to learn a single-window
+    `iced::application`'s own `window::Id` — no `window::latest()`/
+    `oldest()` round trip needed when there's provably only ever one window.
 - **Testing**: pure logic (selection geometry, recorder state machine,
   config, undo/redo, swizzle/crop, blur kernels) unit-tested directly;
   buses/compositors behind traits with fakes. **Never `std::env::set_var`

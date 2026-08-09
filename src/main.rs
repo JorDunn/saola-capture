@@ -22,9 +22,16 @@
 //! `--geometry` still reports a clean error, because a surfaceless process
 //! has nowhere to draw a selection.
 //!
-//! What is still a stub: `record` (Stages 10–11), `pick-color` (Stage 16),
-//! the `window` process (Stage 9), and `--window` capture (Stage 8) — each
-//! reporting a clean error naming its stage rather than failing silently.
+//! **Stage 8 made `--window` real**, and **Stage 9 made `window` and
+//! `OpenWindow` real**: `run_window` now boots `modules::app`'s plain
+//! `iced::application` (a `Surface::Paper` toplevel, D-Bus client of the
+//! daemon — see that module's doc comment for the hide-until-reply model
+//! and the `window edit <path>` stub editor), and `dbus.rs`'s `OpenWindow`
+//! spawns it detached instead of answering with a stub error.
+//!
+//! What is still a stub: `record` (Stages 10–11) and `pick-color`
+//! (Stage 16) — each reporting a clean error naming its stage rather than
+//! failing silently.
 //!
 //! # The two process shapes in this file
 //!
@@ -342,26 +349,39 @@ fn rgb_to_hex(r: f64, g: f64, b: f64) -> String {
     format!("#{:02X}{:02X}{:02X}", byte(r), byte(g), byte(b))
 }
 
-/// `open`: ask the daemon to raise the main window.
+/// `open`: ask the daemon to raise the main window. `WindowAction::
+/// dbus_mode(None)` (rather than a bare `"main"` literal) is the same
+/// encoder `dbus.rs`'s `spawn_window_process` decodes on the daemon side —
+/// the one real production call site for that mapping, now that Stage 9
+/// makes `OpenWindow` real (the toast-click flow spawns the editor process
+/// directly, without going through `OpenWindow` at all — see
+/// `main.rs::spawn_editor`).
 fn run_open() -> Result<String, CliRunError> {
     run_async(async {
         let connection = connect_to_daemon().await?;
         let proxy = dbus::Capture1Proxy::new(&connection).await?;
-        proxy.open_window("main").await?;
+        proxy
+            .open_window(&cli::WindowAction::dbus_mode(None))
+            .await?;
         Ok("opened the app window".to_string())
     })
 }
 
-/// `window [edit <path>]`: the separate-process app window. Still a stub
-/// (Stage 9 builds the real `iced` window process) — but it now parses
-/// its real argument shape (`edit <path>`) and reports what it would have
-/// opened, rather than Stage 1's bare "not implemented" print.
+/// `window [edit <path>]`: the separate-process app window — **real as of
+/// Stage 9** (`modules::app::run`, a plain `iced::application`; see that
+/// module's doc comment for the process split from the daemon, the
+/// hide-until-reply capture flow, and the `edit <path>` stub editor).
+/// Blocks for the window's whole life, same as `run_daemon` blocks for the
+/// daemon's.
 fn run_window(action: Option<&cli::WindowAction>) -> ExitCode {
-    let mode = cli::WindowAction::dbus_mode(action);
-    println!(
-        "saola-capture window: the app window process is not implemented yet (Stage 9) — mode={mode}"
-    );
-    ExitCode::SUCCESS
+    let mode = modules::app::window_mode_from_action(action);
+    match modules::app::run(mode) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("saola-capture: window: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
