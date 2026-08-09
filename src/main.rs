@@ -12,12 +12,19 @@
 //! **Stage 5 made `shot` real**, both ways: `run_shot_in_process`
 //! (`--no-daemon`) and the daemon's `Screenshot` method call the same two
 //! library functions (`capture::take_screenshot` then
-//! `storage::save_capture`), and the saved path prints to stdout. What is
-//! still a stub: `record` (Stages 10–11), `pick-color` (Stage 16), the
-//! `window` process (Stage 9), and the two capture *kinds* that need a
-//! surface — an interactive `--region` (Stage 7's overlay) and `--window`
-//! (Stage 8) — each reporting a clean error naming its stage rather than
-//! failing silently.
+//! `storage::save_capture`), and the saved path prints to stdout.
+//!
+//! **Stage 7 made an interactive `--region` real** — through the daemon
+//! only, since it needs a layer-shell surface: `capture::
+//! freeze_focused_output` → `modules::overlay` on a
+//! `SurfaceRole::Overlay` surface → `capture::crop_frozen_frame` →
+//! the same `storage::save_capture`. A `--no-daemon --region` with no
+//! `--geometry` still reports a clean error, because a surfaceless process
+//! has nowhere to draw a selection.
+//!
+//! What is still a stub: `record` (Stages 10–11), `pick-color` (Stage 16),
+//! the `window` process (Stage 9), and `--window` capture (Stage 8) — each
+//! reporting a clean error naming its stage rather than failing silently.
 //!
 //! # The two process shapes in this file
 //!
@@ -54,7 +61,9 @@ use iced::widget::{image, Space};
 use iced::window;
 use iced::{Element, Subscription, Task};
 use iced_layershell::build_pattern::daemon;
-use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer, NewLayerShellSettings};
+use iced_layershell::reexport::{
+    Anchor, KeyboardInteractivity, Layer, NewLayerShellSettings, OutputOption,
+};
 use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 use iced_layershell::to_layer_message;
 use saola_theme::Theme;
@@ -487,10 +496,43 @@ fn run_daemon() -> ExitCode {
 ///     design-system colour choice — exempt for the same reason an avatar
 ///     photo is exempt in `saola-lockscreen::modules::reveal`.
 ///
+/// **The region overlay** (`modules::overlay`, PLAN.md Stage 7, task 1),
+/// walked the same way:
+/// 1. Neither ink nor ivory as a *ground* — the ground is the frozen
+///    screenshot itself, dimmed by `scrim.capture` (§2's own "Capture
+///    overlay (outside selection)" row, the one scrim in the table written
+///    for exactly this surface). Its chrome — toolbar, readout — is ink.
+/// 2. Exactly one terracotta element: **the selection**, meaning its dashed
+///    edge and its eight handles together (§7 names both in one breath). It
+///    is unambiguously the live one. The toolbar's Capture button is
+///    deliberately *not* terracotta despite being the primary action — see
+///    `modules::overlay::toolbar`'s doc comment.
+/// 3. Every control at rest is ivory (`style::button::rest`, ink label).
+/// 4. Toolbar labels and the size readout are `typography.size.body` (13.5,
+///    Sans 500) ≥ 13px ✓, and the readout counts, so it takes tabular
+///    numerals — IBM Plex's default figures, via `convert::ui_font`.
+/// 5. Corners: `radii.selection` (6px) on the selection rect — §4's own
+///    "Capture selection" row, and the deliberate exception to the ≥18px
+///    rule, since a 6px radius is what that row specifies. The toolbar is
+///    `radii.popover` (30) and the readout `radii.pill`.
+/// 6. Zero serif.
+/// 7. No icons at all: the toolbar is text pills (§6's pill button), so the
+///    Lucide/stroke-2.75 question is vacuous. Recorded as a deliberate
+///    choice — `src/icons.rs` still does not exist in this repo, and
+///    inventing an icon set for four buttons that read perfectly well as
+///    words would be the wrong first reason to add one.
+/// 8. Animates? **No.** Nothing on this surface moves on a timer; the
+///    selection follows the pointer, which is direct manipulation, not
+///    animation. It is the first Saola surface with *no* motion at all.
+/// 9. N/A — not a popover.
+/// 10. Added a colour? No — ink, ivory, terracotta. The frozen frame's own
+///     pixels are user content, exempt on the same grounds as the toast's
+///     thumbnail.
+///
 /// Registry of live layer-shell surfaces, keyed by iced's `window::Id`, and
 /// what each one is *for* — the shape `saola-panel::main::SurfaceRole`
 /// established (PLAN.md Stage 3, task 4: "the SurfaceRole registry in
-/// place"). Stage 6 gives it its first two real variants; Stage 7 adds a
+/// place"). Stage 6 gave it its first two real variants; Stage 7 adds the
 /// third (the region-selection overlay).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfaceRole {
@@ -507,6 +549,29 @@ enum SurfaceRole {
     /// unmap-then-respawn — see that method's doc comment) whenever the
     /// card count changes, and unmapped once the last toast expires.
     Toast,
+    /// The region-selection overlay (`modules::overlay`). **Spawned
+    /// reactively and torn down the moment the user acts** — a third
+    /// lifecycle, distinct from both of the above, and the only one it
+    /// could have: it needs `KeyboardInteractivity::Exclusive` from the
+    /// moment it maps, so it cannot be pre-warmed at boot the way the flash
+    /// is (an always-mapped exclusive-keyboard surface would hold the
+    /// keyboard forever), and it has no size that depends on its content,
+    /// so it never needs the toast's respawn-to-resize dance. See
+    /// [`Daemon::begin_region`] for the surface-latency risk this shape
+    /// inherits from Stage 6's first flash draft, and why it is survivable
+    /// here.
+    Overlay,
+    /// The delayed-capture countdown pill (`modules::countdown`, PLAN.md
+    /// Stage 8). Reactive like the overlay (spawned on the first delayed
+    /// shot, torn down the instant the countdown reaches zero — see
+    /// [`Daemon::sync_countdown_surface`]) but with neither of the
+    /// overlay's two reasons to be reactive instead of boot-spawned: no
+    /// keyboard interactivity at all (`KeyboardInteractivity::None`, same
+    /// as the flash) and, unlike the flash, real content that changes over
+    /// its own lifetime, so there is no idle state worth pre-warming.
+    /// `modules::countdown`'s own doc comment has the full reasoning for
+    /// why the flash's boot-time trick neither applies nor is needed here.
+    Countdown,
 }
 
 /// The daemon's whole state.
@@ -531,6 +596,31 @@ struct Daemon {
     /// `toast_surface_settings`) is noticed even though the surface's own
     /// Id doesn't change on its own. See `Daemon::sync_toast_surface`.
     toast_surface_count: usize,
+    /// The region-selection overlay's state, while one is up (Stage 7).
+    /// `Some` here is the daemon's "a selection is in progress" flag: a
+    /// second `shot --region` arriving now is answered
+    /// `RegionOutcome::Unavailable` rather than stacking a second
+    /// exclusive-keyboard surface on top of the first.
+    overlay: Option<modules::overlay::Overlay>,
+    /// The overlay surface's Id, while one is mapped. Tracked separately
+    /// from `overlay` (rather than read back out of `windows`) for the same
+    /// reason `toast_surface` is: `remove_surface` needs the Id, and
+    /// scanning the registry for "the one with role Overlay" would be a
+    /// worse way to ask the same question.
+    overlay_surface: Option<window::Id>,
+    /// Where the answer goes when the user finishes — the reply half of
+    /// `dbus::DaemonEvent::BeginRegion`, held for exactly as long as the
+    /// overlay is up.
+    overlay_reply: Option<mpsc::Sender<dbus::RegionOutcome>>,
+    /// The delayed-capture countdown's state (Stage 8). `Countdown::
+    /// is_active` (not a separate `Option`, unlike `overlay`) is what
+    /// decides whether [`Self::countdown_surface`] should be mapped —
+    /// `#[derive(Default)]` already gives a countdown that is never active,
+    /// which is the correct idle state.
+    countdown: modules::countdown::Countdown,
+    /// The countdown surface's Id, while one is mapped. Same role
+    /// `overlay_surface`/`toast_surface` play for their own surfaces.
+    countdown_surface: Option<window::Id>,
 }
 
 impl Daemon {
@@ -629,6 +719,44 @@ impl Daemon {
                 }
                 self.sync_toast_surface()
             }
+            // Stage 8's delayed-capture countdown pill.
+            Message::CountdownStarted(seconds) => {
+                self.countdown.trigger(
+                    std::time::Duration::from_secs(u64::from(seconds)),
+                    Instant::now(),
+                );
+                self.sync_countdown_surface()
+            }
+            // A tick changes nothing in `self.countdown` (the countdown's
+            // own `Instant` is fixed at trigger time — see
+            // `modules::countdown::Countdown::trigger`); its only job is to
+            // wake rendering and let this arm re-check whether the
+            // countdown surface should still be mapped, the same shape
+            // `Message::Toast`'s arm re-checks the toast surface on every
+            // tick.
+            Message::Countdown(_inner) => self.sync_countdown_surface(),
+            // Stage 7's region flow, both halves.
+            Message::BeginRegion(request) => self.begin_region(request),
+            Message::OverlayEvent {
+                id,
+                event,
+                captured,
+            } => {
+                if self.overlay_surface != Some(id) {
+                    // An event from the toast surface (or from a surface
+                    // that has already been torn down) must never be read as
+                    // an overlay drag: pointer coordinates are
+                    // surface-relative, so a click on a toast card would
+                    // otherwise land somewhere arbitrary inside the
+                    // selection.
+                    return Task::none();
+                }
+                match modules::overlay::message_from_event(&event, captured) {
+                    Some(message) => self.update_overlay(message),
+                    None => Task::none(),
+                }
+            }
+            Message::Overlay(message) => self.update_overlay(message),
             // The macro-injected layer-shell control variants (see
             // `Message`'s doc comment) never reach here — this is the
             // same catch-all `saola-panel::main::Panel::update` ends with,
@@ -659,17 +787,32 @@ impl Daemon {
                 .toasts
                 .view(&self.theme, Instant::now())
                 .map(Message::Toast),
+            // The overlay surface can outlive its state by one frame: the
+            // `RemoveWindow` task and the `self.overlay = None` that
+            // accompanies it are processed by the runtime in that order, so
+            // a redraw in between must render *something*. An empty
+            // `Space` is the same answer the unregistered-Id arm gives.
+            Some(SurfaceRole::Overlay) => match &self.overlay {
+                Some(overlay) => overlay.view(&self.theme).map(Message::Overlay),
+                None => Space::new().into(),
+            },
+            Some(SurfaceRole::Countdown) => self
+                .countdown
+                .view(&self.theme, Instant::now())
+                .map(Message::Countdown),
             None => Space::new().into(),
         }
     }
 
-    /// Three independent workers, batched: the D-Bus service (which owns
+    /// Independent workers, batched: the D-Bus service (which owns
     /// the bus name for the daemon's whole life, or reports why it
-    /// couldn't), the SIGTERM/SIGINT wait, and — new in Stage 6 — the
-    /// flash/toast animation ticks, each gated to run only while its
+    /// couldn't), the SIGTERM/SIGINT wait, and — new in Stage 6, joined by
+    /// the countdown in Stage 8 — the flash/toast/countdown animation
+    /// ticks, each gated to run only while its
     /// surface actually needs to redraw (see
     /// `modules::flash::Flash::subscription` / `modules::toast::ToastStack::
-    /// subscription`), so an idle daemon between screenshots burns zero
+    /// subscription` / `modules::countdown::Countdown::subscription`), so an
+    /// idle daemon between screenshots burns zero
     /// extra timer wakeups. `Instant::now()` is read once per subscription
     /// rebuild (cheap, and iced only rebuilds this when `Daemon`'s state
     /// actually changed) rather than threaded in — see `modules::flash`'s
@@ -684,6 +827,19 @@ impl Daemon {
                 .subscription(now, modules::flash::fade(&self.theme))
                 .map(Message::Flash),
             self.toasts.subscription().map(Message::Toast),
+            self.countdown.subscription(now).map(Message::Countdown),
+            // Raw input, **only while a selection is in progress**. Gated
+            // for the same reason the flash/toast ticks are: this is the
+            // one subscription in the daemon that would otherwise deliver a
+            // message for every pointer motion anywhere on the desktop, all
+            // day, to a daemon that spends almost all of its life idle. The
+            // gate closes again the instant `self.overlay` goes back to
+            // `None` (iced rebuilds subscriptions whenever state changes).
+            if self.overlay.is_some() {
+                overlay_event_subscription()
+            } else {
+                Subscription::none()
+            },
         ])
     }
 
@@ -792,6 +948,128 @@ impl Daemon {
             _ => Task::none(),
         }
     }
+
+    /// Map or unmap the delayed-capture countdown surface to match
+    /// `self.countdown.is_active(..)` (PLAN.md Stage 8, task 2).
+    ///
+    /// Simpler than [`Self::sync_toast_surface`] on purpose: the countdown
+    /// pill's size never changes over its own lifetime (unlike the toast's
+    /// card count), so there is only ever a map/unmap decision here, never
+    /// a resize. Called from both the trigger (`Message::CountdownStarted`)
+    /// and every subsequent tick (`Message::Countdown`) — the tick side is
+    /// what notices "the countdown just reached zero" and tears the surface
+    /// back down, since nothing else in this daemon watches the countdown's
+    /// own clock.
+    fn sync_countdown_surface(&mut self) -> Task<Message> {
+        let active = self.countdown.is_active(Instant::now());
+        match (self.countdown_surface, active) {
+            (None, true) => {
+                let (id, task) =
+                    self.spawn_surface(SurfaceRole::Countdown, countdown_surface_settings());
+                self.countdown_surface = Some(id);
+                task
+            }
+            (Some(id), false) => {
+                self.countdown_surface = None;
+                self.remove_surface(id)
+            }
+            // Already mapped-and-counting, or already unmapped-and-idle.
+            _ => Task::none(),
+        }
+    }
+
+    /// Map the region-selection overlay over a frozen frame (PLAN.md Stage
+    /// 7, task 1) — the daemon's half of `dbus::CaptureService::
+    /// interactive_region`.
+    ///
+    /// **One selection at a time.** A second request while an overlay is up
+    /// is refused immediately with `RegionOutcome::Unavailable` rather than
+    /// queued or stacked: two surfaces both holding
+    /// `KeyboardInteractivity::Exclusive` is a state CAPTURE-RESEARCH §6.6
+    /// explicitly flags as unspecified by the protocol, and "the second
+    /// `Print` press does nothing visible but returns a clear error" is a far
+    /// better failure than "the keyboard is now owned by an invisible
+    /// surface".
+    ///
+    /// **On surface-creation latency** (Stage 6's bug #1, which this shape
+    /// re-exposes): the overlay *is* spawned reactively, exactly like the
+    /// flash draft that lost its whole visible window to Wayland/GPU setup
+    /// latency. The difference that makes it survivable is lifetime — the
+    /// flash's entire existence was ~140 ms, so latency ate the whole thing,
+    /// while the overlay stays mapped until the user acts. Latency here
+    /// delays the moment the overlay becomes visible/interactive; it cannot
+    /// make the overlay never appear. It is still the first thing to suspect
+    /// if a region shot feels sluggish — see the Stage 7 handoff for how it
+    /// was measured live.
+    fn begin_region(&mut self, request: RegionRequest) -> Task<Message> {
+        if self.overlay.is_some() {
+            let mut reply = request.reply;
+            if reply
+                .try_send(dbus::RegionOutcome::Unavailable(
+                    "a region selection is already in progress",
+                ))
+                .is_err()
+            {
+                eprintln!(
+                    "saola-capture: daemon: could not refuse a second region selection — the \
+                     caller is gone"
+                );
+            }
+            return Task::none();
+        }
+
+        let settings = overlay_surface_settings(&request.output.name);
+        let overlay =
+            modules::overlay::Overlay::new(request.frame, request.output, request.focused_window);
+        self.overlay = Some(overlay);
+        self.overlay_reply = Some(request.reply);
+        let (id, task) = self.spawn_surface(SurfaceRole::Overlay, settings);
+        self.overlay_surface = Some(id);
+        task
+    }
+
+    /// Fold one overlay message in, and act on whatever it decides.
+    fn update_overlay(&mut self, message: modules::overlay::Message) -> Task<Message> {
+        let Some(overlay) = self.overlay.as_mut() else {
+            return Task::none();
+        };
+        match overlay.update(message) {
+            modules::overlay::Action::None => Task::none(),
+            modules::overlay::Action::Cancel => self.finish_overlay(dbus::RegionOutcome::Cancelled),
+            modules::overlay::Action::Confirm(region) => {
+                self.finish_overlay(dbus::RegionOutcome::Selected(region))
+            }
+            // Stage 8: the toolbar's Window button.
+            modules::overlay::Action::ConfirmWindow(window) => {
+                self.finish_overlay(dbus::RegionOutcome::SelectedWindow(window))
+            }
+        }
+    }
+
+    /// Answer the waiting D-Bus call and tear the overlay down.
+    ///
+    /// **Order matters, and it is: reply, then unmap.** The `try_send`
+    /// happens before the `RemoveWindow` task is even returned, so the
+    /// blocking crop-and-save on the other side starts while this surface is
+    /// still being torn down rather than after. The flash and toast that
+    /// follow are then landing on a screen the overlay has already left —
+    /// which is what makes the flash read as "the shutter fired", instead of
+    /// firing behind a scrim.
+    fn finish_overlay(&mut self, outcome: dbus::RegionOutcome) -> Task<Message> {
+        if let Some(mut reply) = self.overlay_reply.take() {
+            if reply.try_send(outcome).is_err() {
+                eprintln!(
+                    "saola-capture: daemon: the region selection finished but nobody was \
+                     waiting for it (the caller gave up or exited)"
+                );
+            }
+        }
+        self.overlay = None;
+        match self.overlay_surface.take() {
+            Some(id) => self.remove_surface(id),
+            None => Task::none(),
+        }
+    }
 }
 
 /// The flash surface's layer-shell settings: the whole output, click
@@ -855,6 +1133,102 @@ fn toast_surface_settings(theme: &Theme, count: usize) -> NewLayerShellSettings 
         events_transparent: false,
         ..Default::default()
     }
+}
+
+/// The region-selection overlay's layer-shell settings, targeted at one
+/// named output — CAPTURE-RESEARCH D9's shape, verbatim (`Layer::Overlay`,
+/// all four edges anchored, `size: (0, 0)`, `exclusive_zone: -1`,
+/// `KeyboardInteractivity::Exclusive`, `OutputOption::OutputName`), which is
+/// the configuration that was live-tested in nested niri in Stage 2 rather
+/// than a fresh guess.
+///
+/// Three fields carry real weight:
+///
+/// - **`exclusive_zone: -1`** — "ignore everyone else's reserved space". The
+///   overlay must cover the whole output including whatever strip the panel
+///   reserved, or the top 48 px of the screen would be unselectable.
+/// - **`keyboard_interactivity: Exclusive`** — Escape has to reach this
+///   surface even though a normal window has focus. This is also the reason
+///   the overlay is the one surface in this daemon that must **never** be
+///   live-tested outside a nested niri (CLAUDE.md's binding rule): a bug
+///   that leaves it mapped takes the keyboard with it.
+/// - **`events_transparent: false`** — unlike the flash, this surface is the
+///   whole point of the pointer. It covers the entire output, so it swallows
+///   every click while it is up, which is correct here and exactly why it is
+///   torn down the instant the user acts.
+///
+/// **Single-output, deliberately, for v0.1** (PLAN.md Stage 7, task 3
+/// allows it; CAPTURE-RESEARCH D10 documents why): per-output surface
+/// creation is source-verified but has never been *run* — this machine has
+/// one output and niri's headless backend has no CLI surface — so
+/// cross-output drags and Escape arbitration between several
+/// exclusive-keyboard surfaces are untested. The overlay maps on the focused
+/// output only (`capture::freeze_focused_output` picks it), and a selection
+/// cannot leave that output. The signature already takes an output name, so
+/// the multi-output version is a loop over `outputs()` here plus a shared
+/// coordinate space in `modules::overlay`, not a rewrite.
+fn overlay_surface_settings(output: &str) -> NewLayerShellSettings {
+    NewLayerShellSettings {
+        anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
+        layer: Layer::Overlay,
+        size: Some((0, 0)),
+        margin: Some((0, 0, 0, 0)),
+        exclusive_zone: Some(-1),
+        keyboard_interactivity: KeyboardInteractivity::Exclusive,
+        events_transparent: false,
+        output_option: OutputOption::OutputName(output.to_string()),
+        // Named so `niri msg layers` can tell this apart from the flash and
+        // toast surfaces during a live check — the introspection command the
+        // Stage 6 handoff calls out as the only one that lists layer-shell
+        // surfaces at all.
+        namespace: Some("saola-capture-overlay".to_string()),
+    }
+}
+
+/// The delayed-capture countdown pill's layer-shell settings (PLAN.md Stage
+/// 8, task 2): full-output, click-through, no keyboard, no reservation —
+/// the same shape [`flash_surface_settings`] uses, minus the "spawn once at
+/// boot" part (`modules::countdown`'s own doc comment explains why the
+/// countdown doesn't want that trick even though it's available). Single-
+/// output only, matching the flash and the (single-output-for-v0.1) overlay
+/// — no `output_option` override, so this targets the currently active
+/// output.
+fn countdown_surface_settings() -> NewLayerShellSettings {
+    NewLayerShellSettings {
+        anchor: Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right,
+        layer: Layer::Overlay,
+        size: Some((0, 0)),
+        margin: Some((0, 0, 0, 0)),
+        exclusive_zone: Some(0),
+        keyboard_interactivity: KeyboardInteractivity::None,
+        events_transparent: true,
+        // Named for the same `niri msg layers` introspection reason
+        // `overlay_surface_settings` names its own surface.
+        namespace: Some("saola-capture-countdown".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Raw pointer/keyboard events, tagged with the surface they arrived on.
+///
+/// `iced::event::listen_with` takes a **`fn` pointer, not a closure**, so it
+/// cannot capture the overlay's `window::Id` to filter on — hence the id
+/// rides in the message and `Daemon::update` does the filtering. Everything
+/// that is definitely not overlay input is dropped here rather than in
+/// `update`, so an idle-but-open overlay isn't waking the daemon for window
+/// events, touch, or key releases.
+fn overlay_event_subscription() -> Subscription<Message> {
+    iced::event::listen_with(|event, status, id| {
+        let interesting = matches!(
+            event,
+            iced::Event::Mouse(_) | iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { .. })
+        );
+        interesting.then(|| Message::OverlayEvent {
+            id,
+            event,
+            captured: status == iced::event::Status::Captured,
+        })
+    })
 }
 
 /// Spawns `saola-capture window edit <path>` detached — a toast click
@@ -927,6 +1301,54 @@ enum Message {
     /// Wraps [`modules::toast::Message`] — the stack's tick, hover and
     /// click messages.
     Toast(modules::toast::Message),
+    /// An interactive `shot --region` wants a rectangle —
+    /// `dbus.rs`'s [`dbus::DaemonEvent::BeginRegion`], forwarded through
+    /// `dbus_worker_stream`. Maps the overlay (`Daemon::begin_region`).
+    BeginRegion(RegionRequest),
+    /// A raw input event, tagged with the surface it landed on — see
+    /// [`overlay_event_subscription`]. Only delivered while an overlay is
+    /// up.
+    OverlayEvent {
+        id: window::Id,
+        event: iced::Event,
+        /// Whether a widget on the surface (a toolbar button) already
+        /// handled it — `modules::overlay::message_from_event` uses this to
+        /// keep a button press from also starting a drag underneath it.
+        captured: bool,
+    },
+    /// Wraps [`modules::overlay::Message`] — what the overlay's own widgets
+    /// (the toolbar buttons) emit directly, as opposed to the raw events
+    /// above.
+    Overlay(modules::overlay::Message),
+    /// **Stage 8.** A delayed shot just started counting down —
+    /// `dbus.rs`'s [`dbus::DaemonEvent::CountdownStarted`], forwarded
+    /// through `dbus_worker_stream`. Maps the countdown pill
+    /// (`Daemon::sync_countdown_surface`, via this variant's `update` arm).
+    CountdownStarted(u32),
+    /// Wraps [`modules::countdown::Message`] (just `Tick`) — the pill's own
+    /// gated redraw-and-recheck timer, the same shape [`Message::Flash`]
+    /// uses for the flash's fade.
+    Countdown(modules::countdown::Message),
+}
+
+/// Everything one interactive region selection needs to start, bundled so
+/// [`Message`] carries one field instead of three (four, as of Stage 8).
+///
+/// Derives `Clone` because `#[to_layer_message(multi)]` requires `Message`
+/// to — which is also why the reply half is an `mpsc::Sender` (clonable)
+/// rather than a `oneshot::Sender` (not), and why the frozen frame is
+/// wrapped in `modules::overlay::FrozenFrame` (an `image::Handle` has no
+/// `Debug`). Cloning one is cheap: the handle is refcounted `Bytes`, the
+/// sender a refcount bump, `OutputInfo` a short string plus numbers, and
+/// `focused_window` a `Copy` newtype-over-`u64`.
+#[derive(Debug, Clone)]
+struct RegionRequest {
+    frame: modules::overlay::FrozenFrame,
+    output: capture::OutputInfo,
+    /// **Stage 8.** See `dbus::DaemonEvent::BeginRegion::focused_window`'s
+    /// doc comment — carried straight into `modules::overlay::Overlay::new`.
+    focused_window: Option<capture::WindowRef>,
+    reply: mpsc::Sender<dbus::RegionOutcome>,
 }
 
 #[derive(Debug, Clone)]
@@ -1017,6 +1439,20 @@ fn dbus_worker_stream() -> impl Stream<Item = Message> {
                                 path,
                                 thumbnail: Thumbnail(thumbnail),
                             }
+                        }
+                        dbus::DaemonEvent::BeginRegion {
+                            frame,
+                            output,
+                            focused_window,
+                            reply,
+                        } => Message::BeginRegion(RegionRequest {
+                            frame: modules::overlay::FrozenFrame::new(frame),
+                            output,
+                            focused_window,
+                            reply,
+                        }),
+                        dbus::DaemonEvent::CountdownStarted { seconds } => {
+                            Message::CountdownStarted(seconds)
                         }
                     };
                     if sender.send(message).await.is_err() {

@@ -87,7 +87,7 @@
 //! from `main`.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd};
 use std::os::unix::fs::FileExt;
@@ -375,6 +375,10 @@ impl CaptureBackend for ScreencopyBackend {
             .ok_or(CaptureError::NoOutputs)
     }
 
+    fn focused_window(&self) -> Result<Option<WindowRef>, CaptureError> {
+        Ok(niri_focused_window_id().map(WindowRef))
+    }
+
     fn capture_output(&self, output: &str, cursor: bool) -> Result<Frame, CaptureError> {
         let mut session = Session::open()?;
         let info = session.find_output(output)?;
@@ -405,15 +409,192 @@ impl CaptureBackend for ScreencopyBackend {
         frame.crop(rect).ok_or(CaptureError::EmptyRegion)
     }
 
-    fn capture_window(&self, _window: WindowRef, _cursor: bool) -> Result<Frame, CaptureError> {
-        // CAPTURE-RESEARCH D3: this is *not* a screencopy path at all. niri
-        // exposes no pixel position for tiled windows, so a geometry crop is
-        // impossible; the mechanism is niri-ipc's own `Action::ScreenshotWindow`,
-        // which renders the window's elements offscreen. Stage 8's job.
-        Err(CaptureError::Unsupported(
-            "--window capture lands in Stage 8 (niri's own ScreenshotWindow action)",
-        ))
+    /// **Not a screencopy path at all** — CAPTURE-RESEARCH D3. niri exposes
+    /// no pixel position for a tiled window, so a geometry crop is
+    /// impossible; instead this asks niri to render the window's own
+    /// elements to an offscreen buffer and write them to a PNG file this
+    /// process names, via `Action::ScreenshotWindow`
+    /// (`niri.rs:5575-5640`, cited in the research doc). Three
+    /// consequences follow directly from that mechanism, all handled here:
+    ///
+    /// 1. **Disk round-trip.** niri can only hand back a *file*, never
+    ///    pixels directly, so this reads the PNG back and deletes it. One
+    ///    PNG encode+write+read of a window-sized image is a rounding error
+    ///    next to the ~0.3 s a full-output screencopy already costs.
+    /// 2. **The path must be absolute**, or niri's IPC returns an error
+    ///    before ever rendering anything — [`window_screenshot_temp_path`].
+    /// 3. **niri clobbers the clipboard unconditionally** as a side effect
+    ///    of this same call (`niri.rs:5665-5706`, `tx.send(buf)` runs
+    ///    regardless of `write_to_disk`) — this function does not fight
+    ///    that; `storage.rs`'s "storage.rs owns the final clipboard state"
+    ///    posture (CLAUDE.md Boundaries) is what overwrites or clears it
+    ///    afterward, once the *final* encoded image exists.
+    fn capture_window(&self, window: WindowRef, cursor: bool) -> Result<Frame, CaptureError> {
+        let path = window_screenshot_temp_path(window.0);
+
+        let mut socket = niri_ipc::socket::Socket::connect()
+            .map_err(|err| CaptureError::Connect(err.to_string()))?;
+        let reply = socket
+            .send(niri_ipc::Request::Action(
+                niri_ipc::Action::ScreenshotWindow {
+                    id: Some(window.0),
+                    write_to_disk: true,
+                    show_pointer: cursor,
+                    path: Some(path.to_string_lossy().into_owned()),
+                },
+            ))
+            .map_err(|err| CaptureError::Protocol(err.to_string()))?;
+        // `reply` is `Result<Response, String>` (niri's own error message,
+        // e.g. "no such window" for an id that has since closed) — surfaced
+        // as-is rather than reworded, since niri already wrote the
+        // actionable half of the sentence.
+        reply.map_err(CaptureError::Protocol)?;
+
+        // **Live-caught, Stage 8**: the IPC reply above lands before the
+        // file is necessarily on disk. `Request::Action` replies once niri
+        // has *queued* the action, not once it has rendered the window,
+        // encoded a PNG and written it — a straight `fs::read` immediately
+        // after the reply intermittently raced an ENOENT against a file
+        // that showed up a few milliseconds later (caught live: the PNG
+        // was found, complete and valid, sitting at the exact expected
+        // path moments after this function had already returned an error
+        // for it). `read_window_screenshot_with_retry` absorbs that gap.
+        let bytes = read_window_screenshot_with_retry(&path)?;
+        // Best effort: niri already has its own copy of these bytes
+        // in-process by the time it replied, so a failed cleanup here must
+        // not turn an otherwise-successful capture into a reported failure
+        // — it only leaves one stray file in `$TMPDIR`.
+        let _ = fs::remove_file(&path);
+
+        let decoded = image::load_from_memory(&bytes)
+            .map_err(|err| {
+                CaptureError::Protocol(format!(
+                    "could not decode niri's window screenshot PNG: {err}"
+                ))
+            })?
+            .to_rgba8();
+        let (width, height) = decoded.dimensions();
+
+        // Metadata only (CAPTURE-RESEARCH D3: the render is already
+        // scale-correct by construction, so nothing crops against this
+        // value) — see `niri_window_output_scale`'s own doc comment for why
+        // a lookup failure degrades to `1.0` rather than an error.
+        let scale = niri_window_output_scale(window.0).unwrap_or(1.0);
+
+        Frame::new(width, height, scale, decoded.into_raw()).ok_or_else(|| {
+            CaptureError::Protocol(
+                "niri's window screenshot had an unexpected pixel buffer size".to_string(),
+            )
+        })
     }
+}
+
+/// An absolute scratch path for one `ScreenshotWindow` call — niri
+/// **requires an absolute path** and returns an error rather than inventing
+/// one itself the way its own interactive screenshot UI does (CAPTURE-
+/// RESEARCH D3). The process id plus the window id keeps two concurrent
+/// captures (this daemon and, say, a `--no-daemon` script racing it) from
+/// ever writing over each other's file.
+fn window_screenshot_temp_path(window_id: u64) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "saola-capture-window-{}-{window_id}.png",
+        std::process::id()
+    ))
+}
+
+/// How many times [`read_window_screenshot_with_retry`] retries an `ENOENT`
+/// before giving up, and how long it sleeps between attempts. 20 × 25 ms is
+/// a 500 ms budget — generous next to the render itself (niri's own
+/// screencopy path, doing comparable work, budgets ~0.3 s per CAPTURE-
+/// RESEARCH §1.5), small next to the daemon's already-async `Screenshot`
+/// D-Bus call, and this is a liveness retry (a real file that's merely not
+/// there *yet*), not the `HANDSHAKE_TIMEOUT` liveness budget above (a
+/// compositor that might never answer at all).
+const WINDOW_SCREENSHOT_READ_RETRIES: u32 = 20;
+const WINDOW_SCREENSHOT_READ_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+/// Reads the PNG [`ScreencopyBackend::capture_window`] just asked niri to
+/// write, retrying a short while on `ENOENT` before giving up.
+///
+/// **Why this exists (live-caught, Stage 8):** `niri_ipc::Socket::send`
+/// blocks until niri's IPC *reply* arrives, which — per the same "`Start`
+/// returns success before the session is actually confirmed" shape
+/// CAPTURE-RESEARCH §5.3 already documents for `RecordWindow` — is not the
+/// same moment the render-encode-write pipeline for `ScreenshotWindow`
+/// actually finishes. A straight `fs::read` right after the reply
+/// intermittently lost this race in live testing: the call returned
+/// `ENOENT`, and the exact file it was looking for showed up, complete and
+/// byte-valid, a short time later. Every *other* failure mode (permission
+/// denied, a full disk, the directory itself missing) is not retried —
+/// only `ErrorKind::NotFound`, so a real, permanent failure still reports
+/// immediately rather than burning half a second first.
+fn read_window_screenshot_with_retry(path: &std::path::Path) -> Result<Vec<u8>, CaptureError> {
+    let mut last_err = None;
+    for _ in 0..WINDOW_SCREENSHOT_READ_RETRIES {
+        match fs::read(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                last_err = Some(err);
+                std::thread::sleep(WINDOW_SCREENSHOT_READ_RETRY_DELAY);
+            }
+            Err(err) => return Err(CaptureError::Io(err)),
+        }
+    }
+    Err(CaptureError::Io(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "niri's window screenshot never appeared",
+        )
+    })))
+}
+
+/// The currently focused window's niri id, or `None` if nothing is focused
+/// (a layer-shell surface has focus, the desktop is empty) or niri's IPC
+/// socket can't be reached — both read the same to a caller, which is why
+/// [`ScreencopyBackend::focused_window`] doesn't distinguish them either.
+fn niri_focused_window_id() -> Option<u64> {
+    let mut socket = niri_ipc::socket::Socket::connect().ok()?;
+    let response = socket.send(niri_ipc::Request::FocusedWindow).ok()?.ok()?;
+    match response {
+        niri_ipc::Response::FocusedWindow(Some(window)) => Some(window.id),
+        _ => None,
+    }
+}
+
+/// The physical-pixels-per-logical-pixel scale of the output `window_id`
+/// currently lives on: window → its `workspace_id` (`Request::Windows`) →
+/// that workspace's `output` name (`Request::Workspaces`) → that output's
+/// fractional scale ([`niri_logical_outputs`], the same lookup
+/// [`OutputInfo::scale`]'s own doc comment explains). `None` on any lookup
+/// failure along that chain (the window closed between the screenshot and
+/// this call, an output was unplugged, niri is unreachable) — the caller
+/// falls back to `1.0`, which is exactly right on an integer-scale output
+/// and merely imprecise history-index metadata on a fractional one, never a
+/// crash.
+fn niri_window_output_scale(window_id: u64) -> Option<f64> {
+    let mut socket = niri_ipc::socket::Socket::connect().ok()?;
+    let windows = match socket.send(niri_ipc::Request::Windows).ok()?.ok()? {
+        niri_ipc::Response::Windows(windows) => windows,
+        _ => return None,
+    };
+    let workspace_id = windows
+        .into_iter()
+        .find(|window| window.id == window_id)?
+        .workspace_id?;
+
+    let mut socket = niri_ipc::socket::Socket::connect().ok()?;
+    let workspaces = match socket.send(niri_ipc::Request::Workspaces).ok()?.ok()? {
+        niri_ipc::Response::Workspaces(workspaces) => workspaces,
+        _ => return None,
+    };
+    let output_name = workspaces
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)?
+        .output?;
+
+    niri_logical_outputs()?
+        .get(&output_name)
+        .map(|logical| logical.scale)
 }
 
 // ---------------------------------------------------------------------
@@ -1468,5 +1649,95 @@ mod tests {
             bytes.iter().all(|byte| *byte == 0),
             "a fresh memfd reads as zeroes"
         );
+    }
+
+    // -- window screenshot read-retry (Stage 8, live-caught) ----------------
+
+    /// Two captures for the same window id, from two different processes,
+    /// must never be able to collide on the same scratch path — the whole
+    /// reason the pid is in the filename.
+    #[test]
+    fn window_screenshot_temp_paths_are_absolute_and_pid_scoped() {
+        let path = window_screenshot_temp_path(42);
+        assert!(
+            path.is_absolute(),
+            "niri requires an absolute path: {path:?}"
+        );
+        assert!(path
+            .to_string_lossy()
+            .contains(&std::process::id().to_string()));
+        assert!(path.to_string_lossy().contains("42"));
+    }
+
+    /// A file already sitting at the path when this is called (the common
+    /// case — niri usually wins the race) is read on the very first try,
+    /// no sleep incurred.
+    #[test]
+    fn read_with_retry_succeeds_immediately_when_the_file_is_already_there() {
+        let path = std::env::temp_dir().join(format!(
+            "saola-capture-test-retry-immediate-{}.png",
+            std::process::id()
+        ));
+        fs::write(&path, b"already here").expect("write");
+        let result = read_window_screenshot_with_retry(&path);
+        let _ = fs::remove_file(&path);
+        assert_eq!(result.expect("file existed"), b"already here");
+    }
+
+    /// The exact race live-tested against real niri: the file does not
+    /// exist yet when the read is asked for, but appears a moment later.
+    /// Spawns a thread that writes it after one retry interval's worth of
+    /// delay, so this exercises the *retry loop itself*, not just "the file
+    /// happened to already be there".
+    #[test]
+    fn read_with_retry_survives_a_file_that_appears_a_moment_later() {
+        let path = std::env::temp_dir().join(format!(
+            "saola-capture-test-retry-delayed-{}-{:?}.png",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_file(&path); // in case a previous run left one
+        let writer_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(WINDOW_SCREENSHOT_READ_RETRY_DELAY * 2);
+            fs::write(&writer_path, b"showed up late").expect("write");
+        });
+
+        let result = read_window_screenshot_with_retry(&path);
+        writer.join().expect("writer thread");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(result.expect("the retry loop caught it"), b"showed up late");
+    }
+
+    /// A file that never shows up at all reports a clean, actionable
+    /// `CaptureError::Io` rather than hanging forever — the retry budget is
+    /// bounded, not a liveness wait with no ceiling.
+    #[test]
+    fn read_with_retry_gives_up_and_reports_a_clean_error() {
+        let path = std::env::temp_dir().join(format!(
+            "saola-capture-test-retry-never-{}-{:?}.png",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_file(&path);
+        let err = read_window_screenshot_with_retry(&path).expect_err("never written");
+        assert!(matches!(err, CaptureError::Io(_)), "got {err}");
+    }
+
+    /// A failure that isn't "not found yet" (permission denied, say) must
+    /// not be retried at all — retrying it would just burn the whole budget
+    /// reporting the same permanent error five hundred milliseconds later.
+    #[test]
+    fn read_with_retry_does_not_retry_a_non_notfound_error() {
+        // A directory can never be `fs::read` as a file — `IsADirectory`
+        // (or `Other` on some platforms), never `NotFound`, so this proves
+        // the non-`NotFound` branch returns immediately rather than
+        // spinning through the whole retry budget first (the test's own
+        // runtime would show it: `cargo test` here still completed in
+        // milliseconds, not the ~500 ms the retry budget would cost).
+        let dir = std::env::temp_dir();
+        let err = read_window_screenshot_with_retry(&dir).expect_err("a directory is not a file");
+        assert!(matches!(err, CaptureError::Io(_)), "got {err}");
     }
 }

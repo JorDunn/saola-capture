@@ -64,6 +64,14 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 use zbus::Connection;
 
+// Brings `CaptureBackend`'s trait methods (`.focused_window()`,
+// `.capture_window()`) into scope for the `ScreencopyBackend` values built
+// inline in `CaptureService::interactive_region` — Stage 8's window-picking
+// path. `capture_and_save` above only ever calls the free function
+// `capture::take_screenshot(&backend, ..)`, so this import wasn't needed
+// until this stage added a direct trait-method call site.
+use crate::capture::CaptureBackend;
+
 /// The well-known bus name this daemon claims and the object path it lives
 /// at. The interface name (used in the `#[zbus::interface]`/`#[zbus::proxy]`
 /// attributes below, which need a string literal rather than a `const`) is
@@ -122,6 +130,73 @@ pub enum DaemonEvent {
         path: String,
         thumbnail: iced::widget::image::Handle,
     },
+    /// **Stage 7.** An interactive `--region` shot needs the user to drag a
+    /// rectangle: the frozen full-output capture is already in hand (see
+    /// [`CaptureService::interactive_region`]) and this asks the iced daemon
+    /// to map `modules::overlay` on top of it.
+    ///
+    /// Unlike [`Self::CaptureTaken`] this one expects an **answer**, which
+    /// is what `reply` carries. It is a one-message
+    /// `iced::futures::channel::mpsc` channel rather than a `oneshot`
+    /// specifically because `main.rs`'s `Message` must derive `Clone`
+    /// (`#[to_layer_message(multi)]` requires it) and `oneshot::Sender` is
+    /// not `Clone` — an `mpsc::Sender` is, and a capacity-1 channel used
+    /// once is a oneshot in every way that matters here.
+    BeginRegion {
+        /// The frozen frame, already decoded for iced. A **copy** of the
+        /// `Frame`'s bytes: the `Frame` itself stays behind in
+        /// [`CaptureService::interactive_region`], because it — not the
+        /// handle — is what the confirmed rectangle is finally cropped out
+        /// of. One extra full-output allocation per region shot (~16 MB at
+        /// 2560×1600) buys the guarantee that the saved pixels are the ones
+        /// the compositor handed us, never something round-tripped through
+        /// a widget toolkit.
+        frame: iced::widget::image::Handle,
+        /// Which output the frame came from — its logical origin and size
+        /// (the overlay's coordinate space), its name (for
+        /// `OutputOption::OutputName`) and its scale (for the size readout).
+        output: crate::capture::OutputInfo,
+        /// **Stage 8.** Whichever window was focused at the moment the
+        /// frame above was frozen, resolved once here (a best-effort extra
+        /// niri-ipc round trip — see [`CaptureService::interactive_region`])
+        /// and carried straight into `modules::overlay::Overlay::new` so the
+        /// toolbar's Window button and a bare `shot --window`'s own
+        /// no-`--window-id` default resolve "which window?" identically.
+        focused_window: Option<crate::capture::WindowRef>,
+        reply: iced::futures::channel::mpsc::Sender<RegionOutcome>,
+    },
+    /// **Stage 8.** A delayed shot (`--delay N`, any of the three kinds) is
+    /// about to start counting down — maps `modules::countdown`'s pill so
+    /// the countdown is visible before the shutter, not just felt as a
+    /// pause. Fire-and-forget, like [`Self::CaptureTaken`]: nothing waits on
+    /// an answer, so this is offered with `try_send` from
+    /// [`CaptureService::screenshot`], never `.send().await`, for the same
+    /// reason every other daemon-side bridge in this file is.
+    CountdownStarted { seconds: u32 },
+}
+
+/// How an interactive region selection ended — the value the daemon sends
+/// back down [`DaemonEvent::BeginRegion`]'s `reply` channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionOutcome {
+    /// Confirmed. Crop this **desktop-logical** rectangle out of the frozen
+    /// frame (`capture::crop_frozen_frame`).
+    Selected(crate::capture::LogicalRect),
+    /// **Stage 8.** The toolbar's Window button: capture this window fresh
+    /// via `CaptureBackend::capture_window` instead of cropping anything out
+    /// of the frozen frame — see
+    /// [`CaptureService::interactive_region`]'s step 4 for why this is a
+    /// genuinely different tail than [`Self::Selected`], not a variant on
+    /// it.
+    SelectedWindow(crate::capture::WindowRef),
+    /// Escape, or the toolbar's Cancel. Nothing is saved and the D-Bus call
+    /// fails with a message saying so — the same shape `slurp` has always
+    /// had, and the only honest answer for a method whose return value is a
+    /// saved path.
+    Cancelled,
+    /// The daemon could not run a selection at all — today, only because one
+    /// is already in progress. Carries the message the caller should see.
+    Unavailable(&'static str),
 }
 
 /// A method that isn't implemented yet: log to stderr (so `daemon`'s own
@@ -191,6 +266,138 @@ where
     }
 }
 
+/// The interactive half of `Screenshot`, kept in a **plain** `impl` block —
+/// anything inside the `#[zbus::interface]` block below would be exported on
+/// the bus, and this is an internal helper, not a method.
+impl CaptureService {
+    /// `Screenshot("region", …)` with no `geometry`: the full round trip
+    /// through Stage 7's selection overlay.
+    ///
+    /// Four steps, in an order Architecture and CAPTURE-RESEARCH §1.5 both
+    /// fix and none of which is negotiable:
+    ///
+    /// 1. **Freeze.** Capture the whole focused output *before* any overlay
+    ///    exists, because screencopy composites layer-shell surfaces — a
+    ///    capture taken with the overlay up would contain the overlay.
+    /// 2. **Ask.** Hand a copy of those pixels to the iced daemon
+    ///    ([`DaemonEvent::BeginRegion`]), which maps the overlay surface.
+    /// 3. **Wait.** Park on the reply channel for as long as the user takes.
+    ///    This is the one D-Bus method in this interface that can legitimately
+    ///    take minutes to answer; `zbus` dispatches each incoming call on its
+    ///    own task (`spawn_tasks_for_methods`, on by default), so a pending
+    ///    selection blocks nothing else on the bus, and no client-side
+    ///    timeout applies (`zbus::Connection`'s `method_timeout` defaults to
+    ///    `None`, so `shot --region` blocks until the user acts — exactly
+    ///    like `slurp`).
+    /// 4. **Crop and save.** Out of the frame from step 1, never a fresh
+    ///    capture, through the same `save_capture` every other shot uses.
+    ///
+    /// **`try_send`, not `.send().await`,** at step 2 — same rule as
+    /// [`Self::screenshot`]'s `CaptureTaken` bridge: a D-Bus method must
+    /// never park on the iced event loop draining a channel. A full channel
+    /// here means the daemon is wedged, and a clean error beats a hung
+    /// keybind.
+    async fn interactive_region(
+        &self,
+        options: crate::cli::CaptureOptions,
+    ) -> Result<(crate::storage::SavedCapture, crate::capture::Frame), String> {
+        use iced::futures::StreamExt;
+
+        // 1. Freeze. `--delay` is honoured here, before the overlay maps, so
+        //    the frozen frame shows the delayed state rather than delaying
+        //    the *selection* — the countdown pill (`Self::screenshot`'s
+        //    `CountdownStarted` send, before this method is even called)
+        //    is what makes that wait visible as of Stage 8.
+        let freeze_options = options.clone();
+        let (frame, output) = run_blocking(move || {
+            let backend = crate::capture::screencopy::ScreencopyBackend::new();
+            crate::capture::freeze_focused_output(&backend, &freeze_options)
+                .map_err(|err| err.to_string())
+        })
+        .await?;
+
+        // 1b. Also resolve the focused window, best-effort (Stage 8) — see
+        //     `DaemonEvent::BeginRegion::focused_window`'s doc comment. A
+        //     failure here (or a `run_blocking` panic) degrades to "nothing
+        //     focused" rather than failing the whole region flow: the
+        //     Window toolbar button simply renders disabled, which is the
+        //     same honest answer a real "nothing is focused" gives.
+        let focused_window = run_blocking(|| {
+            let backend = crate::capture::screencopy::ScreencopyBackend::new();
+            Ok::<_, String>(backend.focused_window().ok().flatten())
+        })
+        .await
+        .unwrap_or(None);
+
+        // 2. Ask. See `DaemonEvent::BeginRegion`'s doc comment for why the
+        //    handle is a copy and the `Frame` stays here.
+        let handle = iced::widget::image::Handle::from_rgba(
+            frame.width(),
+            frame.height(),
+            frame.pixels().to_vec(),
+        );
+        let (reply, mut replies) = iced::futures::channel::mpsc::channel::<RegionOutcome>(1);
+        self.events
+            .clone()
+            .try_send(DaemonEvent::BeginRegion {
+                frame: handle,
+                output: output.clone(),
+                focused_window,
+                reply,
+            })
+            .map_err(|_| {
+                "could not reach the daemon's overlay (its event loop is busy or gone)".to_string()
+            })?;
+
+        // 3. Wait. A dropped sender (the daemon exited mid-selection) reads
+        //    as a cancel: nothing was selected, and nothing should be saved.
+        let outcome = replies.next().await.unwrap_or(RegionOutcome::Cancelled);
+
+        // 4. Crop-and-save, or capture-and-save — two different tails,
+        //    because `SelectedWindow` (Stage 8) is not a variant on cropping
+        //    the frozen frame, it is an entirely different capture
+        //    mechanism (`CaptureBackend::capture_window`, CAPTURE-RESEARCH
+        //    D3). The frozen frame this method spent step 1 producing is
+        //    simply discarded on that branch.
+        match outcome {
+            RegionOutcome::Selected(region) => {
+                run_blocking(move || {
+                    let cropped = crate::capture::crop_frozen_frame(&frame, &output, region)
+                        .map_err(|err| err.to_string())?;
+                    let saved = crate::storage::save_capture(
+                        &cropped,
+                        &options,
+                        options.kind,
+                        crate::storage::ClipboardOwner::ThisProcess,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    Ok((saved, cropped))
+                })
+                .await
+            }
+            RegionOutcome::SelectedWindow(window) => {
+                run_blocking(move || {
+                    let backend = crate::capture::screencopy::ScreencopyBackend::new();
+                    let frame = backend
+                        .capture_window(window, options.cursor)
+                        .map_err(|err| err.to_string())?;
+                    let saved = crate::storage::save_capture(
+                        &frame,
+                        &options,
+                        crate::cli::ShotKind::Window,
+                        crate::storage::ClipboardOwner::ThisProcess,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    Ok((saved, frame))
+                })
+                .await
+            }
+            RegionOutcome::Cancelled => Err("the region selection was cancelled".to_string()),
+            RegionOutcome::Unavailable(note) => Err(note.to_string()),
+        }
+    }
+}
+
 #[zbus::interface(name = "io.saola.Capture1")]
 impl CaptureService {
     /// `Screenshot(kind s, options a{sv}) -> s`. `kind` is one of
@@ -200,9 +407,12 @@ impl CaptureService {
     /// its sibling `from_dbus_options`).
     ///
     /// **Real as of Stage 5** for `fullscreen` and for `region` with an
-    /// explicit `geometry`; `region` without one needs Stage 7's overlay and
-    /// `window` needs Stage 8, and both report that as a clean D-Bus error
-    /// naming the stage (`capture::CaptureError::Unsupported`).
+    /// explicit `geometry`, **as of Stage 7** for an interactive `region`
+    /// too (no `geometry` — see [`Self::interactive_region`]), and **as of
+    /// Stage 8** for `window` — with or without `window-id` (`capture::
+    /// take_screenshot`'s own dispatch) and via the region overlay's
+    /// Window button (also [`Self::interactive_region`], which is why that
+    /// one method now branches on two capture mechanisms rather than one).
     ///
     /// # Two teaching notes on the body
     ///
@@ -247,12 +457,53 @@ impl CaptureService {
         let options = crate::cli::CaptureOptions::from_dbus_options(&kind, &options)
             .map_err(|err| zbus::fdo::Error::InvalidArgs(err.to_string()))?;
 
-        let (saved, frame) = run_blocking(move || capture_and_save(&options))
-            .await
-            .map_err(|err| {
-                eprintln!("saola-capture: daemon: Screenshot failed: {err}");
-                zbus::fdo::Error::Failed(err)
-            })?;
+        // **Stage 8.** Show the countdown pill *before* any of the blocking
+        // work below starts — this is the one place all three shot kinds
+        // (fullscreen, region — both interactive and `--geometry` — and
+        // window) funnel through, so it is the one place this event needs
+        // to be sent rather than three. `try_send`, never
+        // `.send().await`, for the same reason every other bridge in this
+        // file uses it: a full channel or a gone event loop degrades to "no
+        // visible countdown, capture anyway" rather than blocking (or
+        // failing) the reply. `--no-daemon` shots never reach this method at
+        // all, so they stay silent during their delay exactly as before —
+        // there is no surface to show a countdown *on*.
+        if options.delay > 0
+            && self
+                .events
+                .clone()
+                .try_send(DaemonEvent::CountdownStarted {
+                    seconds: options.delay,
+                })
+                .is_err()
+        {
+            eprintln!(
+                "saola-capture: daemon: could not show the delay countdown (channel full or \
+                 the daemon's event loop is gone) — capturing anyway"
+            );
+        }
+
+        // **Stage 7.** A `region` shot with no explicit `geometry` is the
+        // one kind that cannot be answered without asking the user, so it
+        // takes the long way round: freeze the output, map the overlay, wait
+        // for a rectangle, *then* crop and save. Everything else — a
+        // fullscreen shot, or a region with `--geometry` — is still the
+        // single blocking call Stage 5 shipped. Both branches end in the
+        // same `(SavedCapture, Frame)`, so the signal/thumbnail/reply tail
+        // below is shared rather than duplicated.
+        let interactive_region =
+            options.kind == crate::cli::ShotKind::Region && options.geometry.is_none();
+
+        let outcome = if interactive_region {
+            self.interactive_region(options).await
+        } else {
+            run_blocking(move || capture_and_save(&options)).await
+        };
+
+        let (saved, frame) = outcome.map_err(|err| {
+            eprintln!("saola-capture: daemon: Screenshot failed: {err}");
+            zbus::fdo::Error::Failed(err)
+        })?;
 
         let path = saved.path.to_string_lossy().into_owned();
         if let Err(err) = Self::capture_taken(&emitter, &path, &kind).await {

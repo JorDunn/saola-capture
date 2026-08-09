@@ -36,18 +36,22 @@
 //! and it applies CAPTURE-RESEARCH §1.4's verified rule (`round(logical *
 //! scale)`, measured byte-exact against the compositor's own rounding).
 //!
-//! # What Stage 5 implements and what it doesn't
+//! # What's implemented, stage by stage
 //!
-//! [`ScreencopyBackend`](screencopy::ScreencopyBackend) implements
-//! [`CaptureBackend::outputs`], [`CaptureBackend::focused_output`],
-//! [`CaptureBackend::capture_output`] and [`CaptureBackend::capture_region`]
-//! for real. [`CaptureBackend::capture_window`] returns
-//! [`CaptureError::Unsupported`] until Stage 8 wires it to niri-ipc's
+//! [`ScreencopyBackend`](screencopy::ScreencopyBackend) implements every
+//! [`CaptureBackend`] method for real as of Stage 8: [`CaptureBackend::
+//! outputs`]/[`focused_output`](CaptureBackend::focused_output)/
+//! [`capture_output`](CaptureBackend::capture_output)/
+//! [`capture_region`](CaptureBackend::capture_region) landed in Stage 5;
+//! [`CaptureBackend::capture_window`] and [`CaptureBackend::
+//! focused_window`] landed in Stage 8, via niri-ipc's
 //! `Action::ScreenshotWindow` (CAPTURE-RESEARCH D3 — *not* a geometry crop;
 //! niri exposes no pixel position for tiled windows). Interactive region
 //! selection (a `--region` with no `--geometry`) needs the Stage 7 overlay
-//! and likewise reports a clean, actionable error today rather than guessing
-//! a rectangle.
+//! surface and is intercepted by `dbus.rs` before it ever reaches this
+//! module; a `--no-daemon --region` with no `--geometry` has no surface to
+//! map and reports a clean, actionable error instead of guessing a
+//! rectangle.
 
 pub mod screencopy;
 
@@ -409,14 +413,12 @@ pub fn output_for_region(outputs: &[OutputInfo], region: LogicalRect) -> Option<
 /// the id space is unified (`niri-ipc Window.id` ==
 /// `ext_foreign_toplevel_handle_v1.identifier` == ScreenCast `window-id`,
 /// all one `MappedId(u64)` inside niri), so one number is enough and no
-/// per-mechanism handle type is needed. Stage 8 fills the implementation in.
-///
-/// `#[allow(dead_code)]` because Stage 5 has no window *picker* to produce
-/// an id — nothing constructs one yet. The type and the trait method exist
-/// now so that Stage 8 adds a picker rather than also having to design this
-/// boundary, and so the trait's shape matches Architecture's four-method
-/// sketch from the start.
-#[allow(dead_code)]
+/// per-mechanism handle type is needed. **Real as of Stage 8**:
+/// `cli::CaptureOptions::window_id` (`--window-id`, the scriptable path),
+/// [`CaptureBackend::focused_window`] (the no-picker default — CAPTURE-
+/// RESEARCH D3's "or by the focused window"), and `modules::overlay`'s
+/// Window toolbar button (the interactive path, same resolution) all
+/// produce one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowRef(pub u64);
 
@@ -456,6 +458,12 @@ pub enum CaptureError {
     /// the actionable "which stage" note, same discipline as
     /// `dbus::not_yet_implemented`.
     Unsupported(&'static str),
+    /// `shot --window` with no `--window-id` and no window currently
+    /// focused (or the daemon can't reach niri's IPC socket to ask) — there
+    /// is nothing to capture. Distinct from [`Self::Unsupported`]: this is
+    /// not a missing feature, it is a `--window` invocation with nothing to
+    /// point at, same class of error as [`Self::EmptyRegion`].
+    NoFocusedWindow,
 }
 
 impl fmt::Display for CaptureError {
@@ -489,6 +497,10 @@ impl fmt::Display for CaptureError {
             ),
             CaptureError::Io(err) => write!(f, "shared-memory buffer error: {err}"),
             CaptureError::Unsupported(note) => f.write_str(note),
+            CaptureError::NoFocusedWindow => write!(
+                f,
+                "no window is currently focused — pass --window-id, or focus a window first"
+            ),
         }
     }
 }
@@ -529,6 +541,23 @@ pub trait CaptureBackend {
     /// one, or a stable fallback if focus can't be determined.
     fn focused_output(&self) -> Result<OutputInfo, CaptureError>;
 
+    /// The window currently focused on the desktop, if any — what a bare
+    /// `shot --window` (no `--window-id`) captures, and what `modules::
+    /// overlay`'s Window toolbar button confirms with (Stage 8;
+    /// CAPTURE-RESEARCH D3: "Picking is by list ... or by 'the focused
+    /// window'" — this is the second option, chosen because niri exposes no
+    /// pixel position for tiled windows, so a hover-to-highlight list picker
+    /// isn't implementable anyway, per D3's own "documented v0.1
+    /// limitation").
+    ///
+    /// `Ok(None)` for "nothing is focused" (a layer-shell surface has focus,
+    /// the desktop is empty, or the compositor's IPC is unreachable) — not
+    /// an error, since the caller's own answer to "no focused window" is
+    /// already a clean, actionable error
+    /// ([`CaptureError::NoFocusedWindow`]) and this method has nothing more
+    /// specific to say.
+    fn focused_window(&self) -> Result<Option<WindowRef>, CaptureError>;
+
     /// A whole output, at its physical resolution.
     fn capture_output(&self, output: &str, cursor: bool) -> Result<Frame, CaptureError>;
 
@@ -550,11 +579,13 @@ pub trait CaptureBackend {
 
     /// A single window, rendered by the compositor itself.
     ///
-    /// Stage 8 (`niri-ipc` `Action::ScreenshotWindow`, CAPTURE-RESEARCH D3).
-    /// `#[allow(dead_code)]` for the same reason [`WindowRef`] carries it:
-    /// implemented by every backend, called by nobody until a window picker
-    /// exists.
-    #[allow(dead_code)]
+    /// **Real as of Stage 8** (`niri-ipc` `Action::ScreenshotWindow`,
+    /// CAPTURE-RESEARCH D3) — see
+    /// [`ScreencopyBackend::capture_window`](screencopy::ScreencopyBackend)
+    /// for the implementation. Not a screencopy path at all: niri renders
+    /// the window's own elements offscreen, so occlusion by other windows,
+    /// decorations and fractional scale are all handled on the compositor
+    /// side rather than by any crop math here.
     fn capture_window(&self, window: WindowRef, cursor: bool) -> Result<Frame, CaptureError>;
 }
 
@@ -579,29 +610,39 @@ pub fn take_screenshot(
     backend: &dyn CaptureBackend,
     options: &CaptureOptions,
 ) -> Result<Frame, CaptureError> {
-    // `--delay`/`delay` is a plain sleep for now. Stage 8 ("window capture
-    // + delayed capture") replaces this with a real countdown surface; the
-    // knob is honoured here rather than ignored because a silently-ignored
-    // `--delay 5` is precisely the "looks like success, isn't" failure
-    // CLAUDE.md's no-panic rule is aimed at. In the daemon this runs inside
-    // a `spawn_blocking` task (see `dbus.rs`), so it never stalls the event
-    // loop.
-    if options.delay > 0 {
-        std::thread::sleep(std::time::Duration::from_secs(u64::from(options.delay)));
-    }
-
     match options.kind {
+        // `freeze_focused_output` owns `--delay`/`delay` for this arm — see
+        // its own doc comment. It used to be honoured *again* here first
+        // (Stage 5/6/7's code), which meant every delayed `--fullscreen`
+        // slept twice: once in this function, once more inside
+        // `freeze_focused_output`. Stage 8 fixed it by giving delay exactly
+        // one owner per shot kind, this one included, rather than a
+        // blanket sleep at the top that some kinds needed and others
+        // (this one!) accidentally paid for twice.
         ShotKind::Fullscreen => {
-            let output = backend.focused_output()?;
-            backend.capture_output(&output.name, options.cursor)
+            let (frame, _output) = freeze_focused_output(backend, options)?;
+            Ok(frame)
         }
         ShotKind::Region => {
             let Some(geometry) = options.geometry else {
+                // Reachable only from `--no-daemon` as of Stage 7: the
+                // daemon intercepts an interactive `--region` *before* this
+                // function (`dbus::CaptureService::interactive_region`) and
+                // maps `modules::overlay` instead. A `--no-daemon` process
+                // has no iced event loop and maps no surfaces at all, by
+                // design — it is the scriptable path — so there is nothing
+                // for a later stage to "finish" here; the actionable answer
+                // is to name the two ways to get a region without an
+                // overlay. Checked *before* sleeping, unlike Stage 5-7's
+                // version of this function, which slept out the whole delay
+                // and then reported "can't do this" anyway.
                 return Err(CaptureError::Unsupported(
-                    "--region without --geometry needs the interactive selection overlay, \
-                     which lands in Stage 7 — pass --geometry WxH+X+Y for now",
+                    "--region without --geometry needs the daemon's selection overlay, and \
+                     --no-daemon maps no surfaces — drop --no-daemon, or pass \
+                     --geometry WxH+X+Y",
                 ));
             };
+            sleep_for_delay(options.delay);
             let region = LogicalRect {
                 x: geometry.x,
                 y: geometry.y,
@@ -612,10 +653,81 @@ pub fn take_screenshot(
             let output = output_for_region(&outputs, region).ok_or(CaptureError::EmptyRegion)?;
             backend.capture_region(&output.name, region, options.cursor)
         }
-        ShotKind::Window => Err(CaptureError::Unsupported(
-            "--window capture lands in Stage 8 (niri's own ScreenshotWindow action)",
-        )),
+        ShotKind::Window => {
+            // `--window-id` (scriptable, mirrors `--geometry`) skips the
+            // focused-window lookup entirely; otherwise CAPTURE-RESEARCH
+            // D3's no-picker default applies — see
+            // `CaptureBackend::focused_window`'s doc comment.
+            let window = match options.window_id {
+                Some(id) => WindowRef(id),
+                None => backend
+                    .focused_window()?
+                    .ok_or(CaptureError::NoFocusedWindow)?,
+            };
+            sleep_for_delay(options.delay);
+            backend.capture_window(window, options.cursor)
+        }
     }
+}
+
+/// The one place `--delay`/`delay`'s whole-second sleep happens outside
+/// [`freeze_focused_output`] (which owns it for [`ShotKind::Fullscreen`],
+/// and for the interactive-region freeze `dbus.rs` calls directly). A shot
+/// kind that doesn't go through `freeze_focused_output` still owes its
+/// caller the delay it asked for — this is what [`take_screenshot`]'s
+/// `Region`-with-`--geometry` and `Window` arms call instead of
+/// reimplementing the same three lines, and it is called *after* each arm's
+/// own validation (a nonsense `--geometry`, no focused window), so a request
+/// that was always going to fail doesn't first make the caller wait out the
+/// whole delay to find that out.
+fn sleep_for_delay(delay: u32) {
+    if delay > 0 {
+        std::thread::sleep(std::time::Duration::from_secs(u64::from(delay)));
+    }
+}
+
+/// Captures the **whole focused output**, and hands back the output it came
+/// from alongside the pixels.
+///
+/// This is the "freeze" half of Architecture's region flow (PLAN.md: "the
+/// daemon captures the target output **first** — frozen frame — no race with
+/// the overlay's own pixels, exact crop source — then maps the overlay").
+/// Screencopy composites layer-shell surfaces (CAPTURE-RESEARCH §1.5), so a
+/// capture taken *after* the overlay maps would contain the overlay; the
+/// only correct order is this one, and there is deliberately no second
+/// capture once the user confirms — [`crop_frozen_frame`] crops these very
+/// bytes.
+///
+/// [`take_screenshot`]'s own `Fullscreen` arm is the same call, which is why
+/// it lives here rather than in `dbus.rs`: a fullscreen shot and a region
+/// shot's freeze are literally the same operation, and keeping them one
+/// function is what stops the two from drifting (the `--delay` handling in
+/// particular).
+pub fn freeze_focused_output(
+    backend: &dyn CaptureBackend,
+    options: &CaptureOptions,
+) -> Result<(Frame, OutputInfo), CaptureError> {
+    sleep_for_delay(options.delay);
+    let output = backend.focused_output()?;
+    let frame = backend.capture_output(&output.name, options.cursor)?;
+    Ok((frame, output))
+}
+
+/// Crops a **desktop-logical** rectangle out of a frame already captured
+/// from `output` — the second half of the region flow, run after the overlay
+/// drops.
+///
+/// The conversion is [`logical_to_pixel_rect`]'s, unchanged: the interactive
+/// overlay and an explicit `--geometry` land in exactly the same place, with
+/// exactly the same rounding, because they go through exactly the same
+/// function.
+pub fn crop_frozen_frame(
+    frame: &Frame,
+    output: &OutputInfo,
+    region: LogicalRect,
+) -> Result<Frame, CaptureError> {
+    let rect = logical_to_pixel_rect(region, output).ok_or(CaptureError::EmptyRegion)?;
+    frame.crop(rect).ok_or(CaptureError::EmptyRegion)
 }
 
 #[cfg(test)]
@@ -964,6 +1076,10 @@ mod tests {
     /// test directly, and this is what makes that possible.
     struct FakeBackend {
         outputs: Vec<OutputInfo>,
+        /// What [`CaptureBackend::focused_window`] answers — `None` by
+        /// default (no window focused), settable per test via
+        /// [`FakeBackend::with_focused_window`].
+        focused_window: Option<WindowRef>,
         calls: std::cell::RefCell<Vec<String>>,
     }
 
@@ -971,8 +1087,14 @@ mod tests {
         fn single_output() -> Self {
             FakeBackend {
                 outputs: vec![output("eDP-1", 0, 0, 1706, 1066, 1.5, (2560, 1600))],
+                focused_window: None,
                 calls: std::cell::RefCell::new(Vec::new()),
             }
+        }
+
+        fn with_focused_window(mut self, window: WindowRef) -> Self {
+            self.focused_window = Some(window);
+            self
         }
 
         fn calls(&self) -> Vec<String> {
@@ -987,6 +1109,11 @@ mod tests {
 
         fn focused_output(&self) -> Result<OutputInfo, CaptureError> {
             self.outputs.first().cloned().ok_or(CaptureError::NoOutputs)
+        }
+
+        fn focused_window(&self) -> Result<Option<WindowRef>, CaptureError> {
+            self.calls.borrow_mut().push("focused_window()".to_string());
+            Ok(self.focused_window)
         }
 
         fn capture_output(&self, output: &str, cursor: bool) -> Result<Frame, CaptureError> {
@@ -1053,13 +1180,19 @@ mod tests {
         );
     }
 
+    /// As of Stage 7 this path is `--no-daemon`-only: the daemon intercepts
+    /// an interactive `--region` before [`take_screenshot`] and maps the
+    /// overlay. The error must therefore name the *two real ways out*, not a
+    /// future stage — there is no later stage that gives a surfaceless
+    /// process an overlay.
     #[test]
-    fn region_without_geometry_reports_the_stage_that_lands_it() {
+    fn region_without_geometry_names_both_ways_out() {
         let backend = FakeBackend::single_output();
         let options = options(|a| a.region = true);
-        let err = take_screenshot(&backend, &options).expect_err("no overlay yet");
+        let err = take_screenshot(&backend, &options).expect_err("no overlay without a daemon");
         assert!(
-            matches!(err, CaptureError::Unsupported(note) if note.contains("Stage 7")),
+            matches!(err, CaptureError::Unsupported(note)
+                if note.contains("--no-daemon") && note.contains("--geometry")),
             "got {err}"
         );
         assert!(
@@ -1068,14 +1201,103 @@ mod tests {
         );
     }
 
+    // -- the region flow's two halves --------------------------------------
+
     #[test]
-    fn window_capture_reports_the_stage_that_lands_it() {
+    fn freezing_captures_the_whole_focused_output_and_names_it() {
+        let backend = FakeBackend::single_output();
+        let options = options(|a| a.region = true);
+        let (frame, output) =
+            freeze_focused_output(&backend, &options).expect("the fake never fails");
+        assert_eq!((frame.width(), frame.height()), (8, 8));
+        assert_eq!(output.name, "eDP-1");
+        assert_eq!(
+            backend.calls(),
+            vec!["capture_output(eDP-1, cursor=true)".to_string()],
+            "the whole output, not a region"
+        );
+    }
+
+    #[test]
+    fn cropping_a_frozen_frame_matches_the_geometry_path_exactly() {
+        // A 12x12 frame standing in for a scale-1.5 output whose logical
+        // size is 8x8: a logical 2,2 4x4 selection is physical 3,3 6x6.
+        let frame = coordinate_frame(12, 12, 1.5);
+        let out = output("eDP-1", 0, 0, 8, 8, 1.5, (12, 12));
+        let cropped = crop_frozen_frame(
+            &frame,
+            &out,
+            LogicalRect {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 4,
+            },
+        )
+        .expect("inside the output");
+        assert_eq!((cropped.width(), cropped.height()), (6, 6));
+        assert_eq!(pixel_at(&cropped, 0, 0), [3, 3, 0, 0xff]);
+    }
+
+    #[test]
+    fn cropping_a_region_off_the_output_is_a_clean_error() {
+        let frame = coordinate_frame(12, 12, 1.5);
+        let out = output("eDP-1", 0, 0, 8, 8, 1.5, (12, 12));
+        let err = crop_frozen_frame(
+            &frame,
+            &out,
+            LogicalRect {
+                x: 900,
+                y: 900,
+                width: 4,
+                height: 4,
+            },
+        )
+        .expect_err("off-screen");
+        assert!(matches!(err, CaptureError::EmptyRegion), "got {err}");
+    }
+
+    // -- window capture (Stage 8) ------------------------------------------
+
+    #[test]
+    fn window_with_an_explicit_id_skips_the_focused_window_lookup() {
+        let backend = FakeBackend::single_output().with_focused_window(WindowRef(1));
+        let options = options(|a| {
+            a.window = true;
+            a.window_id = Some(42);
+        });
+        take_screenshot(&backend, &options).expect("the fake never fails");
+        assert_eq!(
+            backend.calls(),
+            vec!["capture_window(42)".to_string()],
+            "an explicit --window-id must never trigger a focused-window lookup"
+        );
+    }
+
+    #[test]
+    fn window_without_an_id_captures_the_focused_window() {
+        let backend = FakeBackend::single_output().with_focused_window(WindowRef(7));
+        let options = options(|a| a.window = true);
+        take_screenshot(&backend, &options).expect("the fake never fails");
+        assert_eq!(
+            backend.calls(),
+            vec![
+                "focused_window()".to_string(),
+                "capture_window(7)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn window_without_an_id_or_a_focused_window_is_a_clean_error() {
         let backend = FakeBackend::single_output();
         let options = options(|a| a.window = true);
-        let err = take_screenshot(&backend, &options).expect_err("Stage 8");
-        assert!(
-            matches!(err, CaptureError::Unsupported(note) if note.contains("Stage 8")),
-            "got {err}"
+        let err = take_screenshot(&backend, &options).expect_err("nothing is focused");
+        assert!(matches!(err, CaptureError::NoFocusedWindow), "got {err}");
+        assert_eq!(
+            backend.calls(),
+            vec!["focused_window()".to_string()],
+            "must not fall through to capturing anyway"
         );
     }
 

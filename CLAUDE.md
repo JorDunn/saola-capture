@@ -13,26 +13,53 @@ window, history library, annotation editor), and **CLI verbs** (`shot`,
 architecture, dependencies, or conventions updates this file in the same
 stage and says so in its handoff. A stale CLAUDE.md is a bug.
 
-> Status: Stages 1–6 landed (repo skeleton, dependency survey; every capture
+> Status: Stages 1–8 landed (repo skeleton, dependency survey; every capture
 > path proven with live evidence in `docs/CAPTURE-RESEARCH.md`; full CLI
 > parsing, `capture.toml` config, the `io.saola.Capture1` bus, a surfaceless
-> daemon boot; Stage 5's **real screenshot pipeline**; and — new in Stage 6 —
-> the **PrintScr MVP**: the daemon now maps real layer-shell surfaces).
-> `shot --fullscreen` and `shot --region --geometry WxH+X+Y` now genuinely
-> capture, encode, save, copy and print a path, **both ways**: through the
-> daemon's `Screenshot` D-Bus method (which also emits `CaptureTaken`) and
-> in-process via `--no-daemon`. Both go through the same two library calls,
-> `capture::take_screenshot` → `storage::save_capture`. As of Stage 6, the
-> daemon path additionally **flashes and toasts**: `src/modules/flash.rs` (a
-> full-output ivory fade, live-verified in nested niri) and
-> `src/modules/toast.rs` (the §6 notification card, stack of 3, click opens
-> the — still-stub — editor). Both are wired end to end and are this
-> repo's first surfaces to actually map pixels; see Conventions for two
-> binding gotchas Stage 6 found the hard way.
+> daemon boot; Stage 5's **real screenshot pipeline**; Stage 6's **PrintScr
+> MVP**; Stage 7's **region selection overlay**; and — new in Stage 8 —
+> **window capture and a visible delayed-capture countdown**).
+> `shot --fullscreen`, `shot --region [--geometry WxH+X+Y]` and (as of Stage
+> 8) `shot --window [--window-id ID]` all genuinely capture, encode, save,
+> copy and print a path. Fullscreen, `--geometry` region and `--window` all
+> work **both ways** — through the daemon's `Screenshot` D-Bus method (which
+> also emits `CaptureTaken`) and in-process via `--no-daemon` — over the same
+> two library calls, `capture::take_screenshot` → `storage::save_capture`. As
+> of Stage 6, the daemon path additionally **flashes and toasts**:
+> `src/modules/flash.rs` (a full-output ivory fade, live-verified in nested
+> niri) and `src/modules/toast.rs` (the §6 notification card, stack of 3,
+> click opens the — still-stub — editor); see Conventions for two binding
+> gotchas Stage 6 found the hard way.
+> **Stage 7's `src/modules/overlay.rs`** is the daemon-only interactive
+> region path: freeze the focused output, map an `Exclusive`-keyboard
+> layer-shell surface showing that frozen frame, let the user drag/move/
+> resize a rectangle (scrim + dashed terracotta edge + 8 handles + size
+> readout + floating toolbar), then crop **that same frozen frame** in memory
+> and hand it to the same `storage::save_capture` tail. Live-verified end to
+> end in nested niri with injected input. `--no-daemon --region` with no
+> `--geometry` stays an error by design: a surfaceless process has nowhere to
+> draw.
+> **Stage 8 makes `--window` real** two ways: a bare `shot --window` (or
+> `--window-id ID` for the scriptable path) captures via niri-ipc's
+> `Action::ScreenshotWindow` — no crop math, niri renders the window's own
+> elements offscreen — with no picker (niri exposes no pixel position for a
+> tiled window, so hover-highlight isn't implementable; CAPTURE-RESEARCH D3's
+> answer is "or by the focused window", which is what a missing
+> `--window-id` resolves to); and the region overlay's **Window toolbar
+> button is now wired** — it confirms the same focused-window resolution
+> instead of a dragged rectangle, without needing its own picker UI. **Stage
+> 8 also adds a visible countdown**: `src/modules/countdown.rs` maps a small
+> ink pill (tabular-numeral whole seconds, self-expiring) for the duration of
+> any `--delay N` on any of the three shot kinds — the sleep itself is
+> unchanged (still `capture::sleep_for_delay`, run inside the blocking
+> capture task), this is purely the visible half of a wait that used to be
+> silent. **A Stage 5–7 bug fixed in Stage 8**: a delayed `--fullscreen` used
+> to sleep for `2 × --delay` (once in `take_screenshot`'s old top-level
+> sleep, again inside `freeze_focused_output`); delay now has exactly one
+> owner per shot kind.
 > Still stubs, each answering with a clean error naming its stage:
 > `StartRecording`/`StopRecording` (Stages 10–11), `PickColor` (Stage 16),
-> `OpenWindow` and the `window` process (Stage 9), an interactive `--region`
-> with no `--geometry` (Stage 7's overlay) and `--window` (Stage 8).
+> `OpenWindow` and the `window` process (Stage 9).
 > PLAN.md is the staged build plan. Sections marked *(pending Stage N)* fill
 > in as later stages land.
 >
@@ -56,7 +83,12 @@ cargo fmt --check
 
 cargo run -- daemon                # the long-running daemon (surfaceless as of Stage 3)
 cargo run -- shot --fullscreen     # what the Print keybind invokes
+cargo run -- shot --region         # interactive: maps Stage 7's selection overlay, blocks
+                                   # until the user confirms; exits 1 on cancel
 cargo run -- shot --region --geometry 600x450+100+100  # scriptable, skips the overlay
+cargo run -- shot --window         # the focused window (no picker — CAPTURE-RESEARCH D3)
+cargo run -- shot --window --window-id 42  # scriptable: an explicit niri-ipc window id
+cargo run -- shot --fullscreen --delay 3   # any shot kind: countdown pill, then flash+toast
 cargo run -- shot --fullscreen --no-daemon --format=webp --output=/tmp  # headless/scriptable
 cargo run -- record start|stop|toggle [--preset hevc|av1|h264] [--audio mic|system|both]
 cargo run -- pick-color
@@ -79,16 +111,36 @@ name is unowned) — `busctl --user introspect io.saola.Capture1
 Stage 5 `Screenshot` is real; the other served methods still answer with a
 stub `Error` until their stage lands (`src/dbus.rs` names which).
 
+**`Screenshot` can block for minutes, on purpose** (Stage 7): an interactive
+`region` call does not return until the user confirms or cancels — the same
+contract `slurp` has. Nothing times it out (`zbus::Connection`'s
+`method_timeout` defaults to `None`) and nothing else on the bus is blocked
+meanwhile (zbus dispatches each call on its own task). A cancel is a D-Bus
+error (`the region selection was cancelled`), so `shot --region` exits **1**
+with nothing saved. A second `shot --region` while one is up is refused
+immediately (`a region selection is already in progress`) rather than
+stacking a second exclusive-keyboard surface.
+
 Live-testing anything that maps overlay surfaces or grabs the keyboard
 happens in a **nested niri** (see Conventions), never the real session.
-Booting the daemon itself is safe in the real session — as of Stage 6 the
-daemon does map real surfaces (the flash, permanently; the toast, while
-captures are recent), but neither grabs the keyboard
-(`KeyboardInteractivity::None` on both — see `main.rs`'s `flash_surface_settings`/
-`toast_surface_settings`), so this is still the one surface-mapping daemon
-behavior safe to boot in the real session. Stage 7's overlay is the first
-surface that *will* need `Exclusive` keyboard, and that's exactly the one
-that must never be live-tested outside nested niri.
+Booting the daemon itself is safe in the real session — the daemon maps real
+surfaces (the flash, permanently; the toast, while captures are recent) but
+neither grabs the keyboard (`KeyboardInteractivity::None` on both — see
+`main.rs`'s `flash_surface_settings`/`toast_surface_settings`). **Stage 7's
+region overlay is the exception and the one thing that must never be
+exercised outside a nested niri**: `overlay_surface_settings` asks for
+`KeyboardInteractivity::Exclusive`, so a bug that leaves it mapped takes the
+keyboard with it. Booting the daemon is still safe; running
+`shot --region` against the real session is not, until Jordan is driving it
+himself. **Stage 8's countdown pill joins the flash/toast side of that
+line, not the overlay's**: `countdown_surface_settings` asks for
+`KeyboardInteractivity::None` and `events_transparent: true`, exactly like
+the flash, so `shot --fullscreen --delay N` (or `--region`/`--window` with a
+delay) is safe to trigger in the real session — live-verified for the
+capture half via `--no-daemon --window` (real niri, read-only, no synthetic
+input; see the Stage 8 handoff for what that run caught and fixed). A
+`--window` shot — with or without `--window-id`, through the daemon or
+`--no-daemon` — never maps a surface at all and is equally safe.
 
 ## Architecture
 
@@ -109,7 +161,39 @@ PLAN.md's Architecture section is binding; read it first. Summary:
     presets) is the only v0.1 implementation; the trait is what lets
     in-process encoders replace it later.
 - **Region capture freezes first**: capture the output, then map the overlay
-  over the frozen frame; crop in memory. No self-capture race.
+  over the frozen frame; crop in memory. No self-capture race. **Real as of
+  Stage 7**, and the sequence is fixed at exactly three hops:
+  `capture::freeze_focused_output` (blocking, in the D-Bus method's
+  `spawn_blocking`) → `dbus::DaemonEvent::BeginRegion` carries an
+  `image::Handle` **copy** of the pixels to the iced daemon, which maps
+  `modules::overlay` → the confirmed `LogicalRect` comes back down a
+  capacity-1 `mpsc` reply channel and `capture::crop_frozen_frame` crops the
+  **original `Frame`**, which never left the D-Bus task. There is no second
+  screencopy anywhere in that chain, and there must never be: the overlay is
+  mapped by then, and screencopy composites layer-shell surfaces.
+- **Four surface lifecycles now exist, and a new surface picks one
+  deliberately** (`main.rs`'s `SurfaceRole`): *permanent* (the flash —
+  spawned at boot, never unmapped, toggles opacity; the only shape that
+  survives a ~140 ms visible lifetime, see the latency gotcha below),
+  *respawn-to-resize* (the toast — unmap and respawn whenever its content
+  changes its height, so its input region always matches what is drawn),
+  *reactive-with-Exclusive-keyboard* (the overlay — spawned on demand, torn
+  down the moment the user acts), and — new in Stage 8 —
+  *reactive-without-keyboard* (the countdown pill: spawned on the first
+  delayed shot, torn down the instant its own clock reaches zero). Reactive
+  is forced for the overlay: `Exclusive` keyboard cannot be pre-warmed at
+  boot without holding the keyboard forever. Measured live, Stage 7:
+  ~450–560 ms from `shot --region` starting to the overlay's first
+  composited frame, nearly all of it process start plus the ~0.3 s freeze —
+  survivable precisely because the overlay stays up until the user acts. The
+  countdown is reactive too, but for a different reason than the overlay:
+  it has real content that changes over its own lifetime (the number), so
+  there is no idle state worth pre-warming at boot the way the flash's
+  opacity-only content allows — and unlike the overlay it carries none of
+  the keyboard risk, so (per the same latency reasoning) a `--delay 1`
+  countdown is the shortest-lived reactive surface in the daemon and the
+  first one worth measuring if a very short delay ever looks like it flashed
+  too briefly.
 - **Recording state lives in the daemon** and survives window closes; the
   PipeWire thread never blocks on the encoder (bounded channel, drop + log).
 - **Two iced_layershell surface gotchas, found live in Stage 6 and binding on
@@ -160,7 +244,17 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   - **Window screenshots go through niri-ipc `ScreenshotWindow`**, not a
     geometry crop: niri exposes no pixel position for tiled windows, so the
     crop rectangle is not computable. It also clobbers the clipboard
-    unconditionally, so `storage.rs` owns the final clipboard state.
+    unconditionally, so `storage.rs` owns the final clipboard state — real
+    as of Stage 8 (`capture/screencopy.rs::ScreencopyBackend::
+    capture_window`, `storage.rs`'s `else if kind == ShotKind::Window`
+    branch). **Live-caught gotcha**: the IPC reply from `Action::
+    ScreenshotWindow` lands before the PNG is necessarily written — a
+    straight `fs::read` right after the reply intermittently raced an
+    `ENOENT` against a file that appeared a few milliseconds later (caught
+    against Jordan's real session; the file, once found, was complete and
+    byte-valid — this was a read-too-early race, not a corrupt write).
+    `read_window_screenshot_with_retry` retries only `ErrorKind::NotFound`,
+    bounded at 500 ms.
   - **ffmpeg needs `-use_wallclock_as_timestamps 1 -fps_mode vfr`** on the
     rawvideo input (casts are variable-rate; without it the video plays
     fast), GPU colour conversion with the matrix pinned
@@ -169,7 +263,12 @@ PLAN.md's Architecture section is binding; read it first. Summary:
     inputs).
   - **`iced_layershell` is confirmed viable for the overlay** (Exclusive
     keyboard, Escape, pixel-exact drag, frozen-frame background — all
-    live-tested in nested niri). Multi-output is source-verified only.
+    live-tested in nested niri). Multi-output is source-verified only, and
+    **Stage 7 shipped single-output on purpose** (D10 allows it): the overlay
+    maps on the focused output only, so a selection cannot cross outputs.
+    `overlay_surface_settings` already takes an output name, so the
+    multi-output version is a loop plus a shared coordinate space, not a
+    rewrite.
   - **A screencopy buffer is the output's *framebuffer*, not what the user
     sees** — new in Stage 5, extending §1.2 (which covered only the unrelated
     `y_invert` flag, still always 0 on niri). On an output whose
@@ -228,6 +327,19 @@ PLAN.md's Architecture section is binding; read it first. Summary:
     life-rule-thickness field for its 3 px terracotta rule —
     `modules::toast::ICON_TILE_SIZE`/`LIFE_RULE_HEIGHT` are the spec's
     literal values, named and documented at their one definition site.
+- **saola-theme v0.5.0 gaps found in Stage 7** (same posture, still no tag
+  bump). `scrim.capture`, `radii.selection`, `palette.accent`,
+  `container::popover`, `container::bar_pill` and `button::rest` all existed
+  and are used verbatim; `sizes.window_border` (2 px) is reused as the
+  selection edge's stroke width, on the grounds that it is the system's one
+  *thin decorative line* thickness. Three genuine design-token gaps, all in
+  `modules::overlay`: no handle size (`HANDLE_RADIUS`), no dash pattern for
+  the one dashed edge in the whole style guide (`DASH_SEGMENTS`), no width
+  for a small numeric readout pill (`READOUT_WIDTH`).
+  **Deliberately *not* filed as gaps**: `HANDLE_HIT_RADIUS`,
+  `EDGE_SNAP_DISTANCE` and `MIN_SELECTION` describe pointer *behaviour*, not
+  appearance — a design system has no opinion on how close to an edge a drag
+  should snap, and upstreaming them would miscategorise interaction as style.
 
 ## Conventions
 
@@ -257,9 +369,11 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   bindgen, so it needs **libclang at build time** — Jordan installed clang
   22.1.8 (2026-08-08), so the local build is unblocked; it remains a
   `makedepends`/CI build-dep entry in Stage 17.)*
-  Stage 8 will also need `wayland-protocols`' **`staging`** feature if it ever
-  touches `ext_foreign_toplevel_list_v1` — but per CAPTURE-RESEARCH §5.2 it
-  should not: `niri msg windows` returns a superset in one call.
+  Stage 8 confirmed CAPTURE-RESEARCH §5.2's prediction: window capture
+  (`capture/screencopy.rs`'s `capture_window`/`focused_window`) is entirely
+  `niri_ipc::Request::Windows`/`FocusedWindow`/`Action::ScreenshotWindow` —
+  zero new dependencies, and `wayland-protocols`' `staging` feature (which
+  `ext_foreign_toplevel_list_v1` would have needed) was never added.
   - **WebP**: `image` 0.25's `WebPEncoder` is lossless-only (verified in its
     source); no pure-Rust lossy encoder exists on crates.io. Picked `webp =
     "0.3"` (wraps `libwebp-sys`, resolves to 0.9.6 — vendors and compiles
@@ -378,9 +492,34 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   `iced::widget::image::Handle` derives `Clone`/`PartialEq`/`Eq` but **not**
   `Debug` (checked directly in `iced_core-0.14.0/src/image.rs`) — wrap it in
   a local newtype with a hand-written `Debug` before putting it in any type
-  that needs to derive `Debug` (`main.rs`'s `Thumbnail` is the example; the
-  same problem will recur the moment a `Frame`/pixel buffer needs to ride in
-  a `Message`).
+  that needs to derive `Debug` (`main.rs`'s `Thumbnail` and
+  `modules::overlay::FrozenFrame` are the two examples).
+- **More mechanical iced 0.14.2 gotchas, found in Stage 7:**
+  - **`iced::event::listen_with` takes a `fn` pointer, not a closure**, so
+    it cannot capture any state to filter on. It *does* hand the
+    `window::Id` and the `event::Status` to that function, so the pattern is
+    "put the Id in the message, filter in `update`" — `main.rs`'s
+    `overlay_event_subscription` / `Message::OverlayEvent`.
+  - **`event::Status::Captured` is the only thing separating "clicked a
+    widget" from "clicked the surface underneath it"** when raw events and a
+    widget tree share one surface. Consult it for *presses*; forward
+    releases and motion regardless (`modules::overlay::message_from_event`
+    documents why).
+  - **A `button` with no `on_press` does not capture its press.** A disabled
+    button therefore lets the click fall through to whatever is listening
+    underneath — which for the overlay meant "miss Cancel by three pixels,
+    start a drag". Wrap chrome that must swallow input in
+    `mouse_area(..).on_press(some_noop_message)`, which *does* capture (and
+    which iced correctly skips when a child button already captured).
+  - **Anything a `Message` derives, `#[to_layer_message]` enforces** — so a
+    reply channel riding in a message must be `Clone`. `futures::channel::
+    oneshot::Sender` is not; a capacity-1 `mpsc::Sender` is, and is a
+    oneshot in every way that matters.
+  - `keyboard::Event::KeyPressed` has a **`repeat: bool`** field in this
+    version — building one in a test needs it.
+  - The dashed selection edge is `canvas::Path::rounded_rectangle` +
+    `canvas::Stroke { line_dash: LineDash { segments, offset }, .. }`; both
+    exist and work. There is no widget-level dashed border.
 - **Testing**: pure logic (selection geometry, recorder state machine,
   config, undo/redo, swizzle/crop, blur kernels) unit-tested directly;
   buses/compositors behind traits with fakes. **Never `std::env::set_var`
@@ -412,11 +551,62 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   invisible to `cargo test` and found only by mapping real surfaces in
   nested niri. Two additions to the recipe: `niri msg layers` (not
   `windows`, not `outputs`) lists layer-shell surfaces by namespace/output;
-  `magick -format "%[pixel:p{X,Y}]" info: file.png` (ImageMagick, already
+  `magick file.png -format "%[pixel:p{X,Y}]" info:` (ImageMagick, already
   installed) samples one pixel's color from a `grim` capture without opening
   it, cheap enough to script into a tight loop for a "did this render in
   time" check the way a single screenshot at an arbitrary offset can't
-  answer reliably.
+  answer reliably. (**Argument order corrected in Stage 7** — the Stage 6
+  handoff's `magick -format … info: file.png` form fails with "no decode
+  delegate"; the file must come first.) **Stage 7 earned the rule a third
+  time** and adds four more pieces to the recipe, all of which cost real
+  time to rediscover:
+  - **Give the nested session its own D-Bus bus.** `dbus-daemon --session
+    --print-address --fork`, then export `DBUS_SESSION_BUS_ADDRESS` for the
+    nested daemon *and* every CLI verb aimed at it. Without this the test
+    daemon fights Jordan's real one for `io.saola.Capture1`, and a real
+    `Print` press in his session gets answered by a daemon rendering onto a
+    nested display.
+  - **The daemon's environment decides where captures land, not the CLI's.**
+    The save happens daemon-side, so `XDG_DATA_HOME`/`save-dir` must be
+    overridden on the *daemon* process; overriding them on `shot` does
+    nothing and quietly appends test rows to `~/.local/share/saola/capture/
+    history.jsonl`. (`--output` is the exception — it travels over the bus.)
+  - **Scripted input**: the Stage 2 `inject` probe generalises well. Stage 7
+    used a `move / press / drag / release / key / sleep` command-script
+    variant of it (built from `docs/research/2026-08-08-stage2/inject.rs`),
+    which is what made a full drag → resize → move → confirm round trip
+    reproducible instead of eyeballed.
+  - **Locating widgets to click**: dump one scanline of a `grim` capture
+    (`magick shot.png -crop WIDTHx1+0+Y +repage txt:`) and find the runs of
+    ivory — that gives exact button centres to aim the injected pointer at,
+    without guessing from a layout calculation.
+  **Stage 8: a real incident, not a near-miss — read this before injecting
+  anything.** A Stage 8 live-test script built the exact nested-niri setup
+  above correctly (private D-Bus bus, nested `NIRI_SOCKET`, isolated
+  `XDG_DATA_HOME`) but the line invoking the injector itself was missing its
+  own `WAYLAND_DISPLAY=$NESTED_WAYLAND` prefix — every *other* command in
+  the script had it, this one didn't, and nothing caught the omission before
+  it ran. The injector fell back to whatever `WAYLAND_DISPLAY` the shell
+  already had, which was **Jordan's real session**, and
+  `zwlr_virtual_pointer_manager_v1` turned out to be reachable there too
+  (contra the Stage 2 probe's note that it wasn't, on that machine, in that
+  setup — evidently that has changed, or the setup differs enough not to
+  rely on it). The result: one real, synthetic left-click landed on Jordan's
+  actual screen (move → press → release, no keys) before anyone noticed and
+  killed everything. No keyboard input was sent, and the nested processes
+  themselves were fully torn down (verified via `ps aux` — no leaked niri
+  process, daemon, `dbus-daemon`, or client left running), but a stray click
+  reached the real desktop, which is exactly what this whole rule exists to
+  prevent. **The fix isn't "be more careful" — it's structural**: never rely
+  on remembering to prefix every single injected-input command by hand.
+  Export `WAYLAND_DISPLAY`/`NIRI_SOCKET` once, for the *whole test script's*
+  environment (`export`, not a per-line prefix), so there is exactly one
+  place to get it right instead of N, and — belt and braces — have the
+  injector itself refuse to run unless `WAYLAND_DISPLAY` is explicitly
+  passed as an argument rather than inherited from the environment at all,
+  so a forgotten prefix is a hard error, not a silent fallback to whatever
+  display happened to be ambient. Whoever runs live input-injection tests
+  next should build that guard into the tool before using it, not after.
 - **Conventional Commits** (release-plz derives bumps); `chore:`/`ci:`/
   `docs:`/`test:` are changelog-invisible. Never hand-edit versions or
   `CHANGELOG.md`.

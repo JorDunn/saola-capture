@@ -258,6 +258,25 @@ fn save_capture_indexing_to(
                 path.display()
             );
         }
+    } else if kind == ShotKind::Window {
+        // Stage 8, CAPTURE-RESEARCH D3: `Action::ScreenshotWindow` (what
+        // `capture::screencopy::ScreencopyBackend::capture_window` calls)
+        // sets an `image/png` clipboard selection **unconditionally**,
+        // before this function ever runs — there is no niri flag to ask it
+        // not to. "storage.rs owns the final clipboard state" (CLAUDE.md
+        // Boundaries) means a `--no-copy` window shot must not silently
+        // leave niri's own copy sitting in the clipboard just because the
+        // user said not to touch it. The `options.copy` branch above
+        // already handles the opposite case for free: it overwrites
+        // whatever niri put there with the *final* encoded image, so a
+        // `copy = true` window shot needs no extra code here at all.
+        if let Err(err) = clear_clipboard() {
+            eprintln!(
+                "saola-capture: saved {} but could not clear the clipboard niri's window \
+                 screenshot left behind: {err}",
+                path.display()
+            );
+        }
     }
 
     let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
@@ -538,6 +557,19 @@ pub fn copy_to_clipboard(png: &[u8], owner: ClipboardOwner) -> Result<(), io::Er
     }
 }
 
+/// Clears the Wayland selection outright — the `--no-copy` mitigation for
+/// [`save_capture_indexing_to`]'s window-capture branch (see its doc
+/// comment). `Seat::All`/`ClipboardType::Regular` matches every other
+/// clipboard call in this module: one regular selection, every seat, no
+/// primary-selection support (nothing here ever wrote to the primary
+/// selection in the first place, so there's nothing of ours to clear
+/// there).
+fn clear_clipboard() -> Result<(), io::Error> {
+    use wl_clipboard_rs::copy::{clear, ClipboardType, Seat};
+
+    clear(ClipboardType::Regular, Seat::All).map_err(io::Error::other)
+}
+
 /// `wl-clipboard-rs`'s default mode: it spawns a thread that owns the
 /// selection and answers paste requests until something else takes over.
 /// Correct only in a process that outlives the copy — the daemon.
@@ -781,6 +813,7 @@ mod tests {
         CaptureOptions {
             kind: ShotKind::Fullscreen,
             geometry: None,
+            window_id: None,
             format,
             webp_quality: 90,
             png_also,
@@ -879,6 +912,39 @@ mod tests {
 
         let contents = fs::read_to_string(&index).expect("the index was created");
         assert_eq!(contents.lines().count(), 1, "one capture, one line");
+    }
+
+    /// Stage 8, CAPTURE-RESEARCH D3: a `--no-copy` window capture must still
+    /// save the file even when the clipboard-clear mitigation itself can't
+    /// reach a compositor (this test process has none) — the same "best
+    /// effort, the file already exists" posture the ordinary copy-failure
+    /// path already has. This is a save-still-succeeds test, not a
+    /// clipboard-content test: nothing in this crate can assert on the
+    /// *state* of a real Wayland selection from a unit test, only that a
+    /// failure to touch it never turns into a failed capture.
+    #[test]
+    fn a_no_copy_window_capture_still_saves_even_if_clearing_the_clipboard_fails() {
+        let dir = TempDir::new("window-no-copy");
+        let data = TempDir::new("window-no-copy-data");
+        let index = data.path().join("saola/capture/history.jsonl");
+
+        // `options()` already sets `copy: false` — see its own doc comment.
+        let opts = options(dir.path(), ImageFormat::Png, false);
+        let saved = save_capture_indexing_to(
+            &frame(8, 8),
+            &opts,
+            ShotKind::Window,
+            ClipboardOwner::DetachedHelper,
+            Some(&index),
+        )
+        .expect("the capture does not depend on being able to clear the clipboard");
+
+        assert!(saved.path.is_file(), "{} missing", saved.path.display());
+
+        let contents = fs::read_to_string(&index).expect("the index was created");
+        let parsed: serde_json::Value =
+            serde_json::from_str(contents.lines().next().expect("one line")).expect("valid JSON");
+        assert_eq!(parsed["kind"], "window");
     }
 
     /// No data directory at all (a container with neither `$XDG_DATA_HOME`

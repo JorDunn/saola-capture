@@ -146,14 +146,23 @@ pub struct ShotArgs {
     #[arg(long)]
     pub region: bool,
     /// Capture a single window via niri's own `ScreenshotWindow` action
-    /// (CAPTURE-RESEARCH D3) — picked from a list, not by hovering (niri
-    /// exposes no pixel position for tiled windows).
+    /// (CAPTURE-RESEARCH D3). Captures the currently focused window unless
+    /// `--window-id` names a different one — niri exposes no pixel position
+    /// for tiled windows, so a hover-to-highlight picker isn't
+    /// implementable; the region overlay's Window button offers the same
+    /// focused-window shortcut interactively.
     #[arg(long)]
     pub window: bool,
     /// Skip the overlay and capture exactly this rectangle. Logical
     /// coordinates, matching slurp/grim's convention. Requires `--region`.
     #[arg(long, value_name = "WxH+X+Y", requires = "region")]
     pub geometry: Option<String>,
+    /// Capture exactly this window id (from `niri msg windows`, or the
+    /// region overlay's own Window button) instead of resolving the
+    /// currently focused one. Requires `--window`. The scriptable
+    /// `--window` counterpart to `--geometry` — CAPTURE-RESEARCH D3.
+    #[arg(long, value_name = "ID", requires = "window")]
+    pub window_id: Option<u64>,
 
     /// `webp` or `png`. Defaults to `capture.toml`'s `image-format`.
     #[arg(long, value_name = "webp|png")]
@@ -311,7 +320,9 @@ impl Geometry {
 /// Which target flags were actually given, folded into the one kind the
 /// rest of the pipeline cares about. Pulled out of [`CaptureOptions::resolve`]
 /// so the mutual-exclusivity logic is unit-testable on its own.
-fn resolve_shot_kind(args: &ShotArgs) -> Result<(ShotKind, Option<Geometry>), CliError> {
+fn resolve_shot_kind(
+    args: &ShotArgs,
+) -> Result<(ShotKind, Option<Geometry>, Option<u64>), CliError> {
     let chosen = [args.fullscreen, args.region, args.window]
         .iter()
         .filter(|&&set| set)
@@ -322,12 +333,16 @@ fn resolve_shot_kind(args: &ShotArgs) -> Result<(ShotKind, Option<Geometry>), Cl
         ));
     }
 
-    // `requires = "region"` on the clap side already rejects
-    // `--geometry` without `--region` when parsed from real argv — this
-    // second check is what makes the rule enforced (and testable) for a
-    // `ShotArgs` built directly in a test, which bypasses clap entirely.
+    // `requires = "region"`/`requires = "window"` on the clap side already
+    // reject `--geometry`/`--window-id` without their target flag when
+    // parsed from real argv — these checks are what make the rule enforced
+    // (and testable) for a `ShotArgs` built directly in a test, which
+    // bypasses clap entirely.
     if args.geometry.is_some() && !args.region {
         return Err(CliError("--geometry requires --region".to_string()));
+    }
+    if args.window_id.is_some() && !args.window {
+        return Err(CliError("--window-id requires --window".to_string()));
     }
 
     let geometry = args.geometry.as_deref().map(Geometry::parse).transpose()?;
@@ -345,7 +360,7 @@ fn resolve_shot_kind(args: &ShotArgs) -> Result<(ShotKind, Option<Geometry>), Cl
         ShotKind::Fullscreen
     };
 
-    Ok((kind, geometry))
+    Ok((kind, geometry, args.window_id))
 }
 
 /// A resolved `--cursor`/`--no-cursor`-shaped pair against a config
@@ -371,6 +386,12 @@ fn resolve_bool_override(set_true: bool, set_false: bool, default: bool) -> bool
 pub struct CaptureOptions {
     pub kind: ShotKind,
     pub geometry: Option<Geometry>,
+    /// `--window-id`, only meaningful when `kind == ShotKind::Window`. `None`
+    /// means "resolve the focused window at capture time" (CAPTURE-RESEARCH
+    /// D3's no-picker default) — the [`Geometry`]-shaped counterpart to
+    /// `geometry` above, same "skip the interactive step" role for `--window`
+    /// that `--geometry` plays for `--region`.
+    pub window_id: Option<u64>,
     pub format: ImageFormat,
     /// libwebp's lossy quality, `1..=100`. Config-only (no CLI flag) —
     /// see `config::CaptureConfig::webp_quality`.
@@ -394,7 +415,7 @@ impl CaptureOptions {
     /// one falls through to the config value (which is already a concrete
     /// default by the time it reaches here — see `config.rs`).
     pub fn resolve(config: &CaptureConfig, args: &ShotArgs) -> Result<Self, CliError> {
-        let (kind, geometry) = resolve_shot_kind(args)?;
+        let (kind, geometry, window_id) = resolve_shot_kind(args)?;
 
         let format = match &args.format {
             Some(raw) => ImageFormat::parse(raw).ok_or_else(|| {
@@ -414,6 +435,7 @@ impl CaptureOptions {
         Ok(CaptureOptions {
             kind,
             geometry,
+            window_id,
             format,
             webp_quality: config.webp_quality,
             png_also: config.png_also,
@@ -462,6 +484,9 @@ impl CaptureOptions {
                     geometry.width, geometry.height, geometry.x, geometry.y
                 ))),
             );
+        }
+        if let Some(window_id) = self.window_id {
+            options.insert("window-id".to_string(), OwnedValue::from(window_id));
         }
         options
     }
@@ -512,10 +537,12 @@ impl CaptureOptions {
         // means a `--region` falls through to the same clean "needs the
         // overlay" error an omitted geometry would give, not a wrong crop.
         let geometry = option_str(options, "geometry").and_then(|raw| Geometry::parse(&raw).ok());
+        let window_id = option_u64(options, "window-id");
 
         Ok(CaptureOptions {
             kind,
             geometry,
+            window_id,
             format,
             webp_quality: option_u32(options, "webp-quality")
                 .and_then(|value| u8::try_from(value).ok())
@@ -548,6 +575,10 @@ fn option_bool(options: &HashMap<String, OwnedValue>, key: &str) -> Option<bool>
 
 fn option_u32(options: &HashMap<String, OwnedValue>, key: &str) -> Option<u32> {
     u32::try_from(options.get(key)?.clone()).ok()
+}
+
+fn option_u64(options: &HashMap<String, OwnedValue>, key: &str) -> Option<u64> {
+    u64::try_from(options.get(key)?.clone()).ok()
 }
 
 /// `zvariant::Str<'static>` from an owned `String`, the shape
@@ -677,22 +708,23 @@ mod tests {
 
     #[test]
     fn no_target_flag_defaults_to_fullscreen() {
-        let (kind, geometry) = resolve_shot_kind(&ShotArgs::default()).unwrap();
+        let (kind, geometry, window_id) = resolve_shot_kind(&ShotArgs::default()).unwrap();
         assert_eq!(kind, ShotKind::Fullscreen);
         assert_eq!(geometry, None);
+        assert_eq!(window_id, None);
     }
 
     #[test]
     fn explicit_fullscreen() {
         let args = shot(|a| a.fullscreen = true);
-        let (kind, _) = resolve_shot_kind(&args).unwrap();
+        let (kind, ..) = resolve_shot_kind(&args).unwrap();
         assert_eq!(kind, ShotKind::Fullscreen);
     }
 
     #[test]
     fn region_without_geometry_is_interactive() {
         let args = shot(|a| a.region = true);
-        let (kind, geometry) = resolve_shot_kind(&args).unwrap();
+        let (kind, geometry, _) = resolve_shot_kind(&args).unwrap();
         assert_eq!(kind, ShotKind::Region);
         assert_eq!(geometry, None);
     }
@@ -703,7 +735,7 @@ mod tests {
             a.region = true;
             a.geometry = Some("600x450+100+100".to_string());
         });
-        let (kind, geometry) = resolve_shot_kind(&args).unwrap();
+        let (kind, geometry, _) = resolve_shot_kind(&args).unwrap();
         assert_eq!(kind, ShotKind::Region);
         assert_eq!(
             geometry,
@@ -719,8 +751,20 @@ mod tests {
     #[test]
     fn window_kind() {
         let args = shot(|a| a.window = true);
-        let (kind, _) = resolve_shot_kind(&args).unwrap();
+        let (kind, _, window_id) = resolve_shot_kind(&args).unwrap();
         assert_eq!(kind, ShotKind::Window);
+        assert_eq!(window_id, None, "no --window-id given");
+    }
+
+    #[test]
+    fn window_with_explicit_id_skips_the_picker() {
+        let args = shot(|a| {
+            a.window = true;
+            a.window_id = Some(42);
+        });
+        let (kind, _, window_id) = resolve_shot_kind(&args).unwrap();
+        assert_eq!(kind, ShotKind::Window);
+        assert_eq!(window_id, Some(42));
     }
 
     #[test]
@@ -738,6 +782,14 @@ mod tests {
         // `requires = "region"` enforcement) — the pure resolver must
         // still catch it.
         let args = shot(|a| a.geometry = Some("100x100+0+0".to_string()));
+        assert!(resolve_shot_kind(&args).is_err());
+    }
+
+    #[test]
+    fn window_id_without_window_is_an_error() {
+        // Same shape as `geometry_without_region_is_an_error`, bypassing
+        // clap's own `requires = "window"` enforcement.
+        let args = shot(|a| a.window_id = Some(7));
         assert!(resolve_shot_kind(&args).is_err());
     }
 
