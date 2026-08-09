@@ -238,6 +238,13 @@ PLAN.md's Architecture section is binding; read it first. Summary:
 - **Teaching notes**: Jordan is newer to Rust — comment the non-obvious
   (async ownership, the pipewire thread bridge, SPA pods, zbus macros) as
   teaching notes; prefer explicit code over clever abstraction.
+- **Dev builds optimize dependencies** (`[profile.dev.package."*"]
+  opt-level = 3` in `Cargo.toml` — do not remove): the keybinds run the
+  debug binary, and at opt-level 0 the per-screenshot encoders (vendored C
+  libwebp via `cc`, `image`'s PNG/deflate stack) cost ~4.8 s per shot —
+  measured 2026-08-08 as the entire cause of a "4-second screenshot" bug.
+  With the override the same shot is sub-second; `saola-capture`'s own code
+  stays unoptimized and debuggable. Full essay in `Cargo.toml`.
 - **Dependency surveys**: every non-trivial dependency carries a dated
   `Cargo.toml` comment essay — alternatives considered and why they lost.
   Heavyweight deps and build-time C toolchains need strong justification.

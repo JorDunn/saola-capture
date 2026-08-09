@@ -284,3 +284,31 @@ tokio = { version = "1", default-features = false, features = [
     "signal",
     "time",
 ] }
+
+# Teaching note, 2026-08-08 (found while debugging a "4-second screenshot"):
+# why dependencies are optimized even in dev builds.
+#
+# The default dev profile compiles *everything* at opt-level 0 — including
+# the image encoders on the hot per-screenshot path. Measured on a debug
+# build, one 2560x1600 fullscreen `shot` spent 0.29 s capturing (the
+# compositor blit — irreducible) and then **4.8 s encoding**: 2.8 s in
+# libwebp (the `webp` crate vendors libwebp's C sources and compiles them
+# via `cc`, which inherits cargo's `OPT_LEVEL=0`, so even the C code was
+# unoptimized) and 2.0 s in the clipboard's PNG encode (`image` →
+# `png`/`fdeflate`/`miniz_oxide`, pure Rust, same problem). Jordan's Print
+# keybind runs the debug binary, so every keypress paid all of it.
+#
+# The override below applies opt-level 3 to **dependencies only** — cargo's
+# `package."*"` selector deliberately excludes workspace members, so
+# saola-capture's own code stays at opt-level 0 with full debuginfo and
+# fast incremental rebuilds. Dependencies rarely change, so their optimized
+# build is paid once per `cargo update`/toolchain bump, not per edit. (For
+# `libwebp-sys` this also fixes the C half: cargo hands the build script
+# `OPT_LEVEL=3`, and the `cc` crate forwards it as `-O3`.) `--release`
+# builds are unaffected — they were always optimized.
+#
+# Same-day measurement of the same fullscreen shot after the change:
+# WebP encode 2.8 s → ~0.37 s, clipboard PNG encode 2.0 s → ~0.23 s,
+# whole `shot --fullscreen` round trip ~5.1 s → under 1 s.
+[profile.dev.package."*"]
+opt-level = 3
