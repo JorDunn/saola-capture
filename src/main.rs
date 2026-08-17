@@ -50,6 +50,7 @@
 //! comment for why that's still "one runtime" and not a violation of the
 //! rule.
 
+mod audio;
 mod capture;
 mod cli;
 mod config;
@@ -346,14 +347,22 @@ fn run_record(config_dir: Option<&Path>, args: cli::RecordArgs) -> Result<String
             return Ok(proxy.stop_recording().await?);
         }
 
-        // "fullscreen" is the only kind the CLI can express — `--region`/
-        // `--window` recording targets are Stage 12 (CAPTURE-RESEARCH D8).
+        // **Stage 12.** `--region`/`--window` recording targets are real —
+        // `options.kind` carries which one the CLI resolved
+        // (`cli::resolve_record_kind`), the same way `shot`'s own
+        // `options.kind.as_str()` call already does for `Screenshot`.
         proxy
-            .start_recording("fullscreen", options.to_dbus_options())
+            .start_recording(options.kind.as_str(), options.to_dbus_options())
             .await?;
+        // **Stage 13.** The audio the recording *asked for*, not the audio it
+        // got: `StartRecording` returns nothing, and a device that wasn't
+        // there degrades daemon-side to video-only with a warning toast (see
+        // `dbus::CaptureService::resolve_audio`, which documents why that
+        // cannot be reported back through this call).
         Ok(format!(
-            "recording started (preset={}) — stop it with `saola-capture record stop`",
-            options.preset
+            "recording started (preset={}, audio={}) — stop it with `saola-capture record stop`",
+            options.preset,
+            options.audio.map(|audio| audio.as_str()).unwrap_or("none"),
         ))
     })
 }
@@ -399,6 +408,17 @@ fn run_record_dry_run(
          logged for completeness only; a dry run never starts an encoder)",
         options.preset
     );
+    // **Stage 13.** Same "logged, not honoured" note for audio, and worth
+    // saying out loud rather than silently ignoring: a dry run has no encoder,
+    // so it has nowhere to put an audio track — `--audio` is resolved by the
+    // *daemon* (`dbus::CaptureService::resolve_audio`), which a dry run never
+    // contacts.
+    if let Some(audio) = options.audio {
+        eprintln!(
+            "saola-capture: dry run: --audio {audio} is ignored — a dry run negotiates video only \
+             and writes nothing"
+        );
+    }
 
     let report = run_async(async move {
         capture::screencast::dry_run(target, cursor, DRY_RUN_DURATION)
@@ -813,13 +833,29 @@ impl Daemon {
             Message::Toast(inner) => {
                 let now = Instant::now();
                 let action = self.toasts.update(inner, now, &self.theme);
-                if let modules::toast::Action::Open(path) = action {
-                    if let Err(err) = spawn_editor(&path) {
-                        eprintln!(
-                            "saola-capture: daemon: could not open the editor for {}: {err}",
-                            path.display()
-                        );
+                match action {
+                    modules::toast::Action::Open(path) => {
+                        if let Err(err) = spawn_editor(&path) {
+                            eprintln!(
+                                "saola-capture: daemon: could not open the editor for {}: {err}",
+                                path.display()
+                            );
+                        }
                     }
+                    // Stage 12: a recording's toast — "videos open
+                    // containing dir for now" (PLAN.md task 3; the editor
+                    // has no video support at all yet, so there is nothing
+                    // for `spawn_editor` to do with this path).
+                    modules::toast::Action::OpenDir(path) => {
+                        if let Err(err) = open_containing_dir(&path) {
+                            eprintln!(
+                                "saola-capture: daemon: could not open the folder containing {}: \
+                                 {err}",
+                                path.display()
+                            );
+                        }
+                    }
+                    modules::toast::Action::None => {}
                 }
                 self.sync_toast_surface()
             }
@@ -831,6 +867,25 @@ impl Daemon {
             Message::RecordingFailed(message) => {
                 self.toasts
                     .push_notice("Recording failed", message, &self.theme, Instant::now());
+                self.sync_toast_surface()
+            }
+            // Stage 12: the success half — `RecordingFailed`'s sibling.
+            // Clicking it opens the containing directory (`modules::toast::
+            // ToastKind::Recording`), the same "no video editor yet" answer
+            // the module doc comment above explains.
+            Message::RecordingFinished(path) => {
+                self.toasts
+                    .push_recording(PathBuf::from(path), &self.theme, Instant::now());
+                self.sync_toast_surface()
+            }
+            // Stage 13: a recording that started, but not with the audio it
+            // was asked for. The same notice card as a failure, because the
+            // style guide carries severity in the *wording* and never in a
+            // colour (CLAUDE.md's Design language, "three colors, never a
+            // fourth") — so there is nothing else for a warning to look like.
+            Message::Warning { title, body } => {
+                self.toasts
+                    .push_notice(title, body, &self.theme, Instant::now());
                 self.sync_toast_surface()
             }
             // Stage 8's delayed-capture countdown pill.
@@ -1364,6 +1419,33 @@ fn spawn_editor(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A recording toast's click (PLAN.md Stage 12, task 3: "videos open
+/// containing dir for now") — spawns `xdg-open` on the file's *parent*
+/// directory, detached, the same fire-and-forget shape [`spawn_editor`] and
+/// `dbus::spawn_daemon_detached` already use.
+///
+/// **`xdg-open`, not a portal.** CLAUDE.md's Boundaries section forbids
+/// `xdg-desktop-portal` specifically (broken by configuration here, and
+/// portals gate untrusted apps — irrelevant to this first-party component
+/// asking to show its own output). `xdg-open` is the unrelated freedesktop
+/// convenience script every desktop environment ships to resolve "open this
+/// path with whatever the user's file manager is" — the same category of
+/// external CLI boundary `ffmpeg` already is (CLAUDE.md Boundaries: "ffmpeg
+/// is an external CLI boundary"), not a second one invented for this call.
+/// A missing `xdg-open` (unlikely — it ships with `xdg-utils`, a near-universal
+/// dependency of any desktop environment) degrades to a logged error at the
+/// call site, never a panic.
+fn open_containing_dir(path: &Path) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(path);
+    std::process::Command::new("xdg-open")
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
 /// The daemon's message type. `#[to_layer_message(multi)]` appends
 /// iced_layershell's own layer-shell control variants (`NewLayerShell`,
 /// `SizeChange`, …) and implements the `TryInto<LayerShellCustomActionWithId>`
@@ -1450,6 +1532,22 @@ enum Message {
     /// `io.saola.Capture1` `Error` signal was already emitted by the daemon's
     /// recording supervisor, so this variant is purely the on-screen half.
     RecordingFailed(String),
+    /// **Stage 12.** A recording ended cleanly and was saved —
+    /// `dbus.rs`'s [`dbus::DaemonEvent::RecordingFinished`], forwarded
+    /// through `dbus_worker_stream`. Raises the finish toast PLAN.md task 3
+    /// asks for (`modules::toast::ToastStack::push_recording`); the
+    /// `RecordingFinished` D-Bus signal is emitted separately by the
+    /// recording supervisor, same split `RecordingFailed`/`Error` already
+    /// has.
+    RecordingFinished(String),
+    /// **Stage 13.** A non-fatal warning worth a card — `dbus.rs`'s
+    /// [`dbus::DaemonEvent::Warning`], forwarded through
+    /// `dbus_worker_stream`. Today's only sender is a recording that had to
+    /// start without the audio it asked for. Same notice toast
+    /// [`Message::RecordingFailed`] raises; unlike that one there is **no**
+    /// matching D-Bus signal, because nothing failed (see the event's own
+    /// doc comment).
+    Warning { title: String, body: String },
 }
 
 /// Everything one interactive region selection needs to start, bundled so
@@ -1487,6 +1585,11 @@ enum ShutdownReason {
     /// adding for what should be a rare, environment-level failure (no
     /// session bus at all).
     DBusUnavailable(String),
+    /// **Stage 12.** The tray menu's "Quit daemon" row — `modules::tray`'s
+    /// `TrayMenu::event` sends `DaemonEvent::QuitRequested`, which
+    /// `dbus_worker_stream` turns into this. Same `iced::exit()` tail every
+    /// other reason takes; this is purely which line gets printed.
+    TrayQuit,
 }
 
 impl ShutdownReason {
@@ -1506,6 +1609,9 @@ impl ShutdownReason {
                     "saola-capture: daemon: could not serve {}: {err}",
                     dbus::SERVICE_NAME
                 );
+            }
+            ShutdownReason::TrayQuit => {
+                eprintln!("saola-capture: daemon: quit via the tray menu — shutting down");
             }
         }
     }
@@ -1577,6 +1683,22 @@ fn dbus_worker_stream() -> impl Stream<Item = Message> {
                         }
                         dbus::DaemonEvent::RecordingFailed { message } => {
                             Message::RecordingFailed(message)
+                        }
+                        // **Stage 12.** The finish toast — same shape as
+                        // `RecordingFailed` above, minus the "why".
+                        dbus::DaemonEvent::RecordingFinished { path } => {
+                            Message::RecordingFinished(path)
+                        }
+                        // **Stage 13.** A warning with no failure behind it
+                        // — see the event's own doc comment.
+                        dbus::DaemonEvent::Warning { title, body } => {
+                            Message::Warning { title, body }
+                        }
+                        // **Stage 12.** The tray's "Quit daemon" menu action
+                        // — reuses the existing shutdown path exactly like a
+                        // SIGTERM would.
+                        dbus::DaemonEvent::QuitRequested => {
+                            Message::Shutdown(ShutdownReason::TrayQuit)
                         }
                     };
                     if sender.send(message).await.is_err() {

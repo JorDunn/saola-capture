@@ -525,7 +525,14 @@ fn unique_stem_among(dir: &Path, base: &str, extensions: &[&str]) -> Result<Stri
 /// either doesn't exist or holds the complete file. A plain `fs::write` that
 /// runs out of disk halfway leaves a truncated image that looks saved and
 /// isn't.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+///
+/// **`pub` as of Stage 14**: [`crate::modules::editor`]'s Save/Save As write
+/// straight to an explicit path (the file that was opened, or one the user
+/// typed) rather than through [`save_capture`]'s directory-resolution/
+/// filename-invention/history-index pipeline, but they want exactly the same
+/// crash-safety guarantee a fresh capture gets — an edit that dies mid-write
+/// must leave the *original* file intact, never a half-written replacement.
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     let failed = |source: io::Error| StorageError::Write {
         path: path.to_path_buf(),
         source,
@@ -606,6 +613,26 @@ fn encode_png(frame: &Frame) -> Result<Vec<u8>, StorageError> {
         )
         .map_err(|err| StorageError::Encode(format!("png: {err}")))?;
     Ok(out)
+}
+
+/// The same encoder-selection `match` [`save_capture_indexing_to`] does
+/// inline, exposed for a second caller — **Stage 14**'s
+/// [`crate::modules::editor`]. The editor already has a composed RGBA
+/// [`Frame`] in hand (the base image plus its annotations, rasterized) and
+/// wants exactly this step, not the whole [`save_capture`] pipeline (which
+/// also resolves a save directory, invents a timestamped filename and
+/// appends a history-index row — none of which apply to *editing an existing
+/// file*). Kept as a one-line wrapper rather than duplicated so the two
+/// callers can never drift on which encoder a given [`ImageFormat`] means.
+pub fn encode_frame(
+    frame: &Frame,
+    format: ImageFormat,
+    webp_quality: u8,
+) -> Result<Vec<u8>, StorageError> {
+    match format {
+        ImageFormat::Webp => encode_webp(frame, webp_quality),
+        ImageFormat::Png => encode_png(frame),
+    }
 }
 
 // ---------------------------------------------------------------------

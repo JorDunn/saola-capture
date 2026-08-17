@@ -26,6 +26,13 @@ use zbus::zvariant::OwnedValue;
 
 use crate::config::{CaptureConfig, ImageFormat, VideoPreset};
 
+/// `mic`/`system`/`both` — **defined in `config.rs`** (Stage 13) next to the
+/// `audio` knob it is the vocabulary for, exactly like [`ImageFormat`] and
+/// [`VideoPreset`], and re-exported here so `cli::AudioSource` keeps naming
+/// it for every caller. See `config::parse_audio` for why `"none"` is a
+/// parse-level answer rather than a fourth variant.
+pub use crate::config::AudioSource;
+
 /// Teaching note: `clap`'s `derive` feature turns this struct into a full
 /// argument parser at compile time. `Cli::parse()` in `main` reads
 /// `std::env::args()` and — on `--help`, `--version`, or a malformed
@@ -224,10 +231,14 @@ pub struct RecordStartArgs {
     /// Defaults to `capture.toml`'s `video-preset`.
     #[arg(long, value_name = "hevc|av1|h264")]
     pub preset: Option<String>,
-    /// Record audio from the microphone, system output, or both. Device
-    /// *names* are resolved at record time from `pactl list short sources`
-    /// (CAPTURE-RESEARCH: never hardcoded) — omit for a silent recording.
-    #[arg(long, value_name = "mic|system|both")]
+    /// Record audio from the microphone, system output, or both — **real as
+    /// of Stage 13**. Device *names* are resolved at record time from
+    /// ffmpeg's own pulse device list (CAPTURE-RESEARCH §4.4/§4.5: never
+    /// hardcoded), and a device that isn't there degrades the recording to
+    /// video-only with a warning rather than failing it. Omit for a silent
+    /// recording, or say `none` to override a `capture.toml` that turned
+    /// audio on. Defaults to `capture.toml`'s `audio`.
+    #[arg(long, value_name = "none|mic|system|both")]
     pub audio: Option<String>,
     /// Negotiate a screencast, log the format and frame cadence for five
     /// seconds, then tear everything down. **Writes nothing**, saves
@@ -235,16 +246,33 @@ pub struct RecordStartArgs {
     /// screen recording work on this machine at all?" (PLAN.md Stage 10).
     #[arg(long)]
     pub dry_run: bool,
+    /// **Stage 12.** Record a selected region — interactively via the same
+    /// overlay `shot --region` uses (drag, confirm, or click the toolbar's
+    /// Window button to switch to a window recording instead), or exactly
+    /// via `--geometry` (skips the overlay). There is no `RecordArea` on
+    /// niri (CAPTURE-RESEARCH D8), so this still casts the whole monitor and
+    /// crops it in ffmpeg's own filter chain — never a second, narrower cast.
+    #[arg(long)]
+    pub region: bool,
+    /// **Stage 12.** Record a single window (`RecordWindow`) — the focused
+    /// one, or `--window-id` names a different one. Mirrors
+    /// `shot --window`/`--window-id` exactly, including the no-picker
+    /// default (CAPTURE-RESEARCH D3).
+    #[arg(long)]
+    pub window: bool,
+    /// Skip the overlay and record exactly this rectangle. Logical
+    /// coordinates, same convention as `shot --geometry`. Requires
+    /// `--region`.
+    #[arg(long, value_name = "WxH+X+Y", requires = "region")]
+    pub geometry: Option<String>,
     /// Cast one window (a niri-ipc window id, the same id space
     /// `shot --window --window-id` uses) instead of the focused monitor.
     ///
-    /// **Only accepted together with `--dry-run` today.** Real window
-    /// recording is Stage 12; this exists because `RecordWindow` has its own
-    /// documented failure mode — CAPTURE-RESEARCH §5.3: a bogus id is
-    /// accepted at `RecordWindow` time and the session then self-destructs
-    /// — and a diagnostic that cannot reach that path cannot diagnose it.
-    /// Window casts are also damage-driven and can go seconds between
-    /// frames (§2.3), which is worth seeing before Stage 12 relies on it.
+    /// Accepted alongside `--dry-run` (Stage 10's diagnostic, which needs no
+    /// `--window` flag of its own — see the Stage 10 handoff) or alongside
+    /// `--window` (**Stage 12**'s real window recording). Neither alone nor
+    /// with `--region`/a bare `record start` — a script that asked for a
+    /// specific window must not quietly get the whole monitor instead.
     #[arg(long, value_name = "ID")]
     pub window_id: Option<u64>,
 }
@@ -599,6 +627,15 @@ fn option_u64(options: &HashMap<String, OwnedValue>, key: &str) -> Option<u64> {
     u64::try_from(options.get(key)?.clone()).ok()
 }
 
+/// **Stage 13.** `audio-offset`'s decoder. Non-finite values are dropped
+/// here as well as in `config.rs`, so a hostile (or simply confused) D-Bus
+/// caller cannot put a `NaN` into an ffmpeg argument.
+fn option_f64(options: &HashMap<String, OwnedValue>, key: &str) -> Option<f64> {
+    f64::try_from(options.get(key)?.clone())
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
 /// `zvariant::Str<'static>` from an owned `String`, the shape
 /// `OwnedValue`'s `Str` conversion wants (see `zvariant::owned_value`'s
 /// `to_value!` macro — it takes `Str<'a>`, not a bare `String`/`&str`).
@@ -606,32 +643,81 @@ fn fixed_str(value: impl Into<String>) -> zbus::zvariant::Str<'static> {
     zbus::zvariant::Str::from(value.into())
 }
 
-/// `mic`/`system`/`both` — never a hardcoded device name (CAPTURE-RESEARCH:
-/// resolved from `pactl list short sources` at record time, Stage 13).
+/// Which of the three recording targets was asked for — the `record`-side
+/// twin of [`ShotKind`] (**Stage 12**). Kept as a separate type rather than
+/// reusing `ShotKind` even though the three variants are the same names:
+/// `ShotKind` is Stage 5's type and its own doc comments, tests and
+/// `as_str()` are about a *screenshot*'s wire contract; recording's `kind`
+/// argument happens to use the same three words (CAPTURE-RESEARCH D8 is
+/// explicit that `region` still means "a monitor cast cropped in ffmpeg", not
+/// a `RecordArea` that doesn't exist), but the two enums answering different
+/// questions is worth keeping visible rather than overloading one type for
+/// both D-Bus methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioSource {
-    Mic,
-    System,
-    Both,
+pub enum RecordKind {
+    Fullscreen,
+    Region,
+    Window,
 }
 
-impl AudioSource {
-    fn parse(value: &str) -> Option<Self> {
+impl RecordKind {
+    /// The wire spelling `StartRecording`'s `kind` argument uses — the same
+    /// three strings `ShotKind::as_str` uses, by design (see this type's doc
+    /// comment).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fullscreen => "fullscreen",
+            Self::Region => "region",
+            Self::Window => "window",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "mic" => Some(Self::Mic),
-            "system" => Some(Self::System),
-            "both" => Some(Self::Both),
+            "fullscreen" => Some(Self::Fullscreen),
+            "region" => Some(Self::Region),
+            "window" => Some(Self::Window),
             _ => None,
         }
     }
+}
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Mic => "mic",
-            Self::System => "system",
-            Self::Both => "both",
-        }
+/// Which target flags were actually given on `record start`/`record toggle`,
+/// folded into the one kind + optional geometry/window-id the rest of the
+/// pipeline cares about — the record-side twin of [`resolve_shot_kind`],
+/// pulled out for the same reason: unit-testable on its own, independent of
+/// `--preset`/`--audio`/`--dry-run` resolution.
+///
+/// **Deliberately does not enforce `--window-id` requiring `--window`** —
+/// unlike `resolve_shot_kind`'s `--window-id`-requires-`--window` rule,
+/// `--window-id` here is also legal alongside a bare `--dry-run` with no
+/// `--window` at all (Stage 10's diagnostic; see `RecordStartArgs::
+/// window_id`'s doc comment), so that check stays in
+/// [`RecordOptions::resolve`], which has `dry_run` in scope and this
+/// function does not.
+fn resolve_record_kind(
+    args: &RecordStartArgs,
+) -> Result<(RecordKind, Option<Geometry>, Option<u64>), CliError> {
+    if args.region && args.window {
+        return Err(CliError(
+            "choose at most one of --region, --window".to_string(),
+        ));
     }
+    if args.geometry.is_some() && !args.region {
+        return Err(CliError("--geometry requires --region".to_string()));
+    }
+
+    let geometry = args.geometry.as_deref().map(Geometry::parse).transpose()?;
+
+    let kind = if args.region {
+        RecordKind::Region
+    } else if args.window {
+        RecordKind::Window
+    } else {
+        RecordKind::Fullscreen
+    };
+
+    Ok((kind, geometry, args.window_id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,14 +727,30 @@ pub enum RecordActionKind {
     Toggle,
 }
 
-/// The fully resolved options for one `record` invocation. `audio` has no
-/// config-file counterpart (`capture.toml` carries no audio knob) — it is
-/// `None` unless `--audio` was given, meaning "record video only."
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The fully resolved options for one `record` invocation.
+///
+/// **Not `Eq` since Stage 13**, for the same reason [`CaptureConfig`] isn't:
+/// [`Self::audio_offset`] is a float.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecordOptions {
     pub action: RecordActionKind,
+    /// **Stage 12.** Which target `start`/`toggle` means — `StartRecording`'s
+    /// own first argument (`RecordKind::as_str`). Unused, and left at its
+    /// default `Fullscreen`, for `stop` — `StopRecording` takes no kind.
+    pub kind: RecordKind,
     pub preset: VideoPreset,
+    /// Which audio, if any. `--audio` overrides `capture.toml`'s `audio`
+    /// knob, and `--audio none` overrides it *back off* — **Stage 13**.
     pub audio: Option<AudioSource>,
+    /// `audio-mic-source` from `capture.toml` — **Stage 13**. Travels over
+    /// the bus for exactly the reason [`Self::vaapi_device`] does: the CLI
+    /// process is the one that reads the config (including `--config-dir`),
+    /// and the daemon deliberately loads none of its own.
+    pub audio_mic_source: Option<String>,
+    /// `audio-system-source` from `capture.toml` — **Stage 13**.
+    pub audio_system_source: Option<String>,
+    /// `audio-offset` from `capture.toml`, in seconds — **Stage 13**.
+    pub audio_offset: f64,
     /// `--dry-run` (Stage 10). **Deliberately absent from
     /// [`Self::to_dbus_options`]**: a dry run never reaches the daemon, so
     /// putting it on the wire would add a key to the frozen
@@ -656,11 +758,18 @@ pub struct RecordOptions {
     /// meaningful with `start`/`toggle`; `record stop` has no args at all,
     /// so clap rejects `--dry-run` there before this type sees it.
     pub dry_run: bool,
-    /// `--window-id` (Stage 10, dry-run only — see [`RecordStartArgs::
-    /// window_id`]). Also absent from [`Self::to_dbus_options`], for the
-    /// same reason `dry_run` is: nothing on the daemon side reads it yet,
-    /// and Stage 12 will decide the real wire shape for a window recording
-    /// target when it builds one.
+    /// **Stage 12.** Skip the overlay and record exactly this rectangle —
+    /// only meaningful when [`Self::kind`] is [`RecordKind::Region`]. `None`
+    /// with `kind == Region` means "interactive": the daemon reuses the same
+    /// selection overlay `shot --region` maps.
+    pub geometry: Option<Geometry>,
+    /// `--window-id`. Two independent meanings depending on context (see
+    /// [`RecordStartArgs::window_id`]'s doc comment): with `--dry-run` it
+    /// targets Stage 10's diagnostic cast and never travels over D-Bus; with
+    /// `kind == RecordKind::Window` it is **Stage 12**'s real scriptable
+    /// window-recording target and does travel (`Self::to_dbus_options`).
+    /// `None` with `kind == Window` means "the focused window" — the same
+    /// no-picker default `shot --window` uses (CAPTURE-RESEARCH D3).
     pub window_id: Option<u64>,
     /// `cursor` from `capture.toml` — whether the pointer is composited into
     /// the cast (`screencast::CursorMode`). **Added in Stage 11.** No CLI
@@ -700,34 +809,55 @@ impl RecordOptions {
             None => config.video_preset,
         };
 
+        // **Stage 13.** Three outcomes, not two: a recognized source, the
+        // word `none` (an explicit "override the config file back off"), and
+        // an unrecognized word — which is an *error* rather than a silent
+        // fallback, because a script that asked for audio and got a typo must
+        // learn it now, not on playback. `capture.toml`'s own `audio` knob is
+        // the default when the flag is absent entirely.
         let audio = match start_args.and_then(|a| a.audio.as_deref()) {
-            Some(raw) => Some(AudioSource::parse(raw).ok_or_else(|| {
+            Some(raw) => crate::config::parse_audio(raw).ok_or_else(|| {
                 CliError(format!(
-                    "--audio: unrecognized source {raw:?} (expected mic, system, or both)"
+                    "--audio: unrecognized source {raw:?} (expected none, mic, system, or both)"
                 ))
-            })?),
-            None => None,
+            })?,
+            None => config.audio,
         };
 
         let dry_run = start_args.is_some_and(|a| a.dry_run);
-        let window_id = start_args.and_then(|a| a.window_id);
+        let (kind, geometry, window_id) = match start_args {
+            Some(a) => resolve_record_kind(a)?,
+            // `record stop` has no target flags at all — `kind` is unused on
+            // that path (`StopRecording` takes no argument), so `Fullscreen`
+            // is as good a placeholder as any.
+            None => (RecordKind::Fullscreen, None, None),
+        };
         // Rejected rather than ignored: a flag that silently does nothing is
         // the shape of bug this repo's per-knob-error convention exists to
         // prevent, and a script that asked to record a specific window needs
-        // to learn it recorded the whole monitor instead.
-        if window_id.is_some() && !dry_run {
+        // to learn it recorded the whole monitor instead. `--window-id` is
+        // legal alongside `--dry-run` (Stage 10, targets the diagnostic cast,
+        // no `--window` flag needed) or alongside `--window` (Stage 12, the
+        // real recording target) — neither alone, nor with `--region`, nor on
+        // a bare `record start`.
+        if window_id.is_some() && !dry_run && kind != RecordKind::Window {
             return Err(CliError(
-                "--window-id: window recording lands in Stage 12 — today this flag is only \
-                 accepted with --dry-run"
+                "--window-id requires --window (or --dry-run, which can target a window on its \
+                 own)"
                     .to_string(),
             ));
         }
 
         Ok(RecordOptions {
             action,
+            kind,
             preset,
             audio,
+            audio_mic_source: config.audio_mic_source.clone(),
+            audio_system_source: config.audio_system_source.clone(),
+            audio_offset: config.audio_offset,
             dry_run,
+            geometry,
             window_id,
             cursor: config.cursor,
             output_dir: config.save_dir.clone(),
@@ -741,36 +871,59 @@ impl RecordOptions {
     /// against the caller's own `capture.toml`, so a missing or wrong-typed
     /// key falls back to the same default rather than failing the call.
     ///
-    /// `kind` is the method's own first argument. Only `"fullscreen"` is
-    /// accepted today — `region`/`window` recording is Stage 12
-    /// (CAPTURE-RESEARCH D8), and an unrecognized kind is a hard error rather
-    /// than a silent fullscreen recording nobody asked for.
+    /// `kind` is the method's own first argument. **Stage 12** accepts all
+    /// three (`fullscreen`/`region`/`window` — the D8-shaped meaning
+    /// [`RecordKind`]'s own doc comment describes); an unrecognized kind is
+    /// still a hard error rather than a silent fullscreen recording nobody
+    /// asked for.
     pub fn from_dbus_options(
         kind: &str,
         options: &HashMap<String, OwnedValue>,
     ) -> Result<Self, CliError> {
         let defaults = CaptureConfig::default();
 
-        if kind != "fullscreen" {
-            return Err(CliError(format!(
-                "recording kind {kind:?} is not supported yet — only \"fullscreen\" works today \
-                 (region and window recording land in Stage 12)"
-            )));
-        }
+        let kind = RecordKind::parse(kind).ok_or_else(|| {
+            CliError(format!(
+                "recording kind {kind:?} is not supported (expected fullscreen, region, or window)"
+            ))
+        })?;
 
         let preset = option_str(options, "preset")
             .and_then(|raw| VideoPreset::parse(&raw))
             .unwrap_or(defaults.video_preset);
-        let audio = option_str(options, "audio").and_then(|raw| AudioSource::parse(&raw));
+        // **Stage 13.** Absent, unrecognized, and the literal `"none"` all
+        // mean the same thing on this side — the sender already resolved
+        // every one of those to "no audio" and simply omits the key.
+        let audio = option_str(options, "audio")
+            .and_then(|raw| crate::config::parse_audio(&raw))
+            .flatten();
+        // A `geometry`/`window-id` that doesn't parse, or that arrives for
+        // the wrong `kind`, is dropped rather than fatal — the same
+        // already-validated-upstream posture `CaptureOptions::
+        // from_dbus_options` takes. A dropped `geometry` on a `region`
+        // recording falls through to the daemon's interactive overlay path,
+        // which is the same honest degradation an omitted one would give.
+        let geometry = (kind == RecordKind::Region)
+            .then(|| option_str(options, "geometry").and_then(|raw| Geometry::parse(&raw).ok()))
+            .flatten();
+        let window_id = (kind == RecordKind::Window)
+            .then(|| option_u64(options, "window-id"))
+            .flatten();
 
         Ok(RecordOptions {
             action: RecordActionKind::Start,
+            kind,
             preset,
             audio,
-            // Neither travels over the bus, by construction — a dry run never
-            // reaches the daemon and window targets are Stage 12.
+            audio_mic_source: option_str(options, "audio-mic-source"),
+            audio_system_source: option_str(options, "audio-system-source"),
+            audio_offset: option_f64(options, "audio-offset")
+                .unwrap_or(crate::audio::DEFAULT_SYNC_OFFSET),
+            // Never travels over the bus, by construction — a dry run never
+            // reaches the daemon.
             dry_run: false,
-            window_id: None,
+            geometry,
+            window_id,
             cursor: option_bool(options, "cursor").unwrap_or(defaults.cursor),
             output_dir: option_str(options, "output").map(PathBuf::from),
             vaapi_device: option_str(options, "vaapi-device").map(PathBuf::from),
@@ -779,16 +932,49 @@ impl RecordOptions {
 
     /// The `options` map for `StartRecording`'s `a{sv}` argument — same
     /// defensive-insert shape as [`CaptureOptions::to_dbus_options`].
+    /// `geometry`/`window-id` only ever go on the wire alongside the `kind`
+    /// they mean something for — see [`Self::from_dbus_options`]'s decode
+    /// half.
     pub fn to_dbus_options(&self) -> HashMap<String, OwnedValue> {
         let mut options = HashMap::new();
         options.insert(
             "preset".to_string(),
             OwnedValue::from(fixed_str(self.preset.as_str())),
         );
+        // **Stage 13.** "No audio" is an *absent* key, never `"none"` on the
+        // wire — the decode side treats absent and unrecognized identically,
+        // so there is nothing a `"none"` value could add.
         if let Some(audio) = self.audio {
             options.insert(
                 "audio".to_string(),
                 OwnedValue::from(fixed_str(audio.as_str())),
+            );
+            // The device knobs only travel alongside an audio request that
+            // could use them, same rule `geometry`/`window-id` follow.
+            if let Some(source) = &self.audio_mic_source {
+                options.insert(
+                    "audio-mic-source".to_string(),
+                    OwnedValue::from(fixed_str(source.clone())),
+                );
+            }
+            if let Some(source) = &self.audio_system_source {
+                options.insert(
+                    "audio-system-source".to_string(),
+                    OwnedValue::from(fixed_str(source.clone())),
+                );
+            }
+            // **Always sent, even when it is zero** — a live-testing bug from
+            // this stage: omitting a zero made "the user measured their
+            // machine and wants no correction" indistinguishable from "this
+            // key is absent", and the daemon's own decode falls back to
+            // `audio::DEFAULT_SYNC_OFFSET` for an absent key. So
+            // `audio-offset = 0.0` in `capture.toml` silently kept the 0.13 s
+            // default and the knob could not be turned off at all. Unlike
+            // `geometry`/`window-id`, whose absence genuinely *is* the
+            // decision, zero here is a value.
+            options.insert(
+                "audio-offset".to_string(),
+                OwnedValue::from(self.audio_offset),
             );
         }
         options.insert("cursor".to_string(), OwnedValue::from(self.cursor));
@@ -803,6 +989,22 @@ impl RecordOptions {
                 "vaapi-device".to_string(),
                 OwnedValue::from(fixed_str(device.to_string_lossy().into_owned())),
             );
+        }
+        if self.kind == RecordKind::Region {
+            if let Some(geometry) = self.geometry {
+                options.insert(
+                    "geometry".to_string(),
+                    OwnedValue::from(fixed_str(format!(
+                        "{}x{}+{}+{}",
+                        geometry.width, geometry.height, geometry.x, geometry.y
+                    ))),
+                );
+            }
+        }
+        if self.kind == RecordKind::Window {
+            if let Some(window_id) = self.window_id {
+                options.insert("window-id".to_string(), OwnedValue::from(window_id));
+            }
         }
         options
     }
@@ -1042,6 +1244,45 @@ mod tests {
         assert_eq!(options.audio, Some(AudioSource::Both));
     }
 
+    /// **Stage 13.** `capture.toml`'s `audio` is what a bare `record start`
+    /// means — the same relationship `--preset` has to `video-preset`.
+    #[test]
+    fn record_start_takes_its_audio_from_the_config_when_no_flag_is_given() {
+        let config = CaptureConfig {
+            audio: Some(AudioSource::System),
+            audio_mic_source: Some("alsa_input.usb".to_string()),
+            audio_system_source: Some("hdmi.monitor".to_string()),
+            audio_offset: 0.05,
+            ..CaptureConfig::default()
+        };
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs::default()),
+        };
+        let options = RecordOptions::resolve(&config, &args).unwrap();
+        assert_eq!(options.audio, Some(AudioSource::System));
+        assert_eq!(options.audio_mic_source.as_deref(), Some("alsa_input.usb"));
+        assert_eq!(options.audio_system_source.as_deref(), Some("hdmi.monitor"));
+        assert_eq!(options.audio_offset, 0.05);
+    }
+
+    /// …and `--audio none` is how a keybind overrides that config back off.
+    /// Without this spelling there would be no way to say "not this time".
+    #[test]
+    fn audio_none_overrides_a_config_that_turned_audio_on() {
+        let config = CaptureConfig {
+            audio: Some(AudioSource::Both),
+            ..CaptureConfig::default()
+        };
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs {
+                audio: Some("none".to_string()),
+                ..RecordStartArgs::default()
+            }),
+        };
+        let options = RecordOptions::resolve(&config, &args).unwrap();
+        assert_eq!(options.audio, None);
+    }
+
     #[test]
     fn record_stop_carries_no_preset_or_audio_override() {
         let config = CaptureConfig {
@@ -1081,6 +1322,177 @@ mod tests {
         assert!(RecordOptions::resolve(&config, &args).is_err());
     }
 
+    // -- RecordKind resolution (Stage 12) --------------------------------
+
+    fn record_start(mutate: impl FnOnce(&mut RecordStartArgs)) -> RecordStartArgs {
+        let mut args = RecordStartArgs::default();
+        mutate(&mut args);
+        args
+    }
+
+    #[test]
+    fn no_target_flag_defaults_to_fullscreen_recording() {
+        let args = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs::default()),
+        };
+        let options = RecordOptions::resolve(&CaptureConfig::default(), &args).unwrap();
+        assert_eq!(options.kind, RecordKind::Fullscreen);
+        assert_eq!(options.geometry, None);
+        assert_eq!(options.window_id, None);
+    }
+
+    #[test]
+    fn region_without_geometry_is_an_interactive_recording() {
+        let args = RecordArgs {
+            action: RecordAction::Start(record_start(|a| a.region = true)),
+        };
+        let options = RecordOptions::resolve(&CaptureConfig::default(), &args).unwrap();
+        assert_eq!(options.kind, RecordKind::Region);
+        assert_eq!(options.geometry, None);
+    }
+
+    #[test]
+    fn record_region_with_geometry_skips_the_overlay() {
+        let args = RecordArgs {
+            action: RecordAction::Start(record_start(|a| {
+                a.region = true;
+                a.geometry = Some("600x450+100+100".to_string());
+            })),
+        };
+        let options = RecordOptions::resolve(&CaptureConfig::default(), &args).unwrap();
+        assert_eq!(options.kind, RecordKind::Region);
+        assert_eq!(
+            options.geometry,
+            Some(Geometry {
+                width: 600,
+                height: 450,
+                x: 100,
+                y: 100
+            })
+        );
+    }
+
+    #[test]
+    fn window_kind_with_no_id_means_the_focused_window() {
+        let args = RecordArgs {
+            action: RecordAction::Start(record_start(|a| a.window = true)),
+        };
+        let options = RecordOptions::resolve(&CaptureConfig::default(), &args).unwrap();
+        assert_eq!(options.kind, RecordKind::Window);
+        assert_eq!(options.window_id, None);
+    }
+
+    #[test]
+    fn region_and_window_together_is_an_error() {
+        let args = RecordArgs {
+            action: RecordAction::Start(record_start(|a| {
+                a.region = true;
+                a.window = true;
+            })),
+        };
+        assert!(RecordOptions::resolve(&CaptureConfig::default(), &args).is_err());
+    }
+
+    #[test]
+    fn record_geometry_without_region_is_an_error() {
+        // Bypasses clap's own `requires = "region"` — the pure resolver must
+        // still catch it, same shape `resolve_shot_kind`'s own test takes.
+        let args = RecordArgs {
+            action: RecordAction::Start(record_start(|a| {
+                a.geometry = Some("100x100+0+0".to_string());
+            })),
+        };
+        assert!(RecordOptions::resolve(&CaptureConfig::default(), &args).is_err());
+    }
+
+    #[test]
+    fn toggle_resolves_a_target_kind_too() {
+        // `RecordAction::Toggle` carries `RecordStartArgs` for exactly this
+        // reason — a toggle that starts a recording should honour the same
+        // target flags a `start` would.
+        let args = RecordArgs {
+            action: RecordAction::Toggle(record_start(|a| a.window = true)),
+        };
+        let options = RecordOptions::resolve(&CaptureConfig::default(), &args).unwrap();
+        assert_eq!(options.kind, RecordKind::Window);
+    }
+
+    // -- RecordOptions a{sv} round trip for kind/geometry/window-id (Stage 12)
+
+    #[test]
+    fn a_region_recordings_geometry_round_trips_over_dbus() {
+        let args = RecordArgs {
+            action: RecordAction::Start(record_start(|a| {
+                a.region = true;
+                a.geometry = Some("640x480+10+20".to_string());
+            })),
+        };
+        let options = RecordOptions::resolve(&CaptureConfig::default(), &args).unwrap();
+        let map = options.to_dbus_options();
+        assert_eq!(
+            String::try_from(map["geometry"].clone()).unwrap(),
+            "640x480+10+20"
+        );
+
+        let decoded = RecordOptions::from_dbus_options("region", &map).unwrap();
+        assert_eq!(decoded.kind, RecordKind::Region);
+        assert_eq!(decoded.geometry, options.geometry);
+    }
+
+    #[test]
+    fn an_interactive_region_recording_carries_no_geometry_key() {
+        let args = RecordArgs {
+            action: RecordAction::Start(record_start(|a| a.region = true)),
+        };
+        let map = RecordOptions::resolve(&CaptureConfig::default(), &args)
+            .unwrap()
+            .to_dbus_options();
+        assert!(!map.contains_key("geometry"));
+
+        let decoded = RecordOptions::from_dbus_options("region", &map).unwrap();
+        assert_eq!(decoded.kind, RecordKind::Region);
+        assert_eq!(decoded.geometry, None, "no geometry means interactive");
+    }
+
+    #[test]
+    fn a_window_recordings_id_round_trips_over_dbus() {
+        let args = RecordArgs {
+            action: RecordAction::Start(record_start(|a| {
+                a.window = true;
+                a.window_id = Some(99);
+            })),
+        };
+        let options = RecordOptions::resolve(&CaptureConfig::default(), &args).unwrap();
+        let map = options.to_dbus_options();
+        assert_eq!(u64::try_from(map["window-id"].clone()).unwrap(), 99);
+
+        let decoded = RecordOptions::from_dbus_options("window", &map).unwrap();
+        assert_eq!(decoded.kind, RecordKind::Window);
+        assert_eq!(decoded.window_id, Some(99));
+    }
+
+    #[test]
+    fn a_geometry_key_is_ignored_for_a_fullscreen_kind() {
+        // Defence in depth: even if a stray `geometry`/`window-id` key
+        // arrived on the wire for the wrong kind (a hand-crafted `busctl`
+        // call, say), the decode side must not honour it.
+        let mut map = HashMap::new();
+        map.insert(
+            "geometry".to_string(),
+            OwnedValue::from(fixed_str("100x100+0+0")),
+        );
+        map.insert("window-id".to_string(), OwnedValue::from(7u64));
+        let decoded = RecordOptions::from_dbus_options("fullscreen", &map).unwrap();
+        assert_eq!(decoded.geometry, None);
+        assert_eq!(decoded.window_id, None);
+    }
+
+    #[test]
+    fn an_unrecognized_recording_kind_is_a_hard_error() {
+        let err = RecordOptions::from_dbus_options("all-of-them", &HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("all-of-them"), "{err}");
+    }
+
     // -- --dry-run / --window-id (Stage 10) ---------------------------------
 
     #[test]
@@ -1113,10 +1525,10 @@ mod tests {
     }
 
     #[test]
-    fn a_window_id_is_accepted_only_alongside_dry_run() {
+    fn a_window_id_is_accepted_alongside_dry_run_or_window() {
         let config = CaptureConfig::default();
 
-        let allowed = RecordArgs {
+        let with_dry_run = RecordArgs {
             action: RecordAction::Start(RecordStartArgs {
                 dry_run: true,
                 window_id: Some(16),
@@ -1124,9 +1536,23 @@ mod tests {
             }),
         };
         assert_eq!(
-            RecordOptions::resolve(&config, &allowed).unwrap().window_id,
+            RecordOptions::resolve(&config, &with_dry_run)
+                .unwrap()
+                .window_id,
             Some(16)
         );
+
+        // Stage 12: `--window` alone (no `--dry-run`) is the other legal way.
+        let with_window = RecordArgs {
+            action: RecordAction::Start(RecordStartArgs {
+                window: true,
+                window_id: Some(16),
+                ..RecordStartArgs::default()
+            }),
+        };
+        let options = RecordOptions::resolve(&config, &with_window).unwrap();
+        assert_eq!(options.kind, RecordKind::Window);
+        assert_eq!(options.window_id, Some(16));
 
         // Rejected, not silently ignored — a script that asked for a window
         // must not quietly get the whole monitor instead.
@@ -1138,6 +1564,7 @@ mod tests {
         };
         let err = RecordOptions::resolve(&config, &refused).unwrap_err();
         assert!(err.to_string().contains("--window-id"), "{err}");
+        assert!(err.to_string().contains("--window"), "{err}");
         assert!(err.to_string().contains("--dry-run"), "{err}");
     }
 
@@ -1213,6 +1640,99 @@ mod tests {
         let options = RecordOptions::resolve(&config, &args).unwrap();
         let map = options.to_dbus_options();
         assert_eq!(String::try_from(map["audio"].clone()).unwrap(), "system");
+    }
+
+    /// **Stage 13.** The device knobs and the calibration offset ride with an
+    /// audio request and **only** with one — the daemon reads no config of
+    /// its own, so an omitted key is a knob the recording never sees.
+    #[test]
+    fn record_options_carry_the_audio_device_knobs_only_alongside_audio() {
+        let config = CaptureConfig {
+            audio_mic_source: Some("alsa_input.usb".to_string()),
+            audio_system_source: Some("hdmi.monitor".to_string()),
+            audio_offset: -0.04,
+            ..CaptureConfig::default()
+        };
+
+        // No `--audio`: nothing audio-shaped goes on the wire at all.
+        let silent = RecordOptions::resolve(
+            &config,
+            &RecordArgs {
+                action: RecordAction::Start(RecordStartArgs::default()),
+            },
+        )
+        .unwrap()
+        .to_dbus_options();
+        for key in [
+            "audio",
+            "audio-mic-source",
+            "audio-system-source",
+            "audio-offset",
+        ] {
+            assert!(!silent.contains_key(key), "{key} must not travel alone");
+        }
+
+        // With `--audio both`, all four do.
+        let loud = RecordOptions::resolve(
+            &config,
+            &RecordArgs {
+                action: RecordAction::Start(RecordStartArgs {
+                    audio: Some("both".to_string()),
+                    ..RecordStartArgs::default()
+                }),
+            },
+        )
+        .unwrap()
+        .to_dbus_options();
+        assert_eq!(String::try_from(loud["audio"].clone()).unwrap(), "both");
+        assert_eq!(
+            String::try_from(loud["audio-mic-source"].clone()).unwrap(),
+            "alsa_input.usb"
+        );
+        assert_eq!(
+            String::try_from(loud["audio-system-source"].clone()).unwrap(),
+            "hdmi.monitor"
+        );
+        assert_eq!(f64::try_from(loud["audio-offset"].clone()).unwrap(), -0.04);
+
+        // …and the whole map decodes back to the same options the sender had.
+        let decoded = RecordOptions::from_dbus_options("fullscreen", &loud).unwrap();
+        assert_eq!(decoded.audio, Some(AudioSource::Both));
+        assert_eq!(decoded.audio_mic_source.as_deref(), Some("alsa_input.usb"));
+        assert_eq!(decoded.audio_system_source.as_deref(), Some("hdmi.monitor"));
+        assert_eq!(decoded.audio_offset, -0.04);
+    }
+
+    /// **The bug this stage's own live testing caught.** A zero
+    /// `audio-offset` is a *decision* ("I measured my machine; apply no
+    /// correction"), not an absence — and the decode side defaults an absent
+    /// key to `audio::DEFAULT_SYNC_OFFSET`, which is **not** zero. Omitting
+    /// it therefore made the knob impossible to turn off: a config saying
+    /// `audio-offset = 0.0` produced a recording with `-itsoffset 0.13`, and
+    /// only a live A/V measurement noticed.
+    #[test]
+    fn an_explicit_zero_audio_offset_survives_the_round_trip() {
+        let config = CaptureConfig {
+            audio: Some(AudioSource::Mic),
+            audio_offset: 0.0,
+            ..CaptureConfig::default()
+        };
+        let map = RecordOptions::resolve(
+            &config,
+            &RecordArgs {
+                action: RecordAction::Start(RecordStartArgs::default()),
+            },
+        )
+        .unwrap()
+        .to_dbus_options();
+        assert!(map.contains_key("audio"));
+        assert_eq!(
+            RecordOptions::from_dbus_options("fullscreen", &map)
+                .unwrap()
+                .audio_offset,
+            0.0,
+            "an explicit zero must not decode back to the default"
+        );
     }
 
     // -- WindowAction::dbus_mode ------------------------------------------

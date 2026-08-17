@@ -132,7 +132,12 @@ struct CaptureService {
 
 /// The handle parked in [`crate::modules::recorder::RecorderState`] while a
 /// recording is live: how to stop it, and who to tell when it has stopped.
-struct ActiveRecording {
+///
+/// `pub(crate)` only so [`SharedRecorder`]'s alias can name it — nothing
+/// outside this file ever constructs one or reads its fields (both of which
+/// stay private; only the *type name* needs to be nameable for the alias
+/// itself to type-check under `-D warnings`' `private_interfaces` lint).
+pub(crate) struct ActiveRecording {
     /// Set to `true` to ask the pump to finish. An `AtomicBool` rather than a
     /// channel because the pump reads it on every loop turn and nothing ever
     /// needs to block on writing it.
@@ -148,7 +153,17 @@ struct ActiveRecording {
     waiter: Option<iced::futures::channel::oneshot::Sender<Result<String, String>>>,
 }
 
-type SharedRecorder = Arc<Mutex<crate::modules::recorder::RecorderState<ActiveRecording>>>;
+/// **Stage 12**: `pub(crate)`, not private — `modules::tray` holds a clone
+/// of this (shared with the one [`CaptureService`] built in [`serve`]) so the
+/// SNI item can answer `Status`/`Title`/`IconPixmap` from the live recorder
+/// state without a second source of truth. `ActiveRecording` itself stays
+/// private: nothing outside this file ever needs to *name* it, only to hold
+/// this alias opaquely and call the `pub` methods `RecorderState<H>` already
+/// exposes for any `H` (`is_active`/`elapsed`/`phase`/`last_error`), plus
+/// [`lock_recorder`] and [`stop_recording_now`] below, both also
+/// `pub(crate)` for the same reason.
+pub(crate) type SharedRecorder =
+    Arc<Mutex<crate::modules::recorder::RecorderState<ActiveRecording>>>;
 
 /// Take the recorder lock, recovering from poisoning rather than propagating
 /// it.
@@ -160,7 +175,7 @@ type SharedRecorder = Arc<Mutex<crate::modules::recorder::RecorderState<ActiveRe
 /// state behind the lock is a small enum plus two counters; the worst a
 /// recovered guard can observe is a half-applied transition, which the phase
 /// guards below already reject.
-fn lock_recorder(
+pub(crate) fn lock_recorder(
     recorder: &SharedRecorder,
 ) -> std::sync::MutexGuard<'_, crate::modules::recorder::RecorderState<ActiveRecording>> {
     recorder
@@ -185,6 +200,14 @@ struct StartedRecording {
     stream: crate::capture::screencast::PipeWireStream,
     sink: Box<dyn crate::encode::EncoderSink>,
     guard: crate::encode::NegotiatedGuard,
+    /// **Stage 13.** The first frame — already written to the encoder by
+    /// [`CaptureService::spin_up`], and *kept* so the pump can re-write it at
+    /// stop time if nothing else ever arrives (a still screen produces
+    /// exactly one frame; see `modules::recorder::seal_last_frame` for why
+    /// that would otherwise truncate the whole recording, audio included).
+    /// Moved, never copied — this is the same allocation the PipeWire thread
+    /// handed over.
+    first_frame: crate::capture::screencast::VideoFrame,
 }
 
 /// An event crossing from this zbus-hosted service into `main.rs`'s iced
@@ -267,10 +290,33 @@ pub enum DaemonEvent {
     /// terminal and, unlike every other failure in this file, there is no
     /// pending method call left to return an error to.
     ///
-    /// **There is deliberately no `RecordingFinished` counterpart here.** The
-    /// success toast — with the click-to-open-the-containing-directory
-    /// behaviour videos need — is PLAN.md Stage 12's task 3.
     RecordingFailed { message: String },
+    /// **Stage 12.** The success half of the pair above: a recording ended
+    /// cleanly and was saved — task 3's finish toast ("videos open
+    /// containing dir for now"). Sent alongside (never instead of) the
+    /// `RecordingFinished` D-Bus signal, which `spawn_recording_tasks`
+    /// already emits — this is purely the on-screen half, the same split
+    /// `RecordingFailed`/`Error` already has.
+    RecordingFinished { path: String },
+    /// **Stage 13.** Something the user should know that is *not* a failure
+    /// — today, exactly one thing: a recording that had to start without (or
+    /// with different) audio because the device it asked for is not there
+    /// (PLAN.md Stage 13 task 3, "degrades to video-only with a warning
+    /// toast").
+    ///
+    /// Deliberately **not** an `Error` signal on the bus: the
+    /// `io.saola.Capture1` signals are the frozen saola-notifications
+    /// contract (CLAUDE.md Boundaries) and `Error` means the recording
+    /// failed. This one did not — it is recording right now, just quieter
+    /// than asked. So this is the on-screen half with no bus half, which is
+    /// the first event in this enum shaped that way.
+    Warning { title: String, body: String },
+    /// **Stage 12.** The tray menu's "Quit daemon" action — see
+    /// `modules::tray`. Reuses `main.rs`'s existing `Message::Shutdown`
+    /// path (`ShutdownReason::TrayQuit`) rather than calling `iced::exit()`
+    /// from inside a served D-Bus method, which has no way to reach the
+    /// iced daemon's own event loop directly.
+    QuitRequested,
 }
 
 /// How an interactive region selection ended — the value the daemon sends
@@ -622,6 +668,266 @@ impl CaptureService {
         }
     }
 
+    /// **Stage 12.** Turn `options.kind` into a `CastTarget` plus an optional
+    /// crop rectangle — the daemon's half of task 3 ("record start --region
+    /// ... record the monitor and crop before encode").
+    ///
+    /// - `Fullscreen` → the focused output, same lookup `main.rs::
+    ///   run_record_dry_run` and Stage 11's own `spin_up` always used.
+    /// - `Window` → `CastTarget::Window`, no crop at all: a window cast's own
+    ///   negotiated frame already *is* just that window (Stage 10 confirmed
+    ///   this live — a `--window-id` dry run negotiated exactly the window's
+    ///   own size), so there is nothing to crop out of it.
+    /// - `Region` with `options.geometry` set → the monitor that rectangle
+    ///   overlaps most (`capture::output_for_region`, the same rule
+    ///   `take_screenshot`'s own `Region` arm uses), cropped to it.
+    /// - `Region` with no geometry → **interactive**: reuse the same overlay
+    ///   `Screenshot`'s `interactive_region` maps
+    ///   ([`Self::begin_interactive_region`]), and branch on what comes back
+    ///   — a confirmed rectangle crops the monitor exactly like the
+    ///   `--geometry` case; the toolbar's Window button
+    ///   (`RegionOutcome::SelectedWindow`) switches to a window recording
+    ///   with no crop, mirroring `interactive_region`'s own two-tail split;
+    ///   Cancelled/Unavailable end the whole `StartRecording` call with the
+    ///   same message `Screenshot` would give.
+    async fn resolve_record_target(
+        &self,
+        options: &crate::cli::RecordOptions,
+    ) -> Result<
+        (
+            crate::capture::screencast::CastTarget,
+            Option<crate::capture::PixelRect>,
+        ),
+        String,
+    > {
+        use crate::capture::screencast::CastTarget;
+        use crate::capture::{logical_to_pixel_rect, output_for_region, LogicalRect};
+        use crate::cli::RecordKind;
+
+        match options.kind {
+            RecordKind::Fullscreen => {
+                let connector = run_blocking(|| {
+                    let backend = crate::capture::screencopy::ScreencopyBackend::new();
+                    backend
+                        .focused_output()
+                        .map(|output| output.name)
+                        .map_err(|err| err.to_string())
+                })
+                .await?;
+                Ok((CastTarget::Monitor { connector }, None))
+            }
+            RecordKind::Window => {
+                let window = match options.window_id {
+                    Some(id) => crate::capture::WindowRef(id),
+                    None => {
+                        run_blocking(|| {
+                            let backend = crate::capture::screencopy::ScreencopyBackend::new();
+                            backend
+                                .focused_window()
+                                .map_err(|err| err.to_string())?
+                                .ok_or_else(|| {
+                                    "no window is currently focused — pass --window-id, or focus a \
+                                 window first"
+                                        .to_string()
+                                })
+                        })
+                        .await?
+                    }
+                };
+                Ok((CastTarget::Window { id: window.0 }, None))
+            }
+            RecordKind::Region => {
+                if let Some(geometry) = options.geometry {
+                    let region = LogicalRect {
+                        x: geometry.x,
+                        y: geometry.y,
+                        width: geometry.width,
+                        height: geometry.height,
+                    };
+                    let outputs = run_blocking(|| {
+                        let backend = crate::capture::screencopy::ScreencopyBackend::new();
+                        backend.outputs().map_err(|err| err.to_string())
+                    })
+                    .await?;
+                    let output = output_for_region(&outputs, region)
+                        .ok_or_else(|| {
+                            "the requested region does not overlap any output — check --geometry"
+                                .to_string()
+                        })?
+                        .clone();
+                    let rect = logical_to_pixel_rect(region, &output).ok_or_else(|| {
+                        "the requested region does not overlap any output — check --geometry"
+                            .to_string()
+                    })?;
+                    return Ok((
+                        CastTarget::Monitor {
+                            connector: output.name,
+                        },
+                        Some(rect),
+                    ));
+                }
+
+                match self.begin_interactive_region(options.cursor).await? {
+                    (output, RegionOutcome::Selected(region)) => {
+                        let rect = logical_to_pixel_rect(region, &output).ok_or_else(|| {
+                            "the selected region does not overlap any output".to_string()
+                        })?;
+                        Ok((
+                            CastTarget::Monitor {
+                                connector: output.name,
+                            },
+                            Some(rect),
+                        ))
+                    }
+                    (_, RegionOutcome::SelectedWindow(window)) => {
+                        Ok((CastTarget::Window { id: window.0 }, None))
+                    }
+                    (_, RegionOutcome::Cancelled) => {
+                        Err("the region selection was cancelled".to_string())
+                    }
+                    (_, RegionOutcome::Unavailable(note)) => Err(note.to_string()),
+                }
+            }
+        }
+    }
+
+    /// Maps the selection overlay over a frozen frame of the focused output
+    /// and waits for the user, **for a recording** — the region-recording
+    /// twin of [`Self::interactive_region`]'s own step 1/2/3, kept separate
+    /// rather than shared because the two callers diverge in what they do
+    /// with the *frame* afterwards (a screenshot crops and saves it; a
+    /// recording discards it — the frame only ever existed so the overlay had
+    /// something to show behind the selection rectangle, and the actual
+    /// recording is a fresh, independent screencast of whatever the user
+    /// picked) and in what options type each has in scope
+    /// (`CaptureOptions` vs. `RecordOptions`, which is also why this takes a
+    /// bare `cursor: bool` rather than either options struct — the one field
+    /// both freeze and this call actually need).
+    ///
+    /// Returns the [`crate::capture::OutputInfo`] the frame came from
+    /// alongside the outcome, since a confirmed [`RegionOutcome::Selected`]
+    /// needs it for [`crate::capture::logical_to_pixel_rect`] and the caller
+    /// has no other way to get it back.
+    async fn begin_interactive_region(
+        &self,
+        cursor: bool,
+    ) -> Result<(crate::capture::OutputInfo, RegionOutcome), String> {
+        use iced::futures::StreamExt;
+
+        let (frame, output) = run_blocking(move || {
+            let backend = crate::capture::screencopy::ScreencopyBackend::new();
+            let output = backend.focused_output().map_err(|err| err.to_string())?;
+            let frame = backend
+                .capture_output(&output.name, cursor)
+                .map_err(|err| err.to_string())?;
+            Ok((frame, output))
+        })
+        .await?;
+
+        // Best-effort, same degrade-to-"nothing focused" posture
+        // `interactive_region`'s own step 1b documents.
+        let focused_window = run_blocking(|| {
+            let backend = crate::capture::screencopy::ScreencopyBackend::new();
+            Ok::<_, String>(backend.focused_window().ok().flatten())
+        })
+        .await
+        .unwrap_or(None);
+
+        let handle = iced::widget::image::Handle::from_rgba(
+            frame.width(),
+            frame.height(),
+            frame.pixels().to_vec(),
+        );
+        let (reply, mut replies) = iced::futures::channel::mpsc::channel::<RegionOutcome>(1);
+        self.events
+            .clone()
+            .try_send(DaemonEvent::BeginRegion {
+                frame: handle,
+                output: output.clone(),
+                focused_window,
+                reply,
+            })
+            .map_err(|_| {
+                "could not reach the daemon's overlay (its event loop is busy or gone)".to_string()
+            })?;
+
+        let outcome = replies.next().await.unwrap_or(RegionOutcome::Cancelled);
+        Ok((output, outcome))
+    }
+
+    /// **Stage 13.** Turn `options.audio` into the concrete pulse sources
+    /// this recording will open — or into nothing, plus a warning.
+    ///
+    /// Three things worth knowing before changing this:
+    ///
+    /// - **It cannot fail.** PLAN.md Stage 13 task 3 fixes the shape: a
+    ///   missing device degrades the recording to video-only, never ends it.
+    ///   So this returns a plan, not a `Result`, and the only branch its
+    ///   caller takes is "is there a spec".
+    /// - **The enumeration is blocking** (two `ffmpeg -sources/-sinks pulse`
+    ///   spawns, ~85 ms each), so it runs through [`run_blocking`] like every
+    ///   other world-touching step in `spin_up`. A `run_blocking` failure is
+    ///   itself degraded rather than propagated — an audio device list is not
+    ///   worth failing a recording over.
+    /// - **The warning is a toast, not an `Error` signal.** The
+    ///   `io.saola.Capture1` signal set is the frozen saola-notifications
+    ///   contract (CLAUDE.md Boundaries) and `Error` means "the recording
+    ///   failed"; this recording did not. The consequence, recorded honestly:
+    ///   a `record start --audio mic` typed in a terminal prints nothing
+    ///   about the degradation — it reaches the user as the toast and the
+    ///   daemon log only, because `StartRecording` has no reply value to
+    ///   carry it in.
+    async fn resolve_audio(&self, options: &crate::cli::RecordOptions) -> crate::audio::AudioPlan {
+        use crate::audio::{plan_audio, query_devices, AudioOverrides, AudioPlan};
+        use crate::config::AudioSource;
+
+        let Some(request) = options.audio else {
+            return AudioPlan::silent();
+        };
+
+        // `mic` has no use for the sink list, and skipping it saves a whole
+        // process spawn on the most common audio request.
+        let want_sinks = matches!(request, AudioSource::System | AudioSource::Both);
+        let devices = run_blocking(move || Ok(query_devices(true, want_sinks)))
+            .await
+            .unwrap_or_default();
+
+        let overrides = AudioOverrides {
+            mic_source: options.audio_mic_source.clone(),
+            system_source: options.audio_system_source.clone(),
+        };
+        let plan = plan_audio(request, &devices, &overrides, options.audio_offset);
+
+        if let Some(warning) = plan.warning() {
+            eprintln!("saola-capture: daemon: audio: {warning}");
+            // Two different headlines for two different outcomes: the
+            // recording lost its audio entirely, or it is recording something
+            // other than exactly what was asked for (half of `--audio both`,
+            // a fallen-back device override). Severity is carried by the
+            // wording, never by colour (CLAUDE.md's Design language).
+            let title = if plan.spec.is_some() {
+                "Recording with different audio"
+            } else {
+                "Recording without audio"
+            };
+            if self
+                .events
+                .clone()
+                .try_send(DaemonEvent::Warning {
+                    title: title.to_string(),
+                    body: warning,
+                })
+                .is_err()
+            {
+                eprintln!(
+                    "saola-capture: daemon: could not raise the audio warning toast (channel \
+                     full or the daemon's event loop is gone) — recording anyway"
+                );
+            }
+        }
+        plan
+    }
+
     /// Everything between "a `StartRecording` was accepted" and "frames are
     /// flowing into an encoder" — **Stage 11**.
     ///
@@ -631,10 +937,8 @@ impl CaptureService {
     /// 1. **ffmpeg first.** Cheapest check, and the one thing that should
     ///    never leave a screencast session open behind it (PLAN.md Stage 11
     ///    task 2: "missing-ffmpeg detected up front").
-    /// 2. **Which monitor?** Resolved through the *same* `CaptureBackend` a
-    ///    screenshot uses, so "which output does a bare `record start` mean?"
-    ///    has one answer in this codebase rather than two that can drift —
-    ///    the same reasoning `main.rs::run_record_dry_run` already applies.
+    /// 2. **Which target?** — **Stage 12**: [`Self::resolve_record_target`],
+    ///    which also decides whether the recording gets a crop.
     /// 3. **The cast**, then the PipeWire stream (Stage 10's
     ///    `CastSession::open` → `PipeWireStream::connect`).
     /// 4. **The first frame** — see [`await_first_frame`].
@@ -651,28 +955,29 @@ impl CaptureService {
         connection: &Connection,
         options: &crate::cli::RecordOptions,
     ) -> Result<StartedRecording, String> {
-        use crate::capture::screencast::{CastSession, CastTarget, CursorMode, PipeWireStream};
+        use crate::capture::screencast::{CastSession, CursorMode, PipeWireStream};
         use crate::encode::{ffmpeg_cli, EncodePreset, NegotiatedGuard, RecordSpec, VideoSpec};
 
         // 1.
         ffmpeg_cli::ensure_ffmpeg_available().map_err(|err| err.to_string())?;
 
-        // 2.
-        let connector = run_blocking(|| {
-            let backend = crate::capture::screencopy::ScreencopyBackend::new();
-            backend
-                .focused_output()
-                .map(|output| output.name)
-                .map_err(|err| err.to_string())
-        })
-        .await?;
+        // 2/3. **Stage 12**: which target, and — for a region — which
+        // rectangle of it to encode. See [`Self::resolve_record_target`].
+        let (target, crop) = self.resolve_record_target(options).await?;
 
-        // 3.
-        let target = CastTarget::Monitor { connector };
+        // 3b. **Stage 13**: which audio devices, if any.
+        //
+        // *After* the target (an interactive region selection can sit on the
+        // overlay for minutes, and a device snapshot taken before it would be
+        // that stale) and *before* the cast — so a machine with no microphone
+        // costs nothing but a warning, with no screencast session to unwind.
+        let audio = self.resolve_audio(options).await;
+
         let cursor = CursorMode::from_cursor_option(options.cursor);
         eprintln!(
-            "saola-capture: daemon: recording {target} (cursor {cursor:?}, preset {})",
-            options.preset
+            "saola-capture: daemon: recording {target} (cursor {cursor:?}, preset {}, {})",
+            options.preset,
+            audio.summary()
         );
         let session = CastSession::open(connection, &target, cursor)
             .await
@@ -712,18 +1017,33 @@ impl CaptureService {
 
         // 5.
         let preset = EncodePreset::from_config(options.preset);
-        let video = VideoSpec::from_negotiated(&format);
+        let video = match crop {
+            // **Stage 12.** `crop` was computed against the *screenshot*
+            // backend's own `OutputInfo.physical_width/height`
+            // (`logical_to_pixel_rect`, already clamped there) — not
+            // re-clamped a second time against `format`'s negotiated size.
+            // Every live measurement so far (Stage 10/11) has a `Monitor`
+            // cast's negotiated frame match the output's own physical size
+            // exactly, so this is expected to agree in practice; if a future
+            // machine's cast ever negotiates something else, ffmpeg's own
+            // `crop` filter refuses out-of-bounds geometry with a clear
+            // stderr line (surfaced via `EncodeError::Died`'s tail) rather
+            // than silently corrupting the frame.
+            Some(rect) => VideoSpec::from_negotiated(&format).with_crop(rect),
+            None => VideoSpec::from_negotiated(&format),
+        };
         let vaapi_device = options.vaapi_device.clone();
 
         let guard = NegotiatedGuard::new(video.clone());
         let output_dir = options.output_dir.clone();
+        let audio_spec = audio.spec.clone();
         let sink = run_blocking(move || {
             let path =
                 crate::storage::allocate_recording_path(output_dir.as_deref(), preset.extension())
                     .map_err(|err| err.to_string())?;
             let spec = RecordSpec {
                 video,
-                audio: None,
+                audio: audio_spec,
                 preset,
                 path,
             };
@@ -733,15 +1053,20 @@ impl CaptureService {
                 ffmpeg_cli::FfmpegSink::start(&spec, choice).map_err(|err| err.to_string())?;
             // The frame that was waited for in step 4 is the recording's
             // first frame, not a probe — dropping it would both lose a frame
-            // and start ffmpeg's wallclock on nothing.
+            // and start ffmpeg's wallclock on nothing. **Stage 13** hands it
+            // back afterwards rather than dropping it, so the pump can seal
+            // the recording with it (`StartedRecording::first_frame`).
             crate::encode::EncoderSink::write_video(&mut sink, &first_frame.bytes)
                 .map_err(|err| err.to_string())?;
-            Ok(Box::new(sink) as Box<dyn crate::encode::EncoderSink>)
+            Ok((
+                Box::new(sink) as Box<dyn crate::encode::EncoderSink>,
+                first_frame,
+            ))
         })
         .await;
 
-        let sink = match sink {
-            Ok(sink) => sink,
+        let (sink, first_frame) = match sink {
+            Ok(pair) => pair,
             Err(why) => {
                 stream.stop();
                 session.close().await;
@@ -759,6 +1084,7 @@ impl CaptureService {
             stream,
             sink,
             guard,
+            first_frame,
         })
     }
 
@@ -801,6 +1127,7 @@ impl CaptureService {
             stream,
             mut sink,
             guard,
+            first_frame,
         } = started;
         let recorder = Arc::clone(&self.recorder);
         let events = self.events.clone();
@@ -815,6 +1142,7 @@ impl CaptureService {
                 &stop,
                 &pump_written,
                 &guard,
+                Some(first_frame),
             );
             // Read the producer's drop counter *before* tearing the stream
             // down, while it still exists.
@@ -889,19 +1217,36 @@ impl CaptureService {
                 }
             }
 
-            if let Err(message) = &result {
-                eprintln!("saola-capture: daemon: recording failed: {message}");
-                if events
-                    .clone()
-                    .try_send(DaemonEvent::RecordingFailed {
-                        message: message.clone(),
-                    })
-                    .is_err()
-                {
-                    eprintln!(
-                        "saola-capture: daemon: could not raise a toast for the failed recording \
-                         (channel full or the daemon's event loop is gone)"
-                    );
+            match &result {
+                Err(message) => {
+                    eprintln!("saola-capture: daemon: recording failed: {message}");
+                    if events
+                        .clone()
+                        .try_send(DaemonEvent::RecordingFailed {
+                            message: message.clone(),
+                        })
+                        .is_err()
+                    {
+                        eprintln!(
+                            "saola-capture: daemon: could not raise a toast for the failed \
+                             recording (channel full or the daemon's event loop is gone)"
+                        );
+                    }
+                }
+                // **Stage 12.** The finish toast — task 3's success half of
+                // what Stage 11 only built the failure half of.
+                Ok(path) => {
+                    if events
+                        .clone()
+                        .try_send(DaemonEvent::RecordingFinished { path: path.clone() })
+                        .is_err()
+                    {
+                        eprintln!(
+                            "saola-capture: daemon: could not raise a toast for the finished \
+                             recording (channel full or the daemon's event loop is gone) — \
+                             {path} is still saved"
+                        );
+                    }
                 }
             }
 
@@ -1086,16 +1431,6 @@ impl CaptureService {
         let options = crate::cli::RecordOptions::from_dbus_options(&kind, &options)
             .map_err(|err| zbus::fdo::Error::InvalidArgs(err.to_string()))?;
 
-        // Refused rather than silently dropped: a script that asked to record
-        // its microphone must learn it didn't, not discover it on playback.
-        // (Same posture `cli.rs` takes for `--window-id` without `--dry-run`.)
-        if options.audio.is_some() {
-            return Err(zbus::fdo::Error::NotSupported(
-                "audio recording lands in Stage 13 — start the recording without --audio"
-                    .to_string(),
-            ));
-        }
-
         // Checked before anything is claimed: `spawn_blocking`/`spawn` need a
         // runtime, and (per the no-panic rule) that is asked rather than
         // assumed — the same `Handle::try_current()` guard `run_blocking`
@@ -1183,71 +1518,16 @@ impl CaptureService {
     /// `Screenshot`'s interactive region already established, and for the same
     /// reason it is safe: zbus dispatches each call on its own task, so
     /// nothing else on the bus waits with it.
+    ///
+    /// **Stage 12**: the body itself moved to the free function
+    /// [`stop_recording_now`], which the tray's "Stop recording" menu click
+    /// also calls — see that function's doc comment for why sharing it (not
+    /// a menu-only shortcut) matters.
     async fn stop_recording(&self) -> zbus::fdo::Result<String> {
         eprintln!("saola-capture: daemon: StopRecording()");
-
-        use crate::modules::recorder::StopOutcome;
-
-        // The lock is held across *both* writes — registering the waiter and
-        // setting the stop flag — which is what stops the supervisor from
-        // finishing in between and concluding nobody was listening. See
-        // `ActiveRecording::waiter`.
-        let waiting = {
-            let mut state = lock_recorder(&self.recorder);
-            match state.request_stop() {
-                // "nothing is recording" is a much better answer when it can
-                // also say *why* there is nothing recording — a recording that
-                // died thirty seconds ago is the case where a user presses the
-                // stop keybind and deserves the real reason, not a shrug.
-                Err(err) => {
-                    let message = match state.last_error() {
-                        Some(last) => format!("{err} (the last recording ended: {last})"),
-                        None => err.to_string(),
-                    };
-                    return Err(zbus::fdo::Error::Failed(message));
-                }
-                Ok(StopOutcome::QueuedDuringStart) => {
-                    // Honest: the stop was accepted, but there is no path to
-                    // return, because nothing was ever recorded. The start
-                    // sequence will see `StopImmediately` and unwind.
-                    return Err(zbus::fdo::Error::Failed(
-                        "the recording had not finished starting — it has been cancelled, and \
-                         nothing was saved"
-                            .to_string(),
-                    ));
-                }
-                Ok(StopOutcome::Stopping) => match state.active_mut() {
-                    Some(active) => {
-                        let (sender, receiver) = iced::futures::channel::oneshot::channel();
-                        active.waiter = Some(sender);
-                        active.stop.store(true, Ordering::Release);
-                        receiver
-                    }
-                    // `Recording` with no handle is not reachable (the handle
-                    // is stored by the same transition that enters the
-                    // phase), but leaving the machine parked in `Stopping`
-                    // with nothing to stop would wedge every later start — so
-                    // it is reset rather than assumed away.
-                    None => {
-                        state.finished(Err("the recording had no live handle".to_string()));
-                        return Err(zbus::fdo::Error::Failed(
-                            "the recording had no live handle — the recorder has been reset"
-                                .to_string(),
-                        ));
-                    }
-                },
-            }
-        };
-
-        match waiting.await {
-            Ok(Ok(path)) => Ok(path),
-            Ok(Err(why)) => Err(zbus::fdo::Error::Failed(why)),
-            // The supervisor dropped the sender without answering — only
-            // possible if the daemon is tearing down around us.
-            Err(_) => Err(zbus::fdo::Error::Failed(
-                "the recorder stopped without reporting a result".to_string(),
-            )),
-        }
+        stop_recording_now(&self.recorder)
+            .await
+            .map_err(zbus::fdo::Error::Failed)
     }
 
     /// `Recording b` — read-only, true while anything is starting, recording
@@ -1332,6 +1612,81 @@ impl CaptureService {
     async fn error(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
 }
 
+/// Stop the live recording and wait for its saved path.
+///
+/// **Stage 12**: pulled out of [`CaptureService::stop_recording`] into a free
+/// function so [`modules::tray`](crate::modules::tray)'s "Stop recording"
+/// menu click can call the exact same sequence — registering the waiter and
+/// setting the stop flag under one lock, then awaiting the supervisor's
+/// answer — rather than a menu-only shortcut that raced
+/// [`ActiveRecording::waiter`]'s "exactly one finalization site" contract
+/// differently. `CaptureService::stop_recording` is now a two-line wrapper
+/// that turns this function's `Result<String, String>` into the
+/// `zbus::fdo::Result` a served method needs.
+pub(crate) async fn stop_recording_now(recorder: &SharedRecorder) -> Result<String, String> {
+    use crate::modules::recorder::StopOutcome;
+
+    // The lock is held across *both* writes — registering the waiter and
+    // setting the stop flag — which is what stops the supervisor from
+    // finishing in between and concluding nobody was listening. See
+    // `ActiveRecording::waiter`.
+    let waiting = {
+        let mut state = lock_recorder(recorder);
+        match state.request_stop() {
+            // "nothing is recording" is a much better answer when it can
+            // also say *why* there is nothing recording — a recording that
+            // died thirty seconds ago is the case where a user presses the
+            // stop keybind (or the tray's menu item) and deserves the real
+            // reason, not a shrug.
+            Err(err) => {
+                let message = match state.last_error() {
+                    Some(last) => format!("{err} (the last recording ended: {last})"),
+                    None => err.to_string(),
+                };
+                return Err(message);
+            }
+            Ok(StopOutcome::QueuedDuringStart) => {
+                // Honest: the stop was accepted, but there is no path to
+                // return, because nothing was ever recorded. The start
+                // sequence will see `StopImmediately` and unwind.
+                return Err(
+                    "the recording had not finished starting — it has been cancelled, and \
+                     nothing was saved"
+                        .to_string(),
+                );
+            }
+            Ok(StopOutcome::Stopping) => match state.active_mut() {
+                Some(active) => {
+                    let (sender, receiver) = iced::futures::channel::oneshot::channel();
+                    active.waiter = Some(sender);
+                    active.stop.store(true, Ordering::Release);
+                    receiver
+                }
+                // `Recording` with no handle is not reachable (the handle is
+                // stored by the same transition that enters the phase), but
+                // leaving the machine parked in `Stopping` with nothing to
+                // stop would wedge every later start — so it is reset rather
+                // than assumed away.
+                None => {
+                    state.finished(Err("the recording had no live handle".to_string()));
+                    return Err(
+                        "the recording had no live handle — the recorder has been reset"
+                            .to_string(),
+                    );
+                }
+            },
+        }
+    };
+
+    match waiting.await {
+        Ok(Ok(path)) => Ok(path),
+        Ok(Err(why)) => Err(why),
+        // The supervisor dropped the sender without answering — only
+        // possible if the daemon is tearing down around us.
+        Err(_) => Err("the recorder stopped without reporting a result".to_string()),
+    }
+}
+
 /// What [`serve`] settled into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeOutcome {
@@ -1362,13 +1717,19 @@ pub async fn serve(
     connection: &Connection,
     events: iced::futures::channel::mpsc::Sender<DaemonEvent>,
 ) -> zbus::Result<ServeOutcome> {
+    // **Stage 12**: built here, before `CaptureService` takes ownership of
+    // its own clone, so `modules::tray` can share the exact same recorder
+    // (see [`SharedRecorder`]'s doc comment) rather than the tray icon and
+    // the actual recording state ever being two sources of truth.
+    let recorder = SharedRecorder::default();
+
     connection
         .object_server()
         .at(
             OBJECT_PATH,
             CaptureService {
-                events,
-                recorder: SharedRecorder::default(),
+                events: events.clone(),
+                recorder: recorder.clone(),
             },
         )
         .await?;
@@ -1379,6 +1740,18 @@ pub async fn serve(
 
     match claimed {
         Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {
+            // **Stage 12**: the tray item — a served StatusNotifierItem plus
+            // a best-effort registration-and-retry with whatever watcher is
+            // (or later becomes) reachable. Spawned rather than awaited: SNI
+            // registration is a "nice to have, never a blocker" feature (the
+            // sibling rule — "the panel is the live host; degrade silently
+            // if no host" — CLAUDE.md), so it must not delay `serve` itself
+            // returning and the rest of the daemon coming up.
+            tokio::spawn(crate::modules::tray::install(
+                connection.clone(),
+                recorder,
+                events,
+            ));
             Ok(ServeOutcome::Serving)
         }
         // zbus turns `Exists` into `Err(NameTaken)` before we ever see it
@@ -1551,7 +1924,12 @@ fn spawn_daemon_detached() -> Result<(), ClientError> {
 /// inverse, kept deliberately tiny (one `strip_prefix`) rather than shared
 /// code — the two ends of a D-Bus string argument only need to agree on its
 /// shape, not share a parser to do it.
-fn spawn_window_process(mode: &str) -> Result<(), std::io::Error> {
+///
+/// `pub(crate)` since **Stage 12**: the tray's "Open Saola Capture" menu
+/// item calls this directly with `"main"` — the same thing `OpenWindow`
+/// itself does, so the tray needs no D-Bus round trip to its own daemon to
+/// raise the window.
+pub(crate) fn spawn_window_process(mode: &str) -> Result<(), std::io::Error> {
     let exe = std::env::current_exe()?;
     let mut command = Command::new(exe);
     command.arg("window");

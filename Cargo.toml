@@ -239,6 +239,25 @@ libc = "0.2"
 #   write would mean re-reading and re-serializing the whole history, which is O(n) per
 #   screenshot and loses the crash-safety an append gives for free.
 serde_json = "1"
+# Survey, 2026-08-09 (Stage 12). `modules::tray`'s `com.canonical.dbusmenu` server
+# needs one wire struct — `RawMenuNode`, `(ia{sv}av)` — to match the exact static
+# D-Bus signature `saola-panel::modules::tray::menu::RawMenuNode` (its own,
+# independent declaration of the same protocol, imported nowhere — the two crates
+# don't share source) decodes on the *host* side, which needs `#[derive(Type,
+# Serialize)]` — `Type` from `zbus::zvariant` (already in the tree), `Serialize` from
+# `serde` itself. **Zero net new crates**: `serde 1.0.229` was already in
+# `Cargo.lock`, pulled transitively by both `serde_json` (above) and by `zbus`'s own
+# `zvariant` crate (every `#[derive(zvariant::Type)]` in this codebase — e.g.
+# `config.rs`'s knobs — already depends on `serde::Serialize`/`Deserialize` existing,
+# just not on this crate declaring it *directly* until now). The `derive` feature is
+# the only one enabled, matching `saola-panel/Cargo.toml`'s own `serde = { version =
+# "1", features = ["derive"] }` for the identical dbusmenu use case. Rejected: hand-
+# building the reply as a `zvariant::Value` tree with no derive at all — tried first,
+# and abandoned because a bare `Value`/`OwnedValue` return type's *static* signature
+# (what `#[zbus::interface]` publishes for introspection, and what a typed proxy like
+# the panel's `GetLayout` checks the reply against) is `v` (variant), not
+# `(ia{sv}av)` — the exact mismatch a real dbusmenu client would reject.
+serde = { version = "1", features = ["derive"] }
 # Recording pipeline survey, 2026-08-08 (opened in Stage 1 as a *note only*, **closed
 # and the dependency added in Stage 10**, once Stage 2's shm/dmabuf evidence was in
 # hand and Jordan had installed clang — see CAPTURE-RESEARCH §2.0/D5).
@@ -335,6 +354,51 @@ tokio = { version = "1", default-features = false, features = [
     "signal",
     "time",
 ] }
+# Survey, 2026-08-09 (Stage 15 — the Text tool's raster half). PLAN.md's
+# annotation editor draws every shape twice (`modules::editor`'s own doc
+# comment): an interactive `iced::widget::canvas::Program` (which already
+# gets real text rendering for free — `canvas::Frame::fill_text` goes
+# through iced's own text pipeline) and a hand-rolled software rasterizer
+# that composes the real Save/Copy output. That second half has no font
+# dependency at all as of Stage 14 (every `paint_*` function is geometry
+# only) — placing real, legible text into an RGBA8 buffer needs a font
+# shaping + rasterization library, which this crate did not previously have.
+#
+# **Zero net new crates**: `cosmic-text` was already resolved in
+# `Cargo.lock` at exactly this version (0.15.0), pulled in transitively by
+# `cryoglyph` (`iced_wgpu`'s glyph atlas) — iced's own on-screen text
+# rendering is already built on it. Declaring it directly here, at the same
+# `0.15` line with its own default features (`std`, `swash`, `fontconfig` —
+# identical to what `cryoglyph`'s manifest already requests, verified by
+# reading both `Cargo.toml`s), adds no new crate to the tree, just a direct
+# edge to one that was already being compiled and linked. `swash` is what
+# provides the actual glyph rasterizer (`SwashCache::with_pixels`, used
+# directly by `modules::editor::raster_text`); `fontconfig` is what lets
+# `FontSystem::new()` discover `saola-theme`'s IBM Plex Sans (and fall back
+# to whatever sans-serif *is* installed if it isn't — no crash either way,
+# per the no-panic rule) without this crate hand-rolling font discovery.
+#
+# Options considered:
+# - `cosmic-text` (this pick) — see above. `Buffer::draw`'s per-pixel
+#   callback (`FnMut(i32, i32, u32, u32, Color)`, coverage-as-alpha for a
+#   standard antialiased glyph) is exactly the shape `raster_text`'s
+#   `blend_pixel`-based compositing already expects, so no adapter layer
+#   was needed beyond a coordinate offset for centered text (the step
+#   badge's numeral).
+# - `ab_glyph` — also already in the tree (transitively, via
+#   `sctk-adwaita`'s window-decoration text), but it is a single-font
+#   rasterizer with no text *shaping* (kerning, font fallback, family
+#   lookup by name) — every one of those is needed here (an arbitrary
+#   caption typed into the Text tool, rendered in the theme's actual named
+#   family), and `cosmic-text` already wraps `ab_glyph`-class rasterization
+#   underneath its shaping layer, so reaching for the lower-level crate
+#   directly would mean re-implementing shaping this crate gets for free.
+# - `rusttype`/`fontdue` — neither is in the tree at all (a genuine new
+#   crate each), and neither does system font *discovery* (finding "IBM
+#   Plex Sans" by family name the way `fontconfig` does) — this app has no
+#   bundled font file to hand either one a path to, so system discovery is
+#   load-bearing, not a nice-to-have.
+cosmic-text = "0.15"
 
 # Teaching note, 2026-08-08 (found while debugging a "4-second screenshot"):
 # why dependencies are optimized even in dev builds.

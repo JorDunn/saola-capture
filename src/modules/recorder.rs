@@ -340,6 +340,10 @@ impl PumpOutcome {
 ///
 /// `guard` is what makes a mid-stream format change fatal instead of silently
 /// corrupting — see [`NegotiatedGuard`].
+///
+/// `seed` is the frame `dbus::CaptureService::spin_up` already wrote before
+/// this loop started — see [`seal_last_frame`] for the only thing this
+/// function does with it.
 pub fn pump_frames(
     frames: &Receiver<VideoFrame>,
     control: &Receiver<CastControl>,
@@ -347,6 +351,59 @@ pub fn pump_frames(
     stop: &AtomicBool,
     written: &AtomicU64,
     guard: &NegotiatedGuard,
+    seed: Option<VideoFrame>,
+) -> PumpOutcome {
+    let mut last = seed;
+    let outcome = pump_until_done(frames, control, sink, stop, written, guard, &mut last);
+    if outcome.is_clean() {
+        seal_last_frame(sink, last.as_ref());
+    }
+    outcome
+}
+
+/// Re-write the most recent frame, once, as the recording ends.
+///
+/// # Why a duplicate frame is the correct end of a recording
+///
+/// A niri cast is **damage-driven**: a screen nobody is touching produces one
+/// frame and then nothing (CAPTURE-RESEARCH D8). Since every timestamp comes
+/// from *when bytes reach ffmpeg's stdin*, the video stream then ends at the
+/// last change rather than at the stop — so a 60-second recording of a still
+/// screen was a **0.04-second file**. Writing the last frame again at stop
+/// time stamps it "now", which is what makes the video's length the
+/// recording's length.
+///
+/// **Stage 13 made this load-bearing rather than cosmetic**: `-shortest` (which
+/// an infinite `-f pulse` input *requires*, §4.3) ends the output when the
+/// shortest stream ends, so a video that stopped early truncated the audio
+/// with it. Measured live before the fix: a 7.1 s recording of an idle screen
+/// with `--audio system` produced 0.048 s of video **and 0.048 s of audio**.
+///
+/// Failure here is logged, never fatal: the recording is already over and
+/// everything before this frame is already encoded.
+fn seal_last_frame(sink: &mut dyn EncoderSink, last: Option<&VideoFrame>) {
+    let Some(frame) = last else {
+        return;
+    };
+    if let Err(err) = sink.write_video(&frame.bytes) {
+        eprintln!(
+            "saola-capture: recorder: could not write the closing frame ({err}) — the recording \
+             is saved, but its video may be shorter than its audio"
+        );
+    }
+}
+
+/// The loop proper. Split out of [`pump_frames`] so the closing frame has
+/// exactly one place to be written, rather than one per `return`.
+#[allow(clippy::too_many_arguments)]
+fn pump_until_done(
+    frames: &Receiver<VideoFrame>,
+    control: &Receiver<CastControl>,
+    sink: &mut dyn EncoderSink,
+    stop: &AtomicBool,
+    written: &AtomicU64,
+    guard: &NegotiatedGuard,
+    last: &mut Option<VideoFrame>,
 ) -> PumpOutcome {
     let mut last_health = Instant::now();
 
@@ -389,6 +446,10 @@ pub fn pump_frames(
                     return PumpOutcome::EncoderFailed(err.to_string());
                 }
                 written.fetch_add(1, Ordering::Relaxed);
+                // Kept — not copied — so the recording can be sealed with it
+                // (`seal_last_frame`). The previous one is dropped here, so
+                // this holds exactly one frame's worth of memory at a time.
+                *last = Some(frame);
                 last_health = Instant::now();
             }
             // Not a failure — see [`POLL_INTERVAL`] and CAPTURE-RESEARCH D8.
@@ -694,13 +755,101 @@ mod tests {
                 &stop,
                 &written,
                 &guard_for(8, 4),
+                None,
             );
             assert_eq!(outcome, PumpOutcome::StopRequested);
         });
 
-        assert_eq!(sink.frames, vec![8 * 4 * 4; 4]);
+        // Four frames, plus the closing duplicate of the last one — see
+        // `seal_last_frame`. `written` counts what the *cast* produced, so
+        // the seal is deliberately not in it.
+        assert_eq!(sink.frames, vec![8 * 4 * 4; 5]);
         assert_eq!(written.load(Ordering::Relaxed), 4);
         assert!(PumpOutcome::StopRequested.is_clean());
+    }
+
+    // -- Stage 13: the closing frame -----------------------------------
+
+    /// The live failure this fixes: a still screen produces exactly one frame
+    /// (in `spin_up`, before the pump exists), so without a closing frame the
+    /// video stream ends at 0.04 s — and with `-shortest` that truncated the
+    /// **audio** to 0.04 s as well, whatever the recording's real length.
+    #[test]
+    fn a_recording_that_never_saw_a_second_frame_is_still_sealed() {
+        let (_frames_tx, frames_rx) = channel::<VideoFrame>();
+        let (_control_tx, control_rx) = channel();
+        let stop = AtomicBool::new(true);
+        let written = AtomicU64::new(0);
+        let mut sink = FakeSink::new();
+
+        let outcome = pump_frames(
+            &frames_rx,
+            &control_rx,
+            &mut sink,
+            &stop,
+            &written,
+            &guard_for(4, 4),
+            Some(frame(4, 4, 0)),
+        );
+
+        assert_eq!(outcome, PumpOutcome::StopRequested);
+        assert_eq!(
+            sink.frames,
+            vec![4 * 4 * 4],
+            "the seed frame is re-written once, at the stop"
+        );
+        assert_eq!(
+            written.load(Ordering::Relaxed),
+            0,
+            "no frame arrived from the cast"
+        );
+    }
+
+    /// An *unclean* end is not sealed: the encoder is already gone (or the
+    /// cast collapsed), so one more write would at best fail and at worst
+    /// append a frame to a recording that ended abnormally seconds earlier.
+    #[test]
+    fn an_unclean_end_is_not_sealed() {
+        let (frames_tx, frames_rx) = channel();
+        let (_control_tx, control_rx) = channel();
+        for sequence in 0..5 {
+            frames_tx.send(frame(4, 4, sequence)).unwrap();
+        }
+
+        let mut sink = FakeSink::failing_after(2);
+        let outcome = pump_frames(
+            &frames_rx,
+            &control_rx,
+            &mut sink,
+            &AtomicBool::new(false),
+            &AtomicU64::new(0),
+            &guard_for(4, 4),
+            Some(frame(4, 4, 99)),
+        );
+
+        assert!(!outcome.is_clean());
+        assert_eq!(sink.frames.len(), 2, "no closing frame after a failure");
+    }
+
+    /// A failing seal is a logged note, not a failed recording — everything
+    /// before it is already encoded and on disk.
+    #[test]
+    fn a_failed_closing_frame_does_not_change_the_outcome() {
+        let (_frames_tx, frames_rx) = channel::<VideoFrame>();
+        let (_control_tx, control_rx) = channel();
+        let mut sink = FakeSink::failing_after(0);
+
+        let outcome = pump_frames(
+            &frames_rx,
+            &control_rx,
+            &mut sink,
+            &AtomicBool::new(true),
+            &AtomicU64::new(0),
+            &guard_for(4, 4),
+            Some(frame(4, 4, 0)),
+        );
+
+        assert_eq!(outcome, PumpOutcome::StopRequested);
     }
 
     #[test]
@@ -720,6 +869,7 @@ mod tests {
             &AtomicBool::new(false),
             &written,
             &guard_for(4, 4),
+            None,
         );
 
         match outcome {
@@ -747,6 +897,7 @@ mod tests {
             &AtomicBool::new(false),
             &AtomicU64::new(0),
             &guard_for(4, 4),
+            None,
         );
         assert_eq!(outcome, PumpOutcome::StreamEnded);
         assert!(
@@ -773,6 +924,7 @@ mod tests {
             &AtomicBool::new(false),
             &AtomicU64::new(0),
             &guard_for(4, 4),
+            None,
         );
         assert_eq!(
             outcome,
@@ -810,6 +962,7 @@ mod tests {
                 &stop,
                 &written,
                 &guard_for(4, 4),
+                None,
             );
             assert_eq!(outcome, PumpOutcome::StopRequested);
         });
@@ -833,6 +986,7 @@ mod tests {
             &AtomicBool::new(false),
             &AtomicU64::new(0),
             &guard_for(4, 4),
+            None,
         );
         assert_eq!(outcome, PumpOutcome::StreamEnded);
     }
@@ -863,6 +1017,7 @@ mod tests {
             &AtomicBool::new(false),
             &AtomicU64::new(0),
             &guard_for(2560, 1600),
+            None,
         );
         match outcome {
             PumpOutcome::StreamError(why) => {
@@ -902,6 +1057,7 @@ mod tests {
             &AtomicBool::new(false),
             &written,
             &guard_for(64, 32),
+            None,
         );
         assert_eq!(outcome, PumpOutcome::StreamEnded);
         assert_eq!(written.load(Ordering::Relaxed), 1);
@@ -968,6 +1124,7 @@ mod tests {
             &stop,
             &written,
             &guard_for(64, 64),
+            None,
         );
         let (total, longest_offer) = producer.join().expect("the producer thread finished");
 

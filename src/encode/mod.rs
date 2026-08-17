@@ -58,6 +58,44 @@ pub const VIDEO_BITRATE: &str = "20M";
 /// [`filter_chain`]).
 pub const AV1_SOFTWARE_FPS_CAP: u32 = 30;
 
+/// The **time base** of the rawvideo input, in ticks per second, expressed
+/// the only way ffmpeg's rawvideo demuxer lets you express it: as a nominal
+/// `-framerate`.
+///
+/// # This is not a frame rate, and getting that wrong is the §4.2 bug
+///
+/// CAPTURE-RESEARCH §4.2 measured that feeding `-framerate 60` *alone*
+/// fast-forwards a variable-rate cast 3×, and D6 concluded "no frame rate in
+/// [`VideoSpec`]". That conclusion is about **where timestamps come from** —
+/// which is still, exclusively, `-use_wallclock_as_timestamps 1`. What this
+/// constant sets is the *resolution those timestamps are stored at*: the
+/// rawvideo demuxer's stream time base is `1/framerate`, and ffmpeg rescales
+/// each wallclock timestamp into it.
+///
+/// **Stage 13 found the consequence of leaving it at the default.** With no
+/// `-framerate` the demuxer defaults to 25, so every frame's PTS was snapped
+/// to a **40 ms grid** — and `-fps_mode:v vfr` then discards frames that land
+/// in a slot already taken. Measured live (transcripts in the Stage 13
+/// handoff): a 60 fps source through the exact Stage 11 command line came out
+/// as **24.8 fps, 137 frames**; with `-framerate 1000` the same source came
+/// out as **66.2 fps, 360 frames**, PTS on a 1 ms grid, duration and
+/// keyframe interval unchanged. Every recording this project made before
+/// Stage 13 was therefore effectively 25 fps with motion quantised to 40 ms.
+///
+/// 1000 rather than something finer: it is exactly Matroska's own default
+/// time base (the output already reports `1k tbn`), so nothing is lost on the
+/// way out, and 1 ms is an order of magnitude finer than a 120 Hz display's
+/// 8.3 ms refresh. It also matters for A/V sync — a 40 ms video grid is
+/// ±20 ms of unfixable error against an audio stream timestamped in
+/// microseconds, which is the same order as the offset [`AudioSpec::itsoffset`]
+/// exists to correct.
+///
+/// One cosmetic cost, seen live: ffmpeg logs
+/// `Stream #0: not enough frames to estimate rate` once per recording at
+/// `warning`, because a declared 1000 fps is not confirmable from the first
+/// few frames. It is a note about the *nominal* rate this crate never uses.
+pub const RAWVIDEO_TIMEBASE_HZ: &str = "1000";
+
 // ---------------------------------------------------------------------
 // Presets — CAPTURE-RESEARCH §3.7's table, as data
 // ---------------------------------------------------------------------
@@ -362,11 +400,37 @@ pub struct VideoSpec {
     /// which is why they are separate concepts here.
     pub width: u32,
     pub height: u32,
+    /// **Stage 12.** A sub-rectangle of the negotiated frame to encode,
+    /// physical pixels, for `record start --region` — CAPTURE-RESEARCH D8:
+    /// there is no `RecordArea`, so a region recording is a full
+    /// [`CastTarget::Monitor`](crate::capture::screencast::CastTarget::Monitor)
+    /// cast cropped in this same `-vf crop` filter that already exists for
+    /// the even-dimension rule, just pointed at a caller-chosen rectangle
+    /// instead of `(0, 0)`. `None` means "the whole (even-cropped) frame" —
+    /// every fullscreen recording, and every window recording (a window
+    /// cast's own negotiated frame already *is* just that window, so it
+    /// never needs a second crop on top).
+    ///
+    /// The rectangle is [`crate::capture::PixelRect`] — the same type
+    /// `capture::logical_to_pixel_rect` produces for a screenshot region —
+    /// reused rather than duplicated, since `encode` already depends on
+    /// `capture::screencast` for [`Self::from_negotiated`].
+    pub crop: Option<crate::capture::PixelRect>,
 }
 
 impl VideoSpec {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height }
+        Self {
+            width,
+            height,
+            crop: None,
+        }
+    }
+
+    /// Builder for the region-recording case — see [`Self::crop`].
+    pub fn with_crop(mut self, crop: crate::capture::PixelRect) -> Self {
+        self.crop = Some(crop);
+        self
     }
 
     /// Straight from Stage 10's negotiated SPA format.
@@ -443,34 +507,39 @@ impl NegotiatedGuard {
     }
 }
 
-/// One audio input. **Nothing in Stage 11 ever constructs this** — it is the
-/// A/V model CAPTURE-RESEARCH §4.4 fixes, written down now so Stage 13 only
-/// has to *resolve* the values rather than re-derive the shape, and so the
-/// argument builder below has always been tested with an audio input present.
+/// The audio half of one recording — **real as of Stage 13** (Stage 11 wrote
+/// the shape; nothing constructed it until now).
 ///
-/// Stage 13's three mandatory mitigations, and where each one lands:
+/// The three mandatory mitigations CAPTURE-RESEARCH §4.4 attaches to the
+/// `-f pulse` transport, and where each one lands:
 ///
-/// 1. *Spawn ffmpeg only after the first video frame* — already true for
+/// 1. *Spawn ffmpeg only after the first video frame* — already true since
 ///    Stage 11 (`dbus::CaptureService`'s start sequence), for an unrelated
-///    reason: `-video_size` needs the negotiated size.
-/// 2. *`-shortest` plus a graceful stop* — `-shortest` is emitted here
-///    whenever audio is present (`-f pulse` is an infinite input and **will**
-///    hang the process otherwise); the graceful stop is
-///    `ffmpeg_cli::FfmpegSink::finish`'s SIGINT escalation, which exists
-///    precisely because closing stdin cannot end an ffmpeg that still has a
-///    live pulse input.
+///    reason: `-video_size` needs the negotiated size. This is also why the
+///    residual offset Stage 13 measured is small enough to ship uncorrected
+///    (see [`crate::audio::DEFAULT_SYNC_OFFSET`]).
+/// 2. *`-shortest` plus a graceful stop* — `-shortest` is emitted by
+///    [`ffmpeg_args`] whenever audio is present (`-f pulse` is an infinite
+///    input and **will** hang the process otherwise); the graceful stop is
+///    `ffmpeg_cli::FfmpegSink::finish`'s SIGINT escalation. Measured live in
+///    Stage 13: with `-shortest`, closing stdin is enough — ffmpeg finalises
+///    and exits without ever reaching the SIGINT.
 /// 3. *Measure the residual offset with the clap test and bake it in* —
 ///    [`Self::itsoffset`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioSpec {
-    /// A PulseAudio (PipeWire pulse shim) source name, resolved from
-    /// `pactl list short sources` at record time — **never hardcoded**, they
-    /// are hardware-path-derived (§4.4).
-    pub source: String,
-    /// `-itsoffset` on the audio input, in seconds. §4.3 measured that both
+    /// One or two PulseAudio (PipeWire pulse shim) source names, resolved at
+    /// record time by [`crate::audio::plan_audio`] — **never hardcoded**,
+    /// they are hardware-path-derived (§4.4).
+    ///
+    /// Two names means `--audio both`, which is **one mixed track, not two
+    /// tracks** — see [`mix_arguments`].
+    pub sources: Vec<String>,
+    /// `-itsoffset` on every audio input, in seconds. §4.3 measured that both
     /// ffmpeg's default normalisation and `-copyts -start_at_zero` silently
     /// discard the real offset between the two inputs, and that `-itsoffset`
-    /// is the one knob that survives normalisation.
+    /// is the one knob that survives normalisation. `None` (the shipped
+    /// default) emits no argument at all.
     pub itsoffset: Option<f64>,
 }
 
@@ -517,9 +586,24 @@ pub struct RecordSpec {
 /// `crop` is first in both, and is a *pointer-adjusting* filter (it changes
 /// width/height and the data offset; it copies nothing), so an already-even
 /// frame pays essentially nothing for a crop that removes zero pixels.
+///
+/// **Stage 12:** when [`VideoSpec::crop`] is `Some`, that rectangle (rounded
+/// down to even width/height, same rule as the no-crop case — `hevc_vaapi`
+/// cares just as much about a region recording's dimensions being even as it
+/// does about a fullscreen one's) replaces the `(0, 0, even_width,
+/// even_height)` default. The offset itself is **not** rounded — `crop`'s `x`/
+/// `y` are a pointer offset, not a dimension libva reasons about chroma
+/// subsampling over, and rounding it would drift the recording off the
+/// selected rectangle by up to a pixel for no benefit.
 pub fn filter_chain(encoder: VideoEncoder, video: &VideoSpec) -> String {
-    let (width, height) = video.even_dimensions();
-    let mut chain = format!("crop={width}:{height}:0:0");
+    let (width, height, x, y) = match video.crop {
+        Some(rect) => (rect.width & !1, rect.height & !1, rect.x, rect.y),
+        None => {
+            let (width, height) = video.even_dimensions();
+            (width, height, 0, 0)
+        }
+    };
+    let mut chain = format!("crop={width}:{height}:{x}:{y}");
     if let Some(cap) = encoder.fps_cap() {
         chain.push_str(&format!(",fps={cap}"));
     }
@@ -529,6 +613,61 @@ pub fn filter_chain(encoder: VideoEncoder, video: &VideoSpec) -> String {
         chain.push_str(",format=yuv420p");
     }
     chain
+}
+
+/// The `amix` parameters `--audio both` mixes its two inputs with.
+///
+/// **One mixed track, not two tracks** — CAPTURE-RESEARCH §4.4's own answer
+/// ("`both` → two `-f pulse` inputs plus `amix`"), and the reasons hold up:
+/// Matroska could carry two tracks, but the `h264` preset's MP4 container is
+/// the *compatibility* preset and track-switching is exactly what its
+/// audience will not do, and every consumer of a screen recording so far
+/// (upload it, send it, scrub it) wants one audible thing. A future stage
+/// that wants separate tracks should add a *third* `--audio` spelling rather
+/// than change what `both` means.
+///
+/// `normalize=0` is the parameter worth arguing about. `amix` defaults to
+/// `normalize=1`, which divides every input by the input count — so adding a
+/// microphone would make the system audio 6 dB quieter than the same
+/// recording without one, which is a surprising thing for adding a microphone
+/// to do. With `normalize=0` each source keeps its own level; the risk is
+/// clipping when both are loud at once, which the user can fix by turning a
+/// source down, while a 6 dB loss is not fixable by anything they can see.
+const AMIX_PARAMS: &str = "duration=longest:normalize=0";
+
+/// The `-filter_complex` graph a two-source recording needs, plus the `-map`
+/// pair that goes with it — `None` for the one-source case, which needs
+/// neither (ffmpeg's automatic stream selection picks the single video and
+/// single audio stream correctly, which is what Stage 11's own tests already
+/// describe).
+///
+/// **The video keeps its plain `-vf` chain even here.** A complex filtergraph
+/// switches ffmpeg's automatic stream selection off, so both output streams
+/// have to be named — but the video is still mapped straight from input 0 and
+/// `-vf` still applies to it, so the hardware chain
+/// ([`filter_chain`]) is byte-identical between a mixed recording and a
+/// video-only one. Verified live in Stage 13 (CAPTURE-RESEARCH §4.5) rather
+/// than assumed, because the failure mode — `-vf` silently ignored — would
+/// send un-cropped, un-uploaded frames at the VAAPI encoder.
+pub fn mix_arguments(audio: &AudioSpec) -> Option<Vec<String>> {
+    if audio.sources.len() < 2 {
+        return None;
+    }
+    // Input 0 is the raw video on stdin, so the audio inputs are 1..=n.
+    let labels: String = (1..=audio.sources.len())
+        .map(|index| format!("[{index}:a]"))
+        .collect();
+    Some(vec![
+        "-filter_complex".to_string(),
+        format!(
+            "{labels}amix=inputs={}:{AMIX_PARAMS}[aout]",
+            audio.sources.len()
+        ),
+        "-map".to_string(),
+        "0:v:0".to_string(),
+        "-map".to_string(),
+        "[aout]".to_string(),
+    ])
 }
 
 /// The complete ffmpeg argv (everything after the program name) for one
@@ -568,26 +707,41 @@ pub fn ffmpeg_args(spec: &RecordSpec, choice: &EncoderChoice, loglevel: &str) ->
     );
     args.push("-video_size".to_string());
     args.push(format!("{}x{}", spec.video.width, spec.video.height));
+    // **Stage 13.** The input *time base*, not a frame rate — read
+    // [`RAWVIDEO_TIMEBASE_HZ`] before touching this pair; the two lines are
+    // only safe together.
+    push(&mut args, &["-framerate", RAWVIDEO_TIMEBASE_HZ]);
     // §4.2: mandatory. Without it a variable-rate cast becomes a
     // fast-forwarded video, silently.
     push(&mut args, &["-use_wallclock_as_timestamps", "1"]);
     push(&mut args, &["-i", "pipe:0"]);
 
-    // -- input 1: audio (Stage 13) ------------------------------------
+    // -- inputs 1..n: audio (Stage 13) --------------------------------
+    // One `-f pulse` input per resolved source — one for `mic`/`system`, two
+    // for `both`. `-itsoffset` is a *per-input* option and so is repeated,
+    // not stated once: both inputs are opened by the same ffmpeg at the same
+    // moment, so the same correction applies to each.
     if let Some(audio) = &spec.audio {
-        if let Some(offset) = audio.itsoffset {
-            args.push("-itsoffset".to_string());
-            args.push(format!("{offset}"));
+        for source in &audio.sources {
+            if let Some(offset) = audio.itsoffset {
+                args.push("-itsoffset".to_string());
+                args.push(format!("{offset}"));
+            }
+            push(&mut args, &["-f", "pulse"]);
+            args.push("-i".to_string());
+            args.push(source.clone());
         }
-        push(&mut args, &["-f", "pulse"]);
-        args.push("-i".to_string());
-        args.push(audio.source.clone());
     }
 
     // -- output -------------------------------------------------------
     if let Some(device) = &choice.vaapi_device {
         args.push("-vaapi_device".to_string());
         args.push(device.to_string_lossy().into_owned());
+    }
+    // The mix graph, if any — before `-vf`/`-map`-less output options, since
+    // it introduces the labels the `-map`s in it refer to.
+    if let Some(mix) = spec.audio.as_ref().and_then(mix_arguments) {
+        args.extend(mix);
     }
     // Stream-qualified (`:v`) rather than §3.7's bare `-fps_mode vfr`: with an
     // audio input present the bare form would also apply to the audio stream,
@@ -1013,6 +1167,49 @@ mod tests {
         assert!(!chain.contains("hwupload"));
     }
 
+    // -- Stage 12: region-recording crop -------------------------------
+
+    #[test]
+    fn a_region_crop_replaces_the_full_frame_crop() {
+        let video = VideoSpec::new(2560, 1600).with_crop(crate::capture::PixelRect {
+            x: 100,
+            y: 200,
+            width: 640,
+            height: 480,
+        });
+        let chain = filter_chain(VideoEncoder::HevcVaapi, &video);
+        assert!(chain.starts_with("crop=640:480:100:200,"), "{chain}");
+    }
+
+    #[test]
+    fn a_region_crop_rounds_its_own_size_to_even_but_not_its_offset() {
+        let video = VideoSpec::new(2560, 1600).with_crop(crate::capture::PixelRect {
+            x: 101,
+            y: 201,
+            width: 641,
+            height: 481,
+        });
+        let chain = filter_chain(VideoEncoder::HevcVaapi, &video);
+        // Size rounds down to even (640x480); the offset is untouched.
+        assert!(chain.starts_with("crop=640:480:101:201,"), "{chain}");
+    }
+
+    #[test]
+    fn with_crop_is_a_no_op_on_frame_len_and_even_dimensions() {
+        // The crop only ever changes the `-vf` filter — `-video_size` still
+        // describes the full negotiated frame on the wire (the whole monitor
+        // is still cast; only the encoder's own view of it narrows).
+        let full = VideoSpec::new(2560, 1600);
+        let cropped = full.clone().with_crop(crate::capture::PixelRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        });
+        assert_eq!(full.frame_len(), cropped.frame_len());
+        assert_eq!(full.even_dimensions(), cropped.even_dimensions());
+    }
+
     // -- the argv -----------------------------------------------------
 
     fn hevc_choice() -> EncoderChoice {
@@ -1038,6 +1235,22 @@ mod tests {
     }
 
     #[test]
+    fn a_region_recording_crops_the_full_negotiated_frame() {
+        // `-video_size` is still the whole monitor (the cast never narrows);
+        // only the `-vf crop` rectangle picks out the selected region.
+        let mut recording = spec(2560, 1600, EncodePreset::Hevc);
+        recording.video = recording.video.with_crop(crate::capture::PixelRect {
+            x: 300,
+            y: 400,
+            width: 800,
+            height: 600,
+        });
+        let line = joined(&ffmpeg_args(&recording, &hevc_choice(), "warning"));
+        assert!(line.contains("-video_size 2560x1600"), "{line}");
+        assert!(line.contains("crop=800:600:300:400"), "{line}");
+    }
+
+    #[test]
     fn the_timing_model_is_on_every_command_line() {
         let args = ffmpeg_args(
             &spec(2560, 1600, EncodePreset::Hevc),
@@ -1047,8 +1260,38 @@ mod tests {
         let line = joined(&args);
         assert!(line.contains("-use_wallclock_as_timestamps 1"), "{line}");
         assert!(line.contains("-fps_mode:v vfr"), "{line}");
-        // §4.2: feeding a fixed input rate is what produced a 3× fast-forward.
-        assert!(!line.contains("-framerate"), "{line}");
+        // **Stage 13.** `-framerate` is present, but only ever as the input
+        // *time base*, and only ever immediately before the wallclock flag
+        // that overrides the timestamps it would otherwise generate — §4.2's
+        // 3× fast-forward is what `-framerate` *without* that flag produces.
+        assert!(
+            line.contains("-framerate 1000 -use_wallclock_as_timestamps 1"),
+            "{line}"
+        );
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "-framerate").count(),
+            1,
+            "the nominal rate belongs to the input and nothing else: {line}"
+        );
+    }
+
+    /// **Stage 13.** The regression this guards is invisible in the file's
+    /// duration and shows up only as jerky motion: with the demuxer's default
+    /// 25 fps time base, every PTS snaps to a 40 ms grid and `-fps_mode vfr`
+    /// throws away whatever lands in a taken slot (measured live: a 60 fps
+    /// source became 24.8 fps).
+    #[test]
+    fn the_rawvideo_input_declares_a_millisecond_time_base() {
+        assert_eq!(RAWVIDEO_TIMEBASE_HZ, "1000");
+        let args = ffmpeg_args(
+            &spec(2560, 1600, EncodePreset::Hevc),
+            &hevc_choice(),
+            "warning",
+        );
+        // …and it applies to the *input*, so it must come before `-i pipe:0`.
+        let rate = args.iter().position(|arg| arg == "-framerate").unwrap();
+        let input = args.iter().position(|arg| arg == "pipe:0").unwrap();
+        assert!(rate < input, "{args:?}");
     }
 
     #[test]
@@ -1101,14 +1344,14 @@ mod tests {
         assert!(line.contains("-f matroska"), "{line}");
     }
 
-    /// Stage 13's shape, exercised now so it cannot rot: the pulse input, its
-    /// calibration offset, the Opus codec, and the `-shortest` that keeps an
-    /// infinite input from hanging the process (§4.3).
+    /// The single-source shape (`--audio mic` or `--audio system`): one pulse
+    /// input, its calibration offset, the Opus codec, and the `-shortest`
+    /// that keeps an infinite input from hanging the process (§4.3).
     #[test]
     fn an_audio_input_lands_in_the_order_ffmpeg_expects() {
         let mut recording = spec(2560, 1600, EncodePreset::Hevc);
         recording.audio = Some(AudioSpec {
-            source: "alsa_output.pci-0000_07_00.6.analog-stereo.monitor".to_string(),
+            sources: vec!["alsa_output.pci-0000_07_00.6.analog-stereo.monitor".to_string()],
             itsoffset: Some(0.12),
         });
         let args = ffmpeg_args(&recording, &hevc_choice(), "warning");
@@ -1124,6 +1367,80 @@ mod tests {
         let last_input = args.iter().rposition(|a| a == "-i").unwrap();
         let vf = args.iter().position(|a| a == "-vf").unwrap();
         assert!(last_input < vf, "{line}");
+
+        // One source needs no filtergraph and no explicit mapping at all.
+        assert!(!line.contains("-filter_complex"), "{line}");
+        assert!(!line.contains("-map"), "{line}");
+    }
+
+    /// **Stage 13.** `--audio both`: two pulse inputs, mixed into one track.
+    #[test]
+    fn two_audio_inputs_are_mixed_into_one_track() {
+        let mut recording = spec(2560, 1600, EncodePreset::Hevc);
+        recording.audio = Some(AudioSpec {
+            sources: vec!["mic.source".to_string(), "sink.monitor".to_string()],
+            itsoffset: None,
+        });
+        let args = ffmpeg_args(&recording, &hevc_choice(), "warning");
+        let line = joined(&args);
+
+        assert!(line.contains("-f pulse -i mic.source"), "{line}");
+        assert!(line.contains("-f pulse -i sink.monitor"), "{line}");
+        assert!(
+            line.contains(
+                "-filter_complex [1:a][2:a]amix=inputs=2:duration=longest:normalize=0[aout]"
+            ),
+            "{line}"
+        );
+        // Automatic stream selection is off once a complex graph exists, so
+        // both output streams are named — and the video is still the *input*
+        // stream with its own `-vf` chain, not a graph output.
+        assert!(line.contains("-map 0:v:0"), "{line}");
+        assert!(line.contains("-map [aout]"), "{line}");
+        assert!(
+            line.contains("-vf crop=2560:1600:0:0,hwupload"),
+            "the hardware chain is unchanged by mixing: {line}"
+        );
+        assert!(line.contains("-c:a libopus"), "{line}");
+        assert!(line.contains("-shortest"), "{line}");
+    }
+
+    /// A per-input option has to be repeated per input — stated once it would
+    /// apply only to the first pulse source and silently desync the other.
+    #[test]
+    fn the_offset_is_repeated_for_every_audio_input() {
+        let mut recording = spec(640, 480, EncodePreset::Hevc);
+        recording.audio = Some(AudioSpec {
+            sources: vec!["a".to_string(), "b".to_string()],
+            itsoffset: Some(-0.05),
+        });
+        let args = ffmpeg_args(&recording, &hevc_choice(), "warning");
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "-itsoffset").count(),
+            2,
+            "{:?}",
+            args
+        );
+        let line = joined(&args);
+        assert!(line.contains("-itsoffset -0.05 -f pulse -i a"), "{line}");
+        assert!(line.contains("-itsoffset -0.05 -f pulse -i b"), "{line}");
+    }
+
+    #[test]
+    fn a_single_source_never_grows_a_mix_graph() {
+        let one = AudioSpec {
+            sources: vec!["only".to_string()],
+            itsoffset: None,
+        };
+        assert_eq!(mix_arguments(&one), None);
+        // Nor does an empty one — unreachable through `audio::plan_audio`
+        // (which returns no spec at all rather than an empty source list),
+        // but the argv builder must not produce `amix=inputs=0` if it ever is.
+        let none = AudioSpec {
+            sources: Vec::new(),
+            itsoffset: None,
+        };
+        assert_eq!(mix_arguments(&none), None);
     }
 
     #[test]

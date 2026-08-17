@@ -68,16 +68,22 @@
 //! the *daemon* tracking window-process liveness, which is more than this
 //! stage's task list asks for.
 //!
-//! # The editor stub (PLAN.md Stage 9, task 3)
+//! # The editor (PLAN.md Stage 9 task 3, made real by Stage 14)
 //!
 //! `window edit <path>` skips the picker entirely and boots straight into
-//! [`ViewState::Editor`]: the same paper-window chrome, the decoded image
-//! (synchronous `image::open` + `to_rgba8` at boot — a screenshot-sized
-//! file decodes in well under a frame, so there's no need for the
-//! lockscreen wallpaper's async-decode dance here), and a one-line note
-//! that the annotation tools land in Stage 14. No canvas, no tool palette,
-//! no save path — [`load_image`] and [`editor_view`] are the whole surface
-//! Stage 14 replaces.
+//! [`ViewState::Editor`]: the same paper-window chrome, plus
+//! `modules::editor::EditorState` — the crop/arrow/rectangle/ellipse/
+//! freehand canvas, undo/redo, and Save/Save As/Copy. This module owns only
+//! the *decoding-failed* fallback (a missing or corrupt file still opens a
+//! window naming the path, per the no-panic rule) and the plumbing that
+//! nests `editor::Message` into this file's own `Message::Editor` and maps
+//! `editor::EditorState::view`'s `Element` the same way every other module
+//! in this crate nests into its owner (`main.rs`'s `Message::Overlay`, this
+//! file's own `Message::WindowOpened`, …). Stage 9's stub (a decoded image
+//! at `ContentFit::Contain` and a "tools land in Stage 14" note, no canvas,
+//! no save path) is what `modules::editor` replaced; see that module's own
+//! doc comment for the canvas architecture, tool-state model, and raster-
+//! composition performance notes.
 //!
 //! # §11 checklist, walked (PLAN.md Stage 9, task 4)
 //!
@@ -110,14 +116,16 @@
 //! 10. Added a colour? No — ink/ivory/terracotta only, `paper_window`'s own
 //!     ink border included.
 //!
-//! **The editor stub** is a strict subset of the same chrome (header +
-//! paper body, no controls at all besides Close), so every item above
-//! applies to it unchanged; it has no button to be the "one terracotta
-//! element", which is fine — §11's rule is "at most one", not "exactly
-//! one on every surface that exists".
+//! **The editor** (`modules::editor`, real as of Stage 14) shares the same
+//! header chrome above; its own body walks §11 independently in that
+//! module's doc comment — its one terracotta element is the Save button,
+//! the live action, matching this window's own Capture/Start Recording
+//! button precedent on the Main tab.
 
 use std::path::{Path, PathBuf};
 
+use iced::futures::channel::mpsc;
+use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::widget::{
     button, column, container, mouse_area, row, rule, scrollable, text, toggler, Space,
 };
@@ -128,6 +136,7 @@ use zbus::Connection;
 use crate::cli::{self, AudioSource, ShotKind};
 use crate::config::{CaptureConfig, ImageFormat, VideoPreset};
 use crate::dbus::Capture1Proxy;
+use crate::modules::editor;
 
 // ---------------------------------------------------------------------
 // Entry point
@@ -160,11 +169,25 @@ pub fn window_mode_from_action(action: Option<&cli::WindowAction>) -> WindowMode
 /// until the window closes (`exit_on_close_request`'s default of `true`
 /// covers both this window's own Close button, via `window::close`, and
 /// niri's native close keybind).
+///
+/// **Stage 14**: the Main tab's fixed, non-resizable footprint (sized by
+/// [`window_height`], a small multiple of `sizes.list_row`) is the wrong
+/// shape for the editor — a screenshot-sized canvas wants real room, and a
+/// user cropping/annotating benefits from being able to enlarge the window.
+/// [`WindowMode::Edit`] therefore picks a different, resizable starting size
+/// ([`editor_window_size`]) instead of reusing the Main tab's; `mode` is
+/// already available here (a plain enum, not yet boxed into the boot
+/// closure), so the branch costs nothing.
 pub fn run(mode: WindowMode) -> iced::Result {
     let theme = Theme::saola();
     let default_font = saola_theme::convert::ui_font(&theme);
-    let width = theme.sizes.popover_width;
-    let height = window_height(&theme);
+    let (size, resizable) = match &mode {
+        WindowMode::Main => (
+            iced::Size::new(theme.sizes.popover_width, window_height(&theme)),
+            false,
+        ),
+        WindowMode::Edit(_) => (editor_window_size(&theme), true),
+    };
 
     iced::application(move || App::boot(mode.clone()), App::update, App::view)
         .title(App::title)
@@ -186,14 +209,29 @@ pub fn run(mode: WindowMode) -> iced::Result {
         // pair here is cheap and untested-but-consistent — see the Stage 9
         // handoff for what live-checking this actually confirmed.
         .transparent(true)
-        .resizable(false)
+        .resizable(resizable)
         .centered()
-        .window_size(iced::Size::new(width, height))
+        .window_size(size)
         .settings(iced::Settings {
             default_font,
             ..iced::Settings::default()
         })
         .run()
+}
+
+/// The editor's own starting window footprint — a second instance of the
+/// same gap [`window_height`]'s own doc comment names ("no style-guide
+/// token sizes a utility window... directly"), derived the same way: real
+/// token multiples, not bare literals. Wide enough to show a mid-size
+/// screenshot at a legible scale alongside its toolbar; tall enough for the
+/// toolbar rows, canvas and footer without immediately needing the resize
+/// this stage also turns on. Not a hard limit — the window is resizable
+/// (see [`run`]), so this is a starting point, not a ceiling.
+fn editor_window_size(theme: &Theme) -> iced::Size {
+    iced::Size::new(
+        theme.sizes.popover_width * 3.0,
+        theme.sizes.window_header * 2.0 + theme.sizes.list_row * 10.0,
+    )
 }
 
 /// No style-guide token sizes a utility window's height directly (§4's
@@ -202,12 +240,44 @@ pub fn run(mode: WindowMode) -> iced::Result {
 /// card_height` derives its own undocumented height: a small multiple of
 /// `sizes.list_row` (roughly one row per control group) plus the header and
 /// generous padding, rather than a bare literal. If the content overflows
-/// this estimate (the Record tab's extra rows, say), [`App::main_view`]
-/// wraps everything in a `scrollable` — this is a starting size, not a hard
-/// clip.
+/// this estimate, [`App::main_view`] wraps everything in a `scrollable` —
+/// this is a starting size, not a hard clip.
+///
+/// **The multiple is 12, not the original 8** (found by screenshotting the
+/// real window, 2026-08-09): the Screenshot tab alone is four labelled
+/// segmented rows plus a toggle plus the Capture button, which already
+/// overflowed 8 rows — the primary action was *cut in half* by the bottom
+/// window edge on first open, with the scrollbar as the only way to reach
+/// it. The Record tab is taller still (two extra labelled rows: Preset and
+/// Audio), and since the window is deliberately not resizable and the mode
+/// tabs switch in place, the height has to fit the **taller** of the two or
+/// pressing "Record" would push Start Recording back under the fold. 12
+/// rows fits both with room for the feedback line.
 fn window_height(theme: &Theme) -> f32 {
-    theme.sizes.window_header + 8.0 * theme.sizes.list_row + 4.0 * theme.sizes.popover_padding
+    theme.sizes.window_header + 12.0 * theme.sizes.list_row + 4.0 * theme.sizes.popover_padding
 }
+
+/// The gap between adjacent segments in a segmented control, and the inset
+/// of the whole row from its `segmented::track` container's edge — the same
+/// value for both, which is what makes the track read as a rail the pills
+/// sit *in* rather than a shape they overlap.
+///
+/// A local named constant rather than a token, and a **fifth** entry in this
+/// crate's running list of saola-theme gaps (after `modules::overlay`'s
+/// `HANDLE_RADIUS`, `modules::toast`'s `ICON_TILE_SIZE`, and
+/// `modules::editor`'s `StrokeWidth::pixels`/`STEP_BADGE_RADIUS`): v0.5.0
+/// ships `style::segmented::track`/`segment` but no geometry to go with
+/// them. The value is not invented here — it is what saola-theme's own
+/// reference usage of those two helpers uses
+/// (`examples/gallery/main.rs`: `container(row(segments).spacing(4))
+/// .style(style::segmented::track(t, s)).padding(4)`), so this is a copy of
+/// the design system's own answer, pending a real token.
+///
+/// Why it matters, concretely: every segment is a full `radii.pill`, so at
+/// zero spacing adjacent pills' rounded ends scallop into each other and a
+/// four-option control reads as a row of overlapping blobs rather than one
+/// control (verified by screenshot before/after, 2026-08-09).
+pub(super) const SEGMENT_INSET: f32 = 4.0;
 
 // ---------------------------------------------------------------------
 // State
@@ -242,6 +312,19 @@ impl AudioChoice {
             AudioChoice::Both => Some(AudioSource::Both),
         }
     }
+
+    /// **Stage 13.** The inverse, for seeding the picker from
+    /// `capture.toml`'s own `audio` knob at boot — so the window opens on
+    /// whatever a bare `record start` would have done, exactly like the
+    /// delay/cursor/format/preset pickers already do.
+    fn from_option(source: Option<AudioSource>) -> Self {
+        match source {
+            None => AudioChoice::NoAudio,
+            Some(AudioSource::Mic) => AudioChoice::Mic,
+            Some(AudioSource::System) => AudioChoice::System,
+            Some(AudioSource::Both) => AudioChoice::Both,
+        }
+    }
 }
 
 /// Which screen this process is showing — set once at boot from
@@ -253,12 +336,17 @@ enum ViewState {
     Main,
     Editor {
         path: PathBuf,
-        /// Decoded once, at boot, by [`load_image`]. `Err` renders as an
-        /// inline message rather than failing to open at all — a missing or
-        /// corrupt file is not a reason to crash a window that could still
-        /// usefully show the path and let the user close it (no-panic
-        /// rule).
-        image: Result<iced::widget::image::Handle, String>,
+        /// Built once, at boot, by [`editor::EditorState::load`]. `Err`
+        /// renders as an inline message rather than failing to open at all —
+        /// a missing or corrupt file is not a reason to crash a window that
+        /// could still usefully show the path and let the user close it
+        /// (no-panic rule). Boxed: `EditorState` carries the whole
+        /// undo/redo-capable document (an `EditorModel` plus a cached
+        /// display handle), which made this variant far larger than
+        /// `ViewState::Main` — `clippy::large_enum_variant` flags exactly
+        /// that, since every `ViewState` value would otherwise pay the
+        /// bigger variant's stack size even while sitting in `Main`.
+        editor: Result<Box<editor::EditorState>, String>,
     },
 }
 
@@ -277,6 +365,11 @@ struct App {
     view: ViewState,
     mode: CaptureMode,
     target: ShotKind,
+    /// **Stage 12.** The Record tab's own target picker — mirrors
+    /// `target` above, but a separate field/type (`cli::RecordKind`, not
+    /// `ShotKind` — see that type's doc comment for why) since the two tabs
+    /// resolve independently and a mode switch must not clobber either.
+    record_target: cli::RecordKind,
     delay: u32,
     cursor: bool,
     format: ImageFormat,
@@ -286,6 +379,15 @@ struct App {
     /// D-Bus reply lands — guards against a second press re-hiding an
     /// already-hidden window mid-request.
     busy: bool,
+    /// **Stage 12.** `true` from the moment `StartRecording` succeeds (the
+    /// recording is *live*, not finished — see the module doc comment's
+    /// hide/reopen section) until `RecordingFinished`/`Error` arrives on
+    /// [`record_signal_stream`]. `busy` alone can't carry this: it is set the
+    /// instant the button is pressed and `Message::RecordingRequested`'s own
+    /// arrival would otherwise clear it (the shape every other capture kind
+    /// wants), so this is the second flag that keeps the window hidden
+    /// *past* that reply, specifically for a recording in flight.
+    recording_pending: bool,
     /// The last thing worth telling the user inline: `Ok` for a completed
     /// capture/connect, `Err` for anything that failed (a bad D-Bus reply,
     /// a connect failure, StartRecording's current stub `Error`). Rendered
@@ -304,17 +406,24 @@ impl App {
             WindowMode::Main => ViewState::Main,
             WindowMode::Edit(path) => ViewState::Editor {
                 path: path.clone(),
-                image: load_image(path),
+                editor: editor::EditorState::load(
+                    path,
+                    &theme,
+                    config.image_format,
+                    config.webp_quality,
+                )
+                .map(Box::new),
             },
         };
 
         let state = App {
             target: ShotKind::Fullscreen,
+            record_target: cli::RecordKind::Fullscreen,
             delay: config.delay,
             cursor: config.cursor,
             format: config.image_format,
             preset: config.video_preset,
-            audio: AudioChoice::NoAudio,
+            audio: AudioChoice::from_option(config.audio),
             theme,
             config,
             connection: None,
@@ -322,6 +431,7 @@ impl App {
             view,
             mode: CaptureMode::Screenshot,
             busy: false,
+            recording_pending: false,
             feedback: None,
         };
 
@@ -331,7 +441,23 @@ impl App {
     fn title(&self) -> String {
         match &self.view {
             ViewState::Main => "Saola Capture".to_string(),
-            ViewState::Editor { path, .. } => format!("Saola Capture — {}", file_label(path)),
+            // A successful Save As (Stage 14) changes what `editor::
+            // EditorState` itself considers "the" path, and the title bar
+            // should track that rather than staying pinned to whatever
+            // `window edit <path>` was originally launched with — otherwise
+            // renaming via Save As leaves the header naming a file that's no
+            // longer where "Save" (as opposed to "Save As") actually writes.
+            ViewState::Editor {
+                editor: Ok(state), ..
+            } => {
+                format!("Saola Capture — {}", file_label(state.path()))
+            }
+            ViewState::Editor {
+                path,
+                editor: Err(_),
+            } => {
+                format!("Saola Capture — {}", file_label(path))
+            }
         }
     }
 
@@ -349,14 +475,24 @@ impl App {
         }
     }
 
-    /// Just one job: learn this process's one window's `Id`, the first time
-    /// it opens. Nothing else in this window needs a subscription — there
-    /// is no raw-input, animation-tick, or D-Bus-signal listening the way
-    /// the daemon's surfaces need (see the module doc comment on why a
-    /// `RecordingFinished` signal subscription is deliberately not built
-    /// yet).
+    /// Two jobs: learn this process's one window's `Id`, the first time it
+    /// opens, and — **Stage 12** — listen for `RecordingFinished`/`Error` on
+    /// [`record_signal_stream`]. The latter runs for this window's whole
+    /// life (not just while a recording is pending) because it is a plain
+    /// zero-argument `fn` pointer, exactly like `main.rs`'s own
+    /// `dbus_worker_stream`/`shutdown_signal_stream` — `Subscription::
+    /// run_with` would need `zbus::Connection` (or anything holding one) to
+    /// be `Hash` to key a *per-connection* subscription, and it isn't (the
+    /// module doc comment's "hide/reopen model" section explains why that
+    /// was left for this stage). Running it unconditionally, and having
+    /// [`App::update`] ignore a signal that arrives while nothing is
+    /// pending, is simpler than tearing the subscription down and back up
+    /// around every recording.
     fn subscription(&self) -> Subscription<Message> {
-        window::open_events().map(Message::WindowOpened)
+        Subscription::batch([
+            window::open_events().map(Message::WindowOpened),
+            Subscription::run(record_signal_stream),
+        ])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -379,6 +515,10 @@ impl App {
             }
             Message::TargetSelected(target) => {
                 self.target = target;
+                Task::none()
+            }
+            Message::RecordTargetSelected(target) => {
+                self.record_target = target;
                 Task::none()
             }
             Message::DelaySelected(delay) => {
@@ -405,8 +545,36 @@ impl App {
             Message::ScreenshotFinished(result) => {
                 self.finish(result.map(|path| format!("Saved: {path}")))
             }
-            Message::RecordingRequested(result) => {
-                self.finish(result.map(|()| "Recording requested.".to_string()))
+            // **Stage 12.** `StartRecording` returning `Ok` means the
+            // recording is *live*, not finished (see the module doc
+            // comment) — stay hidden and wait for the signal below instead
+            // of calling `finish` here. An `Err` (already recording,
+            // `--audio` refused, no ffmpeg, …) is the request itself
+            // failing, which *is* terminal, so that branch un-hides exactly
+            // like every other capture kind's failure does.
+            Message::RecordingRequested(Ok(())) => {
+                self.recording_pending = true;
+                self.feedback = Some(Ok("Recording…".to_string()));
+                Task::none()
+            }
+            Message::RecordingRequested(Err(err)) => self.finish(Err(err)),
+            Message::RecordingFinishedSignal(path) => {
+                if self.recording_pending {
+                    self.recording_pending = false;
+                    self.finish(Ok(format!("Recording saved: {path}")))
+                } else {
+                    // A recording finished that this window didn't start
+                    // (the CLI, the tray) — nothing to reopen for.
+                    Task::none()
+                }
+            }
+            Message::RecordingErrorSignal(message) => {
+                if self.recording_pending {
+                    self.recording_pending = false;
+                    self.finish(Err(message))
+                } else {
+                    Task::none()
+                }
             }
             Message::DragWindow => match self.window_id {
                 Some(id) => window::drag(id),
@@ -417,6 +585,21 @@ impl App {
                 // No window Id yet (a very early close race) — nothing to
                 // ask the compositor to destroy, so just end the process.
                 None => iced::exit(),
+            },
+            // **Stage 14.** The nested-`Message` shape every module in this
+            // crate uses (`main.rs`'s `Message::Overlay`, this file's own
+            // `Message::WindowOpened`, …): delegate to the editor's own
+            // `update`, mapping its `Task<editor::Message>` back into this
+            // window's `Task<Message>`. A no-op if the editor failed to
+            // load (`ViewState::Editor { editor: Err(_), .. }`) or this
+            // process isn't even showing the editor — neither is reachable
+            // in practice (nothing renders editor controls in that state),
+            // but the no-panic rule wants a real branch, not an `unwrap`.
+            Message::Editor(message) => match &mut self.view {
+                ViewState::Editor {
+                    editor: Ok(state), ..
+                } => state.update(message).map(Message::Editor),
+                _ => Task::none(),
             },
         }
     }
@@ -461,7 +644,12 @@ impl App {
                 }
             }
             CaptureMode::Record => {
-                let options = record_options(&self.config, self.preset, self.audio.to_option());
+                let options = record_options(
+                    &self.config,
+                    self.record_target,
+                    self.preset,
+                    self.audio.to_option(),
+                );
                 Task::perform(
                     request_recording(connection, options),
                     Message::RecordingRequested,
@@ -494,13 +682,25 @@ impl App {
             rule::horizontal(1.0).style(saola_theme::style::rule::rest(theme, Surface::Paper));
         let body = match &self.view {
             ViewState::Main => self.main_view(),
-            ViewState::Editor { path, image } => editor_view(theme, path, image),
+            ViewState::Editor {
+                editor: Ok(state), ..
+            } => state.view(theme).map(Message::Editor),
+            ViewState::Editor {
+                path,
+                editor: Err(err),
+            } => editor_error_view(theme, path, err),
         };
 
         let content = column![head, divider, body];
 
+        // `Length::Fill`, not the Main tab's old `Fixed(popover_width)`: the
+        // Main window is genuinely fixed-size (`run`'s `resizable(false)`),
+        // so the two were indistinguishable there, but the editor window is
+        // resizable (Stage 14) and wider than `popover_width` to begin with
+        // — a `Fixed` width here would silently clip `editor::EditorState::
+        // view`'s own canvas/toolbar to the Main tab's narrow footprint.
         container(content)
-            .width(Length::Fixed(theme.sizes.popover_width))
+            .width(Length::Fill)
             .height(Length::Fill)
             .style(saola_theme::style::container::paper_window(theme))
             .into()
@@ -544,6 +744,24 @@ impl App {
                 ));
             }
             CaptureMode::Record => {
+                // **Stage 12.** Same three targets the Screenshot tab
+                // offers, same "never skips the overlay, never names an
+                // explicit window" posture (`record_options`'s doc
+                // comment) — a Region press hides the window and lets the
+                // daemon map the selection overlay, exactly like
+                // `shot --region` does.
+                sections.push(section_label(theme, "Target"));
+                sections.push(segmented_row(
+                    theme,
+                    &[
+                        (cli::RecordKind::Fullscreen, "Full screen"),
+                        (cli::RecordKind::Region, "Region"),
+                        (cli::RecordKind::Window, "Window"),
+                    ],
+                    self.record_target,
+                    Message::RecordTargetSelected,
+                ));
+
                 sections.push(section_label(theme, "Preset"));
                 sections.push(segmented_row(
                     theme,
@@ -556,12 +774,17 @@ impl App {
                     Message::PresetSelected,
                 ));
 
-                // Architecture: "audio (mic/system/both, Opus) — audio is
-                // inert until Stage 13". The picker is real (the chosen
-                // value reaches `RecordOptions::to_dbus_options`); what's
-                // inert is the daemon side — `StartRecording` doesn't
-                // consume `audio` yet, same stub posture as everything else
-                // Stage 11/13 land.
+                // **Real as of Stage 13** — Architecture's "audio
+                // (mic/system/both, Opus)". The picker was already wired
+                // through `RecordOptions::to_dbus_options` in Stage 9; what
+                // changed is that the daemon now resolves it to real pulse
+                // sources instead of refusing the call. Its initial value
+                // comes from `capture.toml`'s `audio` knob (`App::boot`), and
+                // a device that isn't there degrades the recording to
+                // video-only with a warning toast rather than failing the
+                // button (`dbus::CaptureService::resolve_audio`) — so there
+                // is deliberately no availability check in this process,
+                // which would only be a second, staler answer.
                 sections.push(section_label(theme, "Audio"));
                 sections.push(segmented_row(
                     theme,
@@ -604,9 +827,17 @@ impl App {
             list = list.push(section);
         }
 
+        // The style is not optional decoration: an unstyled `scrollable`
+        // renders iced's *default* scrollbar, which is a near-black rail
+        // that ignores the theme entirely and paints straight over
+        // `paper_window`'s rounded corner. `saola_theme::style::scrollable::
+        // rest` is the surface-aware answer (track-role rail, ivory thumb,
+        // terracotta while dragged) and already existed in v0.5.0 — it was
+        // simply never wired up here.
         scrollable(list.padding(theme.sizes.popover_padding))
             .width(Length::Fill)
             .height(Length::Fill)
+            .style(saola_theme::style::scrollable::rest(theme, Surface::Paper))
             .into()
     }
 }
@@ -647,13 +878,66 @@ async fn request_recording(
     let proxy = Capture1Proxy::new(&connection)
         .await
         .map_err(|err| err.to_string())?;
-    // "fullscreen" is the only recording target the wire protocol can
-    // express today — the same limitation `main.rs::run_record`'s own
-    // comment documents; `--region`/`--window` recording is Stage 12.
     proxy
-        .start_recording("fullscreen", options.to_dbus_options())
+        .start_recording(options.kind.as_str(), options.to_dbus_options())
         .await
         .map_err(|err| err.to_string())
+}
+
+/// **Stage 12.** A standing listener for the two signals that mark a
+/// recording's real end — `RecordingFinished(path)` and `Error(message)` —
+/// on the *daemon's* `io.saola.Capture1` object, over this window's own
+/// independent connection (never the one [`connect`] built: a subscription's
+/// stream is `'static` and outlives any particular `Task::perform`, so it
+/// has to own its own connection start to finish, the same reason
+/// `main.rs::dbus_worker_stream` builds its own rather than borrowing the
+/// daemon's).
+///
+/// A zero-argument `fn` pointer, not a closure — see [`App::subscription`]'s
+/// doc comment for why that's what lets this run without `zbus::Connection`
+/// needing to be `Hash`. Any failure to connect or subscribe (no session
+/// bus, the daemon not owning the name yet) degrades to "never fires" —
+/// [`App::update`]'s `Message::RecordingRequested(Ok(()))` arm already knows
+/// a recording it started stays pending forever in that case, which is an
+/// honest (if quiet) failure mode rather than a panic, matching every other
+/// D-Bus-reachability failure in this crate.
+fn record_signal_stream() -> impl Stream<Item = Message> {
+    iced::stream::channel(4, async |mut sender: mpsc::Sender<Message>| {
+        let Ok(connection) = Connection::session().await else {
+            return;
+        };
+        let Ok(proxy) = Capture1Proxy::new(&connection).await else {
+            return;
+        };
+        let (Ok(mut finished), Ok(mut errors)) = (
+            proxy.receive_recording_finished().await,
+            proxy.receive_error().await,
+        ) else {
+            return;
+        };
+
+        loop {
+            let message = tokio::select! {
+                signal = finished.next() => {
+                    let Some(signal) = signal else { break; };
+                    // A malformed body (a daemon version skew, in theory) is
+                    // dropped rather than ending the whole listener — the
+                    // same "degrade, don't die" posture as a connect
+                    // failure above.
+                    let Ok(args) = signal.args() else { continue; };
+                    Message::RecordingFinishedSignal(args.path().clone())
+                }
+                signal = errors.next() => {
+                    let Some(signal) = signal else { break; };
+                    let Ok(args) = signal.args() else { continue; };
+                    Message::RecordingErrorSignal(args.message().clone())
+                }
+            };
+            if sender.send(message).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -690,53 +974,50 @@ fn resolve_capture_options(
 }
 
 /// The Record tab's UI state, folded into a [`cli::RecordOptions`] — no
-/// `ShotArgs`-style synthetic-args detour needed here since the two knobs the
-/// UI actually tracks (preset, audio) map straight across. Everything else
-/// comes from `config` unchanged, which is the same thing
+/// `ShotArgs`-style synthetic-args detour needed here since the knobs the UI
+/// actually tracks (target, preset, audio) map straight across. Everything
+/// else comes from `config` unchanged, which is the same thing
 /// `cli::RecordOptions::resolve` does for the `record` verb — **Stage 11**
 /// added three such fields (`cursor`, `output_dir`, `vaapi_device`), and they
 /// are read from the same `capture.toml` this process already loaded at boot
 /// rather than re-derived, so the app window and the CLI start identical
 /// recordings.
+///
+/// **Stage 12** adds `target`: like the Screenshot tab's own target picker,
+/// the app never skips the overlay (`geometry: None`) and never names an
+/// explicit window (`window_id: None`) — a `Region` press hides the window
+/// and lets the daemon map the same selection overlay `shot --region` does;
+/// a `Window` press records whichever window is focused (CAPTURE-RESEARCH
+/// D3's no-picker default).
 fn record_options(
     config: &CaptureConfig,
+    target: cli::RecordKind,
     preset: VideoPreset,
     audio: Option<AudioSource>,
 ) -> cli::RecordOptions {
     cli::RecordOptions {
         action: cli::RecordActionKind::Start,
+        kind: target,
         preset,
         audio,
-        // The app window starts *real* recordings; `--dry-run` (Stage 10)
-        // is a terminal diagnostic that never reaches the daemon, so there
-        // is nothing here for it to mean — and `window_id` rides along with
-        // it (it is dry-run-only until Stage 12 builds real window
-        // recording, which is also when this tab grows a target picker).
+        // The app window starts *real* recordings; `--dry-run` (Stage 10) is
+        // a terminal diagnostic that never reaches the daemon, so there is
+        // nothing here for it to mean.
+        // **Stage 13.** The device knobs and the A/V calibration offset come
+        // from the same `capture.toml` this process loaded at boot, for the
+        // same reason `cursor`/`output_dir`/`vaapi_device` do: the daemon
+        // reads no config of its own, so whatever the app window does not
+        // send, the recording does not get.
+        audio_mic_source: config.audio_mic_source.clone(),
+        audio_system_source: config.audio_system_source.clone(),
+        audio_offset: config.audio_offset,
         dry_run: false,
+        geometry: None,
         window_id: None,
         cursor: config.cursor,
         output_dir: config.save_dir.clone(),
         vaapi_device: config.vaapi_device.clone(),
     }
-}
-
-/// Decode a saved capture into an iced image handle, synchronously — see
-/// the module doc comment's "editor stub" section for why this doesn't need
-/// the lockscreen wallpaper's async-decode treatment. `::image::open` (a
-/// leading `::` forces crate-root resolution) rather than a bare
-/// `image::open`, because `iced::widget::image` is already in scope as a
-/// module in this file (for `image::Handle`) and would otherwise shadow the
-/// `image` crate's own name for path lookups in this function.
-fn load_image(path: &Path) -> Result<iced::widget::image::Handle, String> {
-    let decoded = ::image::open(path)
-        .map_err(|err| err.to_string())?
-        .into_rgba8();
-    let (width, height) = decoded.dimensions();
-    Ok(iced::widget::image::Handle::from_rgba(
-        width,
-        height,
-        decoded.into_raw(),
-    ))
 }
 
 fn file_label(path: &Path) -> String {
@@ -755,6 +1036,8 @@ enum Message {
     Connected(Result<Connection, String>),
     ModeSelected(CaptureMode),
     TargetSelected(ShotKind),
+    /// **Stage 12.**
+    RecordTargetSelected(cli::RecordKind),
     DelaySelected(u32),
     CursorToggled(bool),
     FormatSelected(ImageFormat),
@@ -763,8 +1046,16 @@ enum Message {
     Capture,
     ScreenshotFinished(Result<String, String>),
     RecordingRequested(Result<(), String>),
+    /// **Stage 12.** `RecordingFinished(path)` arrived on
+    /// [`record_signal_stream`].
+    RecordingFinishedSignal(String),
+    /// **Stage 12.** `Error(message)` arrived on [`record_signal_stream`].
+    RecordingErrorSignal(String),
     DragWindow,
     ClosePressed,
+    /// **Stage 14.** Nests the whole editor surface's own message type — see
+    /// `Message::Editor`'s `update` arm.
+    Editor(editor::Message),
 }
 
 // ---------------------------------------------------------------------
@@ -843,7 +1134,7 @@ where
     T: Copy + PartialEq + 'static,
     F: Fn(T) -> Message + 'static,
 {
-    let mut track = row![];
+    let mut track = row![].spacing(SEGMENT_INSET);
     for &(value, label) in options {
         let is_selected = value == selected;
         let content = container(
@@ -851,6 +1142,17 @@ where
                 .font(saola_theme::convert::ui_font(theme))
                 .size(theme.typography.size.secondary),
         )
+        // Teaching note: `button` does no alignment of its own in iced 0.14
+        // — `iced_core::layout::padded` places the content flush at
+        // (padding.left, padding.top) — so a label is centred only because
+        // *this* container centres it. Horizontally the segment hugs its
+        // label (no explicit button width), which centres it by
+        // construction; `align_x` is set anyway so the intent survives if a
+        // segment ever gets a fixed width. Vertically it is load-bearing:
+        // the button is a fixed `hit_target_bar` tall with zero vertical
+        // padding, so without `height(Fill)` + `align_y` the label would sit
+        // against the pill's top edge.
+        .align_x(Center)
         .align_y(Center)
         .height(Length::Fill);
 
@@ -873,6 +1175,7 @@ where
     }
 
     container(track)
+        .padding(SEGMENT_INSET)
         .style(saola_theme::style::segmented::track(theme, Surface::Paper))
         .into()
 }
@@ -937,52 +1240,28 @@ fn hint_view(theme: &Theme, message: &str) -> Element<'static, Message> {
         .into()
 }
 
-/// The (still-stub, PLAN.md Stage 9 task 3) editor view: header chrome plus
-/// the decoded image at `ContentFit::Contain`, the file path in mono
-/// beneath it, and a one-line note naming the stage that fills the rest in.
-fn editor_view(
-    theme: &Theme,
-    path: &Path,
-    image: &Result<iced::widget::image::Handle, String>,
-) -> Element<'static, Message> {
-    let picture: Element<'static, Message> = match image {
-        Ok(handle) => iced::widget::image(handle.clone())
-            .content_fit(iced::ContentFit::Contain)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-        Err(err) => container(hint_view(
-            theme,
-            &format!("Could not open this image: {err}"),
-        ))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(Center)
-        .align_y(Center)
-        .into(),
-    };
-
+/// **Stage 14.** The one case left in this file's own hands: `path` failed
+/// to decode at all (`modules::editor::EditorState::load` returned `Err`) —
+/// a missing or corrupt file still opens a window naming the path, rather
+/// than crashing (no-panic rule). A successfully loaded editor renders
+/// through `editor::EditorState::view` instead; this is not that view.
+fn editor_error_view(theme: &Theme, path: &Path, err: &str) -> Element<'static, Message> {
     let caption = text(path.display().to_string())
         .font(saola_theme::convert::mono_font(theme))
         .size(theme.typography.size.meta)
         .color(theme.on_paper.tertiary.into_iced());
 
-    let note = hint_view(
-        theme,
-        "Editing tools land in Stage 14 — this is a preview only.",
-    );
+    let message = hint_view(theme, &format!("Could not open this image: {err}"));
 
-    let footer = column![caption, note]
-        .spacing(4.0)
-        .padding(theme.sizes.popover_padding);
-
-    column![
-        container(picture)
-            .width(Length::Fill)
-            .height(Length::Fill)
+    container(
+        column![caption, message]
+            .spacing(4.0)
             .padding(theme.sizes.popover_padding),
-        footer,
-    ]
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(Center)
+    .align_y(Center)
     .into()
 }
 
@@ -1063,12 +1342,32 @@ mod tests {
     fn record_options_always_requests_start() {
         let options = record_options(
             &CaptureConfig::default(),
+            cli::RecordKind::Fullscreen,
             VideoPreset::Av1,
             Some(AudioSource::Both),
         );
         assert_eq!(options.action, cli::RecordActionKind::Start);
+        assert_eq!(options.kind, cli::RecordKind::Fullscreen);
         assert_eq!(options.preset, VideoPreset::Av1);
         assert_eq!(options.audio, Some(AudioSource::Both));
+    }
+
+    #[test]
+    fn record_options_carries_the_chosen_target_with_no_geometry_or_window_id() {
+        for target in [
+            cli::RecordKind::Fullscreen,
+            cli::RecordKind::Region,
+            cli::RecordKind::Window,
+        ] {
+            let options =
+                record_options(&CaptureConfig::default(), target, VideoPreset::Hevc, None);
+            assert_eq!(options.kind, target);
+            assert_eq!(options.geometry, None, "the app never skips the overlay");
+            assert_eq!(
+                options.window_id, None,
+                "the app never picks a window id directly"
+            );
+        }
     }
 
     // -- AudioChoice --------------------------------------------------------
@@ -1081,13 +1380,8 @@ mod tests {
         assert_eq!(AudioChoice::Both.to_option(), Some(AudioSource::Both));
     }
 
-    // -- load_image ---------------------------------------------------------
-
-    #[test]
-    fn load_image_reports_a_clean_error_for_a_missing_file() {
-        let result = load_image(Path::new("/nonexistent/definitely-not-a-file.webp"));
-        assert!(result.is_err(), "a missing file must not panic");
-    }
+    // `load_image` moved to `modules::editor::load_canvas` in Stage 14 —
+    // that module's own tests cover the missing-file case now.
 
     // -- window_height ------------------------------------------------------
 
@@ -1095,5 +1389,15 @@ mod tests {
     fn window_height_is_taller_than_the_header_alone() {
         let theme = Theme::saola();
         assert!(window_height(&theme) > theme.sizes.window_header);
+    }
+
+    // -- editor_window_size ---------------------------------------------------
+
+    #[test]
+    fn editor_window_size_is_wider_than_the_main_popover() {
+        let theme = Theme::saola();
+        let size = editor_window_size(&theme);
+        assert!(size.width > theme.sizes.popover_width);
+        assert!(size.height > theme.sizes.window_header);
     }
 }

@@ -12,12 +12,21 @@
 //! [`app`] (PLAN.md Stage 9) is a different shape from the other four: it is
 //! not a daemon surface at all, but the **separate-process** window/editor —
 //! a plain `iced::application`, run by `main.rs::run_window`, never touching
-//! `Daemon`'s `SurfaceRole` registry. Stages 11/12 add the recording module
-//! PLAN.md's tree sketch names.
+//! `Daemon`'s `SurfaceRole` registry. Stage 11 adds [`recorder`], the
+//! recording state machine PLAN.md's tree sketch names — also not a
+//! `SurfaceRole` (it draws nothing). Stage 12 adds [`tray`], which is
+//! neither: no surface, no state-machine-with-a-view, just a served D-Bus
+//! object — see that module's own doc comment for why it doesn't follow the
+//! `view`/`subscription`/`Message` shape at all. Stage 14 adds [`editor`],
+//! the real annotation editor rendered inside [`app`]'s `ViewState::Editor`
+//! (also not a `SurfaceRole` — it's a body widget of the app window, not a
+//! surface of its own); see its own doc comment for the canvas architecture.
 
 pub mod app;
 pub mod countdown;
+pub mod editor;
 pub mod flash;
 pub mod overlay;
 pub mod recorder;
 pub mod toast;
+pub mod tray;

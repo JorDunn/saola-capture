@@ -640,6 +640,83 @@ Device selection is by pulse source name from `pactl list short sources` — `mi
 `alsa_input.*`, `system` → `*.monitor`, `both` → two `-f pulse` inputs plus `amix`.
 Resolve names at record time, never hardcode: they are hardware-path-derived.
 
+### 4.5 What Stage 13 measured when it implemented this (2026-08-09)
+
+Everything here is new evidence gathered against the real session while landing the
+transport. It **extends** §4.4 rather than re-litigating it: the transport shipped is
+`-f pulse` exactly as decided, and D7's escalation trigger was checked and not met.
+
+**Device enumeration moved from `pactl` to ffmpeg itself.** `ffmpeg -sources pulse` and
+`ffmpeg -sinks pulse` print one line per device — `name [description] (media types)` —
+with the server's **default** marked `*`, which is every fact §4.4's selection rule
+needs, at ~85 ms per call:
+
+```
+Auto-detected sources for pulse:
+  alsa_output.pci-0000_07_00.6.analog-stereo.monitor [Monitor of Ryzen HD Audio Controller Analog Stereo] (none)
+* alsa_input.pci-0000_07_00.6.analog-stereo [Ryzen HD Audio Controller Analog Stereo] (none)
+Auto-detected sinks for pulse:
+* alsa_output.pci-0000_07_00.6.analog-stereo [Ryzen HD Audio Controller Analog Stereo] (none)
+```
+
+That keeps ffmpeg the sole external CLI (no `pactl` runtime dependency, no extra
+PKGBUILD `depends`) and — the real argument — asks the question *through the library
+that will open the device*: a `pactl`-resolved name on an ffmpeg built without
+`--enable-libpulse` would resolve fine and then fail at spawn. `<sink>.monitor` naming
+and the `Monitor of …` description prefix both hold on PipeWire's shim. Pulse's magic
+names `@DEFAULT_SOURCE@`/`@DEFAULT_MONITOR@` were also confirmed to work through the
+shim, and deliberately **not** used: a concrete name can be checked for existence before
+spawning, which is what makes the degradation path possible.
+
+**`-shortest` is enough; the SIGINT escalation was never reached.** Closing stdin ends
+an ffmpeg with a live pulse input, promptly (a 3 s piped source exited in 2.68 s wall).
+
+**Two timing defects, both pre-existing and both found by measuring A/V sync:**
+
+1. **The rawvideo input's time base was 25 Hz.** With no `-framerate`, the demuxer
+   defaults to 25, so `-use_wallclock_as_timestamps` rescaled every PTS onto a **40 ms
+   grid** and `-fps_mode:v vfr` discarded whatever landed in a taken slot. A 60 fps
+   source through the Stage 11 command line came out **24.8 fps / 137 frames**; adding
+   `-framerate 1000` (the input *time base*, not a rate — the wallclock flag still
+   supplies the timestamps) gave **66.2 fps / 360 frames**, PTS on a 1 ms grid, same
+   duration, keyframe interval unchanged. Every recording before Stage 13 was
+   effectively 25 fps.
+2. **`-shortest` truncated the audio to the video.** A niri cast is damage-driven, so an
+   idle screen produces one frame and the video stream ends at 0.04 s — which with
+   `-shortest` cut the audio there too: a 7.1 s `--audio system` recording of a still
+   screen was **0.048 s of video and 0.048 s of audio**. The recorder now re-writes the
+   most recent frame once at stop (`modules::recorder::seal_last_frame`); the same
+   recording is now 8.28 s of video and 415 audio packets.
+
+**The A/V offset, measured two ways.** Both on 15 s window recordings of a player
+showing a white flash and playing a 1 kHz click at the same source timestamp:
+
+| quantity | result |
+| --- | --- |
+| §4.3 start-offset (`audio_start − video_start`, from ffmpeg's own input dump) | **−37 ms, constant to ±1 ms over four runs** |
+| end-to-end (flash vs click position in the output file) | **audio ahead by +141 ms**; per-run means 142, 139, 115, 139, 169 |
+| within one recording | drifts: **+141 ms at t=2 s → +213 ms at t=14 s** (≈5 ms/s) |
+| pulse latency reported for ffmpeg's own capture stream | **0 µs** — the audio timestamps are not back-dated |
+| with `-itsoffset 0.13` applied | residual **+25 to +53 ms** |
+
+So the start-offset D7 worried about is genuinely collapsed by mitigation 1, and it is
+**constant** — the `pipe:3` escalation is not triggered. What remains is *path latency*:
+a video frame is timestamped when its bytes reach ffmpeg's stdin, after the compositor,
+PipeWire, a `sync_channel(4)`, a multi-MB pipe write and ffmpeg's own read; the audio is
+timestamped on read from the monitor tap with nothing to compensate for. `-itsoffset`
+(`audio-offset` in `capture.toml`, default 0.13 s) corrects the mean. **The drift cannot
+be corrected by any constant** — fixing it properly means taking the video PTS from the
+compositor's own capture timestamp (the SPA meta header PipeWire already delivers)
+instead of from arrival, which needs a framed transport to ffmpeg rather than the raw
+pipe. That is a change to D6's model and is recorded here as the open item.
+
+**Mid-recording device removal is survivable.** Unloading the null sink whose monitor was
+being recorded, 3 s into a recording, did **not** kill anything: the pulse shim rerouted
+the stream and the recording finished with a continuous 7.28 s audio track. A
+*pre*-recording absence degrades to video-only with a warning toast; there is no
+mid-recording degradation path on this transport (an input cannot be removed from a
+running ffmpeg), which is the second thing `pipe:3` would buy.
+
 ---
 
 ## 5. Window capture mechanism

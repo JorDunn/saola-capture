@@ -140,6 +140,63 @@ impl fmt::Display for VideoPreset {
     }
 }
 
+/// `audio = "none"|"mic"|"system"|"both"` and `--audio`'s own vocabulary —
+/// **Stage 13**. Which *kind* of audio a recording wants, never a device
+/// name: the concrete PulseAudio sources are resolved at record time by
+/// `crate::audio::plan_audio` (CAPTURE-RESEARCH §4.4 — "never hardcode: they
+/// are hardware-path-derived").
+///
+/// Lives here rather than in `cli.rs` for the same reason [`ImageFormat`] and
+/// [`VideoPreset`] do: the config file and the CLI flag parse against exactly
+/// this vocabulary, and having one definition is what stops them drifting.
+/// `cli` re-exports it, so `cli::AudioSource` still names this type.
+///
+/// **There is no `None` variant.** "No audio" is `Option<AudioSource>::None`
+/// throughout — the spelling `"none"` is a *parse-level* answer
+/// ([`parse_audio`]), which keeps every match on this type total over the
+/// three things that actually have a device behind them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioSource {
+    Mic,
+    System,
+    Both,
+}
+
+impl AudioSource {
+    /// The wire/config/flag spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mic => "mic",
+            Self::System => "system",
+            Self::Both => "both",
+        }
+    }
+}
+
+impl fmt::Display for AudioSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `"none"|"mic"|"system"|"both"` → what the recording should do, with
+/// `"none"` mapping to `Some(None)` (understood, and it means silence) and an
+/// unrecognized word to `None` (not understood).
+///
+/// The double `Option` is deliberate and is why this is a free function
+/// rather than `AudioSource::parse`: the two "no audio" answers are
+/// different, and collapsing them would make `audio = "bluetooth"` silently
+/// mean "record no audio" instead of warning.
+pub(crate) fn parse_audio(value: &str) -> Option<Option<AudioSource>> {
+    match value {
+        "none" | "off" => Some(None),
+        "mic" => Some(Some(AudioSource::Mic)),
+        "system" => Some(Some(AudioSource::System)),
+        "both" => Some(Some(AudioSource::Both)),
+        _ => None,
+    }
+}
+
 /// The whole of `capture.toml`, resolved to typed values.
 ///
 /// **Unchanged from Stage 3's KDL-backed version** — same fields, same
@@ -147,13 +204,17 @@ impl fmt::Display for VideoPreset {
 /// parsing internals moved; every caller in `main.rs`/`cli.rs` is untouched
 /// by this stage.
 ///
+/// **Not `Eq`** since Stage 13: `audio-offset` is a float (seconds), and
+/// `f64` has no total equality. Nothing in this crate needs `Eq` on a config
+/// — every use is an `assert_eq!` in a test, which `PartialEq` serves.
+///
 /// `save_dir` is deliberately `Option<PathBuf>`, not a plain `PathBuf` with
 /// `~/Pictures/Captures` baked in here: Stage 5's `storage.rs` owns that
 /// fallback (PLAN.md Stage 5, item 3 — "save-dir resolution (config →
 /// `~/Pictures/Captures` fallback ..., created on demand)"), so this module
 /// only reports what the *file* said (or didn't). Every other field has no
 /// such downstream owner, so it resolves to a concrete default right here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CaptureConfig {
     pub save_dir: Option<PathBuf>,
     pub image_format: ImageFormat,
@@ -186,6 +247,35 @@ pub struct CaptureConfig {
     /// is the same warn-and-default posture every other knob gets, applied at
     /// the layer that can actually check.
     pub vaapi_device: Option<PathBuf>,
+    /// `audio = "none"|"mic"|"system"|"both"` — the default for a
+    /// `record start` with no `--audio` flag. **Added in Stage 13.**
+    ///
+    /// `None` (the default) is "record video only", and `--audio none` is how
+    /// a CLI invocation overrides a config file that turned audio on — see
+    /// `cli::RecordOptions::resolve`.
+    pub audio: Option<AudioSource>,
+    /// `audio-mic-source = "alsa_input.…"` — an explicit PulseAudio source
+    /// name for `--audio mic`/`both`. **Added in Stage 13.**
+    ///
+    /// `None`, the default, means "use the server's default input".
+    /// Deliberately **not validated here**, exactly like [`Self::vaapi_device`]:
+    /// whether a name is a real capture device is a runtime question about
+    /// hardware, and a name that no longer exists warns and falls back to
+    /// discovery in `crate::audio::plan_audio` — the same warn-and-default
+    /// rule applied at the layer that can actually check.
+    pub audio_mic_source: Option<String>,
+    /// `audio-system-source = "….monitor"` — the same knob for the system
+    /// audio half. `None` means "the default output's `.monitor`".
+    pub audio_system_source: Option<String>,
+    /// `audio-offset = 0.0` — seconds added to every audio input's timestamps
+    /// (`-itsoffset`), the calibration knob CAPTURE-RESEARCH §4.4's mitigation
+    /// 3 asks for. **Added in Stage 13.**
+    ///
+    /// Positive delays the audio (use it when the sound arrives *early*);
+    /// negative advances it. The default is
+    /// [`crate::audio::DEFAULT_SYNC_OFFSET`], which is where the measurement
+    /// behind that number is written down.
+    pub audio_offset: f64,
     pub cursor: bool,
     pub delay: u32,
     pub toasts: bool,
@@ -212,6 +302,10 @@ impl Default for CaptureConfig {
             png_also: false,
             video_preset: VideoPreset::default(),
             vaapi_device: None,
+            audio: None,
+            audio_mic_source: None,
+            audio_system_source: None,
+            audio_offset: crate::audio::DEFAULT_SYNC_OFFSET,
             cursor: true,
             delay: 0,
             toasts: true,
@@ -334,6 +428,22 @@ impl CaptureConfig {
         // write even though render nodes live under `/dev`.
         let vaapi_device = read_str(&body, "vaapi-device").map(expand_tilde);
 
+        // **Stage 13.** `audio` is the one knob whose "off" answer is also a
+        // legal *value*, so it goes through `parse_audio`'s double `Option`
+        // rather than `match_or_warn`'s single one: an unrecognized word must
+        // warn and default (to "no audio"), while the word `"none"` must
+        // resolve to "no audio" silently, and those two paths would be
+        // indistinguishable otherwise.
+        let audio = match read_str(&body, "audio") {
+            Some(value) => match_or_warn(value, "audio", parse_audio).flatten(),
+            None => None,
+        };
+        // Device names are taken as written — see the fields' own doc
+        // comments for why this module deliberately does not check them.
+        let audio_mic_source = read_str(&body, "audio-mic-source").map(str::to_string);
+        let audio_system_source = read_str(&body, "audio-system-source").map(str::to_string);
+        let audio_offset = read_audio_offset(&body).unwrap_or(crate::audio::DEFAULT_SYNC_OFFSET);
+
         let cursor = read_bool(&body, "cursor").unwrap_or(true);
 
         let delay = read_delay(&body).unwrap_or(0);
@@ -349,6 +459,10 @@ impl CaptureConfig {
             png_also,
             video_preset,
             vaapi_device,
+            audio,
+            audio_mic_source,
+            audio_system_source,
+            audio_offset,
             cursor,
             delay,
             toasts,
@@ -503,6 +617,38 @@ fn read_webp_quality(table: &Table) -> Option<u8> {
     }
 }
 
+/// `audio-offset = <seconds>` — **Stage 13**'s A/V calibration knob.
+///
+/// Accepts a TOML float *or* integer (`audio-offset = 0` is a reasonable
+/// thing to write), and only values inside ±[`MAX_AUDIO_OFFSET`]: a correction
+/// larger than that is a typo (a millisecond value written as seconds, say),
+/// and applying it would silently produce a recording whose audio is seconds
+/// out — far worse than the small residual it was meant to fix. Out of range,
+/// non-finite, or the wrong type all warn and default, the same per-knob rule
+/// every other value gets.
+fn read_audio_offset(table: &Table) -> Option<f64> {
+    let value = table.get("audio-offset")?;
+    let seconds = value
+        .as_float()
+        .or_else(|| value.as_integer().map(|whole| whole as f64));
+    match seconds {
+        Some(seconds) if seconds.is_finite() && seconds.abs() <= MAX_AUDIO_OFFSET => Some(seconds),
+        _ => {
+            eprintln!(
+                "saola-capture: capture.toml: audio-offset {value} is not a number of seconds \
+                 within ±{MAX_AUDIO_OFFSET} — using default"
+            );
+            None
+        }
+    }
+}
+
+/// The largest `audio-offset` this module will accept, in seconds. Generous
+/// enough for any real device-latency correction (the measured residual on
+/// this machine is single-digit milliseconds), small enough that an obviously
+/// wrong number is caught.
+const MAX_AUDIO_OFFSET: f64 = 5.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +674,10 @@ mod tests {
             png-also = true
             video-preset = "av1"
             vaapi-device = "/dev/dri/renderD129"
+            audio = "both"
+            audio-mic-source = "alsa_input.usb-Blue_Yeti"
+            audio-system-source = "alsa_output.hdmi.monitor"
+            audio-offset = 0.08
             cursor = false
             delay = 3
             toasts = false
@@ -547,10 +697,105 @@ mod tests {
             config.vaapi_device,
             Some(PathBuf::from("/dev/dri/renderD129"))
         );
+        assert_eq!(config.audio, Some(AudioSource::Both));
+        assert_eq!(
+            config.audio_mic_source.as_deref(),
+            Some("alsa_input.usb-Blue_Yeti")
+        );
+        assert_eq!(
+            config.audio_system_source.as_deref(),
+            Some("alsa_output.hdmi.monitor")
+        );
+        assert_eq!(config.audio_offset, 0.08);
         assert!(!config.cursor);
         assert_eq!(config.delay, 3);
         assert!(!config.toasts);
         assert!(!config.copy);
+    }
+
+    // -- Stage 13: the audio knobs -------------------------------------
+
+    /// The default is silence, and it is reached by three different routes:
+    /// an absent knob, the explicit word, and a nonsense value.
+    #[test]
+    fn audio_defaults_to_none_however_it_is_spelled_or_mis_spelled() {
+        for toml in ["", r#"audio = "none""#, r#"audio = "bluetooth""#] {
+            let config = CaptureConfig::parse(toml).expect("well-formed TOML");
+            assert_eq!(config.audio, None, "{toml}");
+        }
+    }
+
+    #[test]
+    fn audio_accepts_each_real_source() {
+        for (value, expected) in [
+            ("mic", AudioSource::Mic),
+            ("system", AudioSource::System),
+            ("both", AudioSource::Both),
+        ] {
+            let config =
+                CaptureConfig::parse(&format!("audio = \"{value}\"")).expect("well-formed TOML");
+            assert_eq!(config.audio, Some(expected));
+            assert_eq!(expected.as_str(), value, "the vocabulary round-trips");
+        }
+    }
+
+    /// A bad `audio` value must not blank the *other* audio knobs — the
+    /// per-knob fallback rule, checked on the knobs most likely to be written
+    /// together.
+    #[test]
+    fn a_nonsense_audio_value_keeps_the_device_overrides() {
+        let toml = r#"
+            audio = "surround"
+            audio-mic-source = "alsa_input.usb"
+        "#;
+        let config = CaptureConfig::parse(toml).expect("well-formed TOML");
+        assert_eq!(config.audio, None);
+        assert_eq!(config.audio_mic_source.as_deref(), Some("alsa_input.usb"));
+    }
+
+    /// Whether a name is a real device is not this module's question — see
+    /// the fields' doc comments. It parses; `audio::plan_audio` warns.
+    #[test]
+    fn an_audio_source_that_cannot_exist_still_parses() {
+        let config =
+            CaptureConfig::parse(r#"audio-system-source = "nope.monitor""#).expect("valid TOML");
+        assert_eq!(config.audio_system_source.as_deref(), Some("nope.monitor"));
+    }
+
+    #[test]
+    fn a_non_string_audio_source_falls_back_to_discovery() {
+        let config = CaptureConfig::parse("audio-mic-source = 7").expect("valid TOML");
+        assert_eq!(config.audio_mic_source, None);
+    }
+
+    #[test]
+    fn audio_offset_accepts_floats_integers_and_negatives() {
+        for (toml, expected) in [
+            ("audio-offset = 0.08", 0.08),
+            ("audio-offset = 0", 0.0),
+            ("audio-offset = -0.25", -0.25),
+            ("audio-offset = 5.0", MAX_AUDIO_OFFSET),
+        ] {
+            let config = CaptureConfig::parse(toml).expect("well-formed TOML");
+            assert_eq!(config.audio_offset, expected, "{toml}");
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_or_wrong_typed_audio_offset_falls_back_to_the_default() {
+        for toml in [
+            "audio-offset = 500",
+            "audio-offset = -12.5",
+            r#"audio-offset = "0.1s""#,
+            "audio-offset = nan",
+        ] {
+            let config = CaptureConfig::parse(toml).expect("well-formed TOML");
+            assert_eq!(
+                config.audio_offset,
+                crate::audio::DEFAULT_SYNC_OFFSET,
+                "{toml} must warn and default"
+            );
+        }
     }
 
     /// A config that only overrides a couple of knobs leaves the rest at
@@ -570,6 +815,10 @@ mod tests {
         assert!(!config.png_also);
         assert_eq!(config.video_preset, VideoPreset::default());
         assert_eq!(config.vaapi_device, None);
+        assert_eq!(config.audio, None);
+        assert_eq!(config.audio_mic_source, None);
+        assert_eq!(config.audio_system_source, None);
+        assert_eq!(config.audio_offset, crate::audio::DEFAULT_SYNC_OFFSET);
         assert!(config.cursor);
         assert!(config.toasts);
         assert!(config.copy);

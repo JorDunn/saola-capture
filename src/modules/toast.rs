@@ -182,6 +182,16 @@ enum ToastKind {
     /// the capture card already documents, not an oversight; whichever stage
     /// first needs a real icon set fills it in here.
     Notice { title: String, body: String },
+    /// **Stage 12.** A recording that ended cleanly and was saved —
+    /// `RecordingFailed`'s success-side sibling. No thumbnail (a video's
+    /// first frame is not free to decode the way a screenshot's own pixels
+    /// already-in-hand are — Stage 11 deliberately writes recordings without
+    /// keeping a `Frame` around), so this renders the same plain-ivory tile
+    /// [`ToastKind::Notice`] does, for the same "no `src/icons.rs` yet"
+    /// reason. Clicking opens the **containing directory** (PLAN.md task 3:
+    /// "videos open containing dir for now") rather than the editor, which
+    /// has no video support at all.
+    Recording { path: PathBuf },
 }
 
 /// One notification card's state.
@@ -232,6 +242,11 @@ pub enum Action {
     /// Spawn the editor on this path — `main.rs` turns this into the
     /// detached `saola-capture window edit <path>` call.
     Open(PathBuf),
+    /// **Stage 12.** Open the directory containing this path — `main.rs`
+    /// turns this into a detached `xdg-open` on the parent directory. The
+    /// recording toast's click target, since the editor has no video
+    /// support (PLAN.md task 3: "videos open containing dir for now").
+    OpenDir(PathBuf),
 }
 
 impl ToastStack {
@@ -268,6 +283,14 @@ impl ToastStack {
             theme,
             now,
         );
+    }
+
+    /// Push a finished recording onto the stack — **Stage 12**'s success
+    /// half of [`Self::push_notice`]'s failure-toast precedent (PLAN.md task
+    /// 3, the finish toast). Same timing, same stack rule, same card; see
+    /// [`ToastKind::Recording`].
+    pub fn push_recording(&mut self, path: PathBuf, theme: &Theme, now: Instant) {
+        self.push_kind(ToastKind::Recording { path }, theme, now);
     }
 
     fn push_kind(&mut self, kind: ToastKind, theme: &Theme, now: Instant) {
@@ -313,8 +336,17 @@ impl ToastStack {
                     kind: ToastKind::Capture { path, .. },
                     ..
                 }) => Action::Open(path.clone()),
+                // **Stage 12.**
+                Some(Toast {
+                    kind: ToastKind::Recording { path },
+                    ..
+                }) => Action::OpenDir(path.clone()),
                 // A notice has nothing to open (Stage 11).
-                Some(_) | None => Action::None,
+                Some(Toast {
+                    kind: ToastKind::Notice { .. },
+                    ..
+                })
+                | None => Action::None,
             },
         }
     }
@@ -475,6 +507,13 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
                 .unwrap_or_else(|| path.display().to_string()),
         ),
         ToastKind::Notice { title, body } => (title.clone(), body.clone()),
+        // **Stage 12.**
+        ToastKind::Recording { path } => (
+            "Recording saved".to_string(),
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+        ),
     };
 
     let tile: Element<'static, Message> = match &toast.kind {
@@ -483,9 +522,9 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
             .height(Length::Fixed(ICON_TILE_SIZE))
             .content_fit(iced::ContentFit::Cover)
             .into(),
-        // See `ToastKind::Notice`: an ivory tile, no glyph, until this crate
-        // has an icon set.
-        ToastKind::Notice { .. } => {
+        // See `ToastKind::Notice`/`ToastKind::Recording`: an ivory tile, no
+        // glyph, until this crate has an icon set.
+        ToastKind::Notice { .. } | ToastKind::Recording { .. } => {
             let paper = scale_alpha(theme.palette.paper.into_iced());
             container(Space::new())
                 .width(Length::Fixed(ICON_TILE_SIZE))
@@ -652,14 +691,18 @@ mod tests {
         }
     }
 
-    /// Every card's path, for the stack-order assertions. A notice has none.
+    /// Every card's path, for the stack-order assertions. A notice has none;
+    /// a recording's own path is deliberately excluded too (nothing in this
+    /// module's own tests orders recordings against captures, so keeping
+    /// this helper `Capture`-only rather than teaching it a second path
+    /// shape it never needs to compare).
     fn stack_paths(stack: &ToastStack) -> Vec<PathBuf> {
         stack
             .toasts
             .iter()
             .filter_map(|toast| match &toast.kind {
                 ToastKind::Capture { path, .. } => Some(path.clone()),
-                ToastKind::Notice { .. } => None,
+                ToastKind::Notice { .. } | ToastKind::Recording { .. } => None,
             })
             .collect()
     }
