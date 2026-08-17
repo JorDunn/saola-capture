@@ -13,7 +13,7 @@ window, history library, annotation editor), and **CLI verbs** (`shot`,
 architecture, dependencies, or conventions updates this file in the same
 stage and says so in its handoff. A stale AGENTS.md is a bug.
 
-> Status: Stages 1–15 landed (repo skeleton, dependency survey; every capture
+> Status: Stages 1–16 landed (repo skeleton, dependency survey; every capture
 > path proven with live evidence in `docs/CAPTURE-RESEARCH.md`; full CLI
 > parsing, `capture.toml` config, the `io.saola.Capture1` bus, a surfaceless
 > daemon boot; Stage 5's **real screenshot pipeline**; Stage 6's **PrintScr
@@ -409,8 +409,84 @@ stage and says so in its handoff. A stale AGENTS.md is a bug.
 > `STEP_BADGE_FONT_RATIO`) — all three are drawing/layout parameters in the
 > same category `StrokeWidth::pixels` and `HANDLE_RADIUS` already
 > established as "not a design system's concern."
-> Still a stub, answering with a clean error naming its stage: `PickColor`
-> (Stage 16).
+> **Stage 16 lands the history library, real `PickColor`, and GIF/animated-
+> WebP export — no stub methods remain anywhere in `io.saola.Capture1`.**
+> **`PickColor` is real**: `dbus.rs::CaptureService::pick_color` now calls
+> `src/modules/picker.rs`, which proxies niri's own
+> `org.gnome.Shell.Screenshot.PickColor`, copies the resulting hex to the
+> clipboard (`storage::copy_text_to_clipboard`, a new sibling of the
+> existing PNG-only clipboard functions — Wayland text, not an image), and
+> raises a swatch toast (`modules::toast::ToastKind::Swatch`: a tile painted
+> the picked color itself, body text in the design system's mono family per
+> the style brief). **A real quirk this stage's own research corrected**:
+> niri's `PickColor` does **not** return a bare `(ddd)` the way `dbus.rs`'s
+> old stub doc comment assumed — `busctl --user introspect
+> org.gnome.Shell.Screenshot /org/gnome/Shell/Screenshot` (read-only,
+> live-verified against Jordan's real niri session) shows `PickColor`'s real
+> signature is `a{sv}`, a one-entry dict with the triple under a `"color"`
+> key; `modules::picker::extract_rgb` is what unwraps it. This crate's own
+> `io.saola.Capture1::PickColor() -> (ddd)` is unaffected — live-verified via
+> `busctl --user introspect io.saola.Capture1 /io/saola/Capture1` against an
+> isolated test daemon — that is a different interface with a signature this
+> crate chose deliberately, not a copy of niri's. **The interactive grab
+> itself was never triggered live** (this stage's own constraints forbid
+> it — no human present to click or cancel niri's real pointer grab);
+> verified instead by `modules::picker`'s unit tests (hex formatting,
+> `a{sv}` decoding against synthetic replies) and the two read-only
+> introspections above. `src/modules/history.rs` is the browsable capture
+> library — screenshots from `storage.rs`'s JSONL index, recordings found by
+> scanning the save directory for `Recording_*.{mkv,mp4}` (no index row for
+> recordings exists, and this stage deliberately keeps it that way — see the
+> module's own doc comment for the full reasoning it recorded) — rendered as
+> a scrollable list of thumbnailed rows (no flex-wrap widget is in this
+> crate's dependency set, so "grid" is a list of already-thumbnailed cards,
+> not a wrapped multi-column layout) inside a **new in-app `ViewState::
+> History`** on the app window (`modules::app`'s own doc comment now
+> documents this as a deliberate, narrow exception to "no navigation between
+> views" — history has no separate-document lifetime the way an edit
+> target does). Actions: Open/Edit (screenshots) or Show in folder
+> (recordings, since the editor still has no video support), Copy
+> (screenshots only — WebP entries decode-then-PNG-reencode through
+> `image`'s already-enabled WebP decode feature, no new dependency), Show in
+> folder, and Delete with a two-step inline confirm ("Delete this capture?
+> This can't be undone." — wording carries the severity, no red, per Design
+> language). **Deletion never rewrites `history.jsonl`**: the index stays
+> append-only exactly as documented; a deleted screenshot's row is filtered
+> out on every future load the same way a row whose file went missing any
+> other way already was. **GIF and animated-WebP export**
+> (`src/encode/export.rs`, a new sibling of `ffmpeg_cli.rs` — a **batch**
+> ffmpeg job over an existing file via `Command::output()`, not the
+> streaming `EncoderSink` trait) is a per-recording action on the History
+> screen: GIF runs ffmpeg's documented two-pass `palettegen`/`paletteuse`
+> recipe, animated WebP runs ffmpeg's one-pass `libwebp_anim` muxer (not the
+> vendored `webp` crate, which is still-image-only) — both resampled to a
+> fixed 12 fps and reported back with the exported file's real size. The
+> size-warning teaching note PLAN.md's task 3 asks for is a persistent line
+> above the list whenever any recording is present: exporting stores every
+> frame independently, so the result can be much larger than the source
+> recording. **Zero new dependencies this stage** — `image`'s WebP decode,
+> `serde_json`, and ffmpeg (already the sole external CLI) cover everything;
+> `Cargo.lock` is unchanged apart from this crate's own version. **445 tests
+> at Stage 15 → 478 at Stage 16** (+33: `modules::picker`'s hex/decode
+> tests, `modules::history`'s merge/scan/delete/format tests,
+> `encode::export`'s filename-collision and argument-builder tests,
+> `storage.rs`'s new JSONL-reader tests). **Live-verified against the real
+> session, 2026-08-17**: an isolated test daemon (`XDG_DATA_HOME`/
+> `--config-dir`/`save-dir` all in a scratch dir, teardown-checked — bus
+> name released, both processes gone) took a real `shot --fullscreen` and
+> produced a correct history row; `saola-capture window` booted against that
+> same daemon and rendered the Main tab's new "History"/"Pick Color" buttons
+> correctly (a `grim` capture confirmed the layout, styling and both new
+> buttons visually — see the Stage 16 handoff for the image). **Not live-
+> tested**: actually clicking History/Pick Color/any row action (this
+> stage's own scope note: synthetic input against a plain toplevel window
+> was not exercised, matching Stage 9/14/15's "no safe way to drive a plain
+> `iced::application` window's pointer/keyboard without Jordan present"
+> posture, and PickColor's own interactive grab is explicitly off-limits per
+> this stage's constraints); a real GIF/WebP export was not run against a
+> real recording (would need one to exist first — reasoned through and
+> argument-tested, not executed). See the Stage 16 handoff for the full
+> human-check list.
 > PLAN.md is the staged build plan. Sections marked *(pending Stage N)* fill
 > in as later stages land.
 >
@@ -468,15 +544,30 @@ cargo run -- record start --dry-run          # Stage 10: negotiate a real screen
 cargo run -- record start --dry-run --window-id 16  # cast one window instead of the focused output
                                                     # (dry-run's own window_id, independent of
                                                     # the real --window flag above — see cli.rs)
-cargo run -- pick-color
+cargo run -- pick-color             # real as of Stage 16 — blocks until you click (or Escape,
+                                    # unverified — see the Stage 16 handoff), prints #RRGGBB,
+                                    # copies it to the clipboard, and shows a swatch toast
 cargo run -- open                  # raises the app window (spawns it detached — Stage 9)
-cargo run -- window                # the app window process — Screenshot/Record tabs, real as of Stage 9
+cargo run -- window                # the app window process — Screenshot/Record tabs, real as of
+                                   # Stage 9; Stage 16 adds a "History"/"Pick Color" row under them
 cargo run -- window edit <path>    # boots straight into the real annotation editor (Stage 14,
                                    # text/step/blur/pixelate added Stage 15) — crop/arrow/rectangle/
                                    # ellipse/freehand/text/step/blur/pixelate, undo/redo, an export
                                    # panel (format/quality), Save/Save As/Copy/Save & Copy
 cargo run -- --config-dir ~/scratch shot --fullscreen  # capture.toml from an alternate dir
 ```
+
+**Stage 16's History screen** is reached from the app window's Main tab
+("History" button), not a separate CLI verb or `window` subcommand — it's
+in-app navigation within the already-running `window` process
+(`modules::app::ViewState::History`), not a spawn. It shows every saved
+screenshot (from `history.jsonl`) and recording (found by scanning the save
+directory for `Recording_*.{mkv,mp4}` — see `src/modules/history.rs`'s own
+doc comment for why that's a directory scan and not an index-schema bump),
+with Open/Edit, Copy (screenshots only), Show in folder, Delete (two-step
+confirm) and, per recording, Export GIF/Export WebP
+(`src/encode/export.rs`, ffmpeg's two-pass `palettegen`/`paletteuse` for
+GIF, one-pass `libwebp_anim` for animated WebP).
 
 There is also a **hidden** verb, `saola-capture clipboard-serve --mime
 image/png`, which reads bytes on stdin and serves them as the Wayland
@@ -496,9 +587,9 @@ Every CLI verb above except `--no-daemon` shots and `record --dry-run` is a
 real D-Bus client of the daemon as of Stage 3 (auto-spawning it detached, retrying once, if the bus
 name is unowned) — `busctl --user introspect io.saola.Capture1
 /io/saola/Capture1` shows the live interface once a daemon is running. As of
-Stage 5 `Screenshot` is real, as of Stage 9 `OpenWindow`, and as of Stage 11
-`StartRecording`/`StopRecording`; **`PickColor` is the last stub** (Stage 16;
-`src/dbus.rs` says so in its own error). Stage 11 also added the interface's
+Stage 5 `Screenshot` is real, as of Stage 9 `OpenWindow`, as of Stage 11
+`StartRecording`/`StopRecording`, and **as of Stage 16 `PickColor`** — no
+stub methods remain on `io.saola.Capture1`. Stage 11 also added the interface's
 one **property**, `Recording b` (read-only, true while anything is starting,
 recording *or* stopping) — an additive extension, not a change to the frozen
 signal contract, and the only way `record toggle` can choose a branch without
@@ -989,6 +1080,14 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   *default* near-black scrollbar straight over `paper_window`'s rounded
   corner. `saola_theme::style::scrollable::rest` already existed and is now
   applied; check for that helper before adding any new scrollable.
+- **No new saola-theme gap found in Stage 16** — `modules::history`'s one
+  bare-literal size, `THUMBNAIL_MAX_DIM` (96px), is the same "a design
+  system has no opinion on a drawing surface's own layout parameter"
+  category `modules::editor`'s `STEP_BADGE_RADIUS`/`QUALITY_FIELD_WIDTH`
+  already established, not a value a token scale should own. Everything
+  else this stage drew (the History screen's rows, the swatch toast) reused
+  existing tokens/styles (`button::rest`/`active`, `scrollable::rest`,
+  `mono_font`, `on_paper.*`, `sizes.*`) with no new derived style needed.
 
 ## Conventions
 
@@ -1021,7 +1120,18 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   resolved in `Cargo.lock` at exactly this version, pulled transitively by
   `iced_wgpu`'s own text-rendering pipeline (`cryoglyph`) — `Cargo.lock`'s
   diff for this stage is one line, a new edge to an already-compiled crate,
-  not a new `[[package]]` entry. **Stage 13 added no dependency
+  not a new `[[package]]` entry. **Stage 16 added no dependency and no new
+  runtime binary either**: the history library reads `storage.rs`'s existing
+  JSONL format and a plain directory scan; `PickColor` is a `#[zbus::proxy]`
+  client against an interface niri already serves (same shape
+  `capture/screencast.rs`'s `ScreenCastProxy` already established); a
+  screenshot's WebP-to-PNG re-encode for Copy uses `image = "0.25"`'s
+  already-enabled WebP *decode* feature (the WebP survey's own gap was the
+  lossy *encoder*, which is why `webp` entered the tree in Stage 1 — decode
+  was never missing); and GIF/animated-WebP export is two more argument
+  lists to the same `ffmpeg` binary this crate already shells out to,
+  through `std::process::Command::output()`. `Cargo.lock` is unchanged
+  apart from this crate's own version bump. **Stage 13 added no dependency
   either — nor any new runtime binary**: audio is `-f pulse` argv plus
   `ffmpeg -sources/-sinks pulse` for device names, so the PKGBUILD gains
   nothing (a `pactl`-based design would have added `libpulse` to `depends`).
@@ -1185,7 +1295,8 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   `~/.local/share/saola/capture/history.jsonl`), one object per line with
   `v/unix/path/png?/kind/format/width/height/scale/bytes` — readers must
   ignore unknown keys and skip unparseable lines. Full spec on
-  `storage::HistoryEntry`; Stage 16's library is its consumer. Clipboard and
+  `storage::HistoryEntry`; `storage::read_history_entries` (Stage 16) is the
+  one reader, and `modules::history` is its consumer. Clipboard and
   index failures **warn and continue** — the file is already on disk.
 - **Recordings share that directory and almost nothing else** (Stage 11,
   `storage::allocate_recording_path`). They are named
@@ -1205,12 +1316,18 @@ PLAN.md's Architecture section is binding; read it first. Summary:
     yet, and `FfmpegSink`'s zero-byte cleanup (which removes only
     zero-length files, never a partial one) correctly took it away.
   - **No clipboard.** Nothing pastes a video.
-  - **No history-index row.** `HistoryEntry`'s documented schema fixes
-    `format` to `"webp" | "png"` and carries still-image-only fields
-    (`png`, `scale`), and Stage 16's library is written against that. Adding
-    videos is a schema decision (a `v: 2`, or a `type` key) that belongs to
-    whichever stage builds the library's video half, not to one that would be
-    guessing at its reader. Verified live: a run with an isolated
+  - **No history-index row, and Stage 16 kept it that way on purpose.**
+    `HistoryEntry`'s documented schema fixes `format` to `"webp" | "png"`
+    and carries still-image-only fields (`png`, `scale`); rather than bump
+    the schema (a `v: 2`, or a `type` key) to give recordings a row,
+    `modules::history` finds them with a directory scan filtered on this
+    prefix and `VIDEO_EXTENSIONS` (both now `pub(crate)` in `storage.rs`
+    specifically so the library can reuse them) — see that module's own doc
+    comment for the full reasoning (a schema bump would touch a stable,
+    load-bearing writer for a reader-only feature; the filename convention
+    already carries everything the library needs; a scan self-heals when a
+    file is deleted by hand, an index row would not). Verified live: a run
+    with an isolated
     `XDG_DATA_HOME` produced four recordings and **no** `history.jsonl` at
     all.
 - **One runtime**: `zbus 5` with `default-features = false, features =
@@ -1531,6 +1648,23 @@ PLAN.md's Architecture section is binding; read it first. Summary:
   — `niri msg layers | grep -c 'Namespace: "saola-capture"'` going 1 → 2 → 1
   across the toast's life, the flash being the permanent one. Worth
   remembering as a cheap toast check even when the screen *is* visible.
+  **Stage 16 found a real, safe middle ground for `PickColor`**: niri's
+  `org.gnome.Shell.Screenshot.PickColor` is a genuine interactive pointer
+  grab against the real session (the same "must never be exercised outside
+  a nested niri, and nested niri serves no D-Bus interfaces at all" bind
+  Stage 10 already documented for the ScreenCast interface applies here too
+  — read-only introspection is safe, an actual call is not, without a human
+  present to click or cancel it). What *is* both safe and useful: `busctl
+  --user introspect org.gnome.Shell.Screenshot /org/gnome/Shell/Screenshot`
+  (confirms the interface is served and its exact signature — this is how
+  Stage 16 caught the `a{sv}`-not-`(ddd)` quirk, entirely read-only) and
+  `busctl --user introspect io.saola.Capture1 /io/saola/Capture1` against an
+  isolated test daemon (confirms this crate's *own* `PickColor() -> (ddd)`
+  is unaffected). Whoever next needs to verify the interactive half end to
+  end should run `saola-capture pick-color` themselves, present, ready to
+  click or Escape — the same posture Stage 7's overlay and Stage 13's
+  microphone recording already established for "needs a human, not a
+  script".
 - **Conventional Commits** (release-plz derives bumps); `chore:`/`ci:`/
   `docs:`/`test:` are changelog-invisible. Never hand-edit versions or
   `CHANGELOG.md`.

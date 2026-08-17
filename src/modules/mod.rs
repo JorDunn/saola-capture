@@ -21,12 +21,20 @@
 //! the real annotation editor rendered inside [`app`]'s `ViewState::Editor`
 //! (also not a `SurfaceRole` — it's a body widget of the app window, not a
 //! surface of its own); see its own doc comment for the canvas architecture.
+//! Stage 16 adds two more window-process modules, following [`editor`]'s
+//! shape rather than a daemon `SurfaceRole`'s: [`history`] (the capture
+//! library, rendered inside [`app`]'s `ViewState::History`) and [`picker`]
+//! (the `PickColor` client — its own async orchestration plus the pure
+//! hex/decode helpers, called from *both* `dbus.rs`'s served method and, for
+//! the CLI's stdout formatting, `main.rs`).
 
 pub mod app;
 pub mod countdown;
 pub mod editor;
 pub mod flash;
+pub mod history;
 pub mod overlay;
+pub mod picker;
 pub mod recorder;
 pub mod toast;
 pub mod tray;

@@ -76,6 +76,13 @@ use crate::config::ImageFormat;
 /// doc comment on why this is always PNG.
 const CLIPBOARD_MIME: &str = "image/png";
 
+/// **Stage 16.** The MIME string a *detached* text-clipboard helper is told
+/// to serve (`spawn_clipboard_helper`/`run_clipboard_serve`, which both need
+/// an explicit string rather than [`wl_clipboard_rs::copy::MimeType::Text`]'s
+/// in-process convenience — see [`copy_text_to_clipboard`]'s doc comment).
+/// The conventional value for arbitrary UTF-8 plain text on Wayland/X11.
+const TEXT_MIME: &str = "text/plain;charset=utf-8";
+
 /// How many `-1`, `-2`, … suffixes to try before giving up on finding a free
 /// filename. Collisions only happen for two captures within the same second,
 /// so this is generous by three orders of magnitude; the cap exists so a
@@ -357,7 +364,13 @@ fn timestamp_stem() -> String {
 /// holding both wants them to sort into groups, and because the name is the
 /// only thing distinguishing the two once they are on disk.
 const SCREENSHOT_PREFIX: &str = "Screenshot";
-const RECORDING_PREFIX: &str = "Recording";
+/// `pub(crate)` as of **Stage 16**: [`crate::modules::history`] scans the
+/// save directory for recordings by this same prefix (recordings have no
+/// history-index row — see [`allocate_recording_path`]'s doc comment — so
+/// the library's only way to find them is the filename convention this
+/// constant *is*). Keeping one definition rather than a second literal in
+/// `history.rs` means the writer and the reader cannot drift.
+pub(crate) const RECORDING_PREFIX: &str = "Recording";
 
 /// [`timestamp_stem`] with the prefix chosen by the caller.
 fn timestamp_stem_named(prefix: &str) -> String {
@@ -376,7 +389,11 @@ const IMAGE_EXTENSIONS: &[&str] = &["webp", "png"];
 /// Every extension a recording can occupy — both containers, for the same
 /// reason [`unique_stem_among`] checks both image extensions: a `.mkv` from
 /// one run and a `.mp4` from the next must not share a stem.
-const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4"];
+///
+/// `pub(crate)` as of **Stage 16** — see [`RECORDING_PREFIX`]'s doc comment;
+/// [`crate::modules::history`]'s directory scan filters on both this and the
+/// prefix, rather than re-deciding what a recording's extension can be.
+pub(crate) const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4"];
 
 /// Where a recording is about to be written — **Stage 11**.
 ///
@@ -645,8 +662,25 @@ pub fn encode_frame(
 /// different mechanisms rather than one.
 pub fn copy_to_clipboard(png: &[u8], owner: ClipboardOwner) -> Result<(), io::Error> {
     match owner {
-        ClipboardOwner::ThisProcess => serve_clipboard_in_process(png),
-        ClipboardOwner::DetachedHelper => spawn_clipboard_helper(png),
+        ClipboardOwner::ThisProcess => serve_bytes_in_process(png, CLIPBOARD_MIME),
+        ClipboardOwner::DetachedHelper => spawn_clipboard_helper(png, CLIPBOARD_MIME),
+    }
+}
+
+/// Puts `text` on the Wayland clipboard as plain text — **Stage 16**, the
+/// `PickColor` swatch's hex code. A genuinely different content class from
+/// every other clipboard write in this module (which are all `image/png`),
+/// so this is a sibling entry point rather than a special case bolted onto
+/// [`copy_to_clipboard`]'s image-shaped signature.
+///
+/// `wl_clipboard_rs::copy::MimeType::Text` is the crate's own "plain text,
+/// let the library pick the conventional MIME string" mode — the same
+/// convenience [`copy_to_clipboard`] deliberately does *not* use (an image
+/// needs an exact, specific MIME type; text does not).
+pub fn copy_text_to_clipboard(text: &str, owner: ClipboardOwner) -> Result<(), io::Error> {
+    match owner {
+        ClipboardOwner::ThisProcess => serve_text_in_process(text),
+        ClipboardOwner::DetachedHelper => spawn_clipboard_helper(text.as_bytes(), TEXT_MIME),
     }
 }
 
@@ -666,26 +700,53 @@ fn clear_clipboard() -> Result<(), io::Error> {
 /// `wl-clipboard-rs`'s default mode: it spawns a thread that owns the
 /// selection and answers paste requests until something else takes over.
 /// Correct only in a process that outlives the copy — the daemon.
-fn serve_clipboard_in_process(png: &[u8]) -> Result<(), io::Error> {
+///
+/// **Generalized in Stage 16** from an image-only `serve_clipboard_in_process`
+/// to take an explicit `mime` — [`copy_text_to_clipboard`]'s `ThisProcess` arm
+/// wants the exact same "spawn a thread, own the selection" behavior for a
+/// hex string that [`copy_to_clipboard`] already had for PNG bytes, and the
+/// only thing that differs between them is which MIME type is offered.
+fn serve_bytes_in_process(bytes: &[u8], mime: &str) -> Result<(), io::Error> {
     use wl_clipboard_rs::copy::{MimeType, Options, Source};
 
     Options::new()
         .copy(
-            Source::Bytes(png.to_vec().into_boxed_slice()),
-            MimeType::Specific(CLIPBOARD_MIME.to_string()),
+            Source::Bytes(bytes.to_vec().into_boxed_slice()),
+            MimeType::Specific(mime.to_string()),
         )
         .map_err(io::Error::other)
 }
 
-/// Spawns `saola-capture clipboard-serve --mime image/png` detached and
-/// pipes it the bytes. The child then owns the selection for as long as it
-/// holds it, outliving this process — see [`crate::cli::Command::ClipboardServe`].
-fn spawn_clipboard_helper(png: &[u8]) -> Result<(), io::Error> {
+/// [`serve_bytes_in_process`] via [`wl_clipboard_rs::copy::MimeType::Text`]
+/// rather than a specific string — see [`copy_text_to_clipboard`]'s doc
+/// comment for why plain text gets the library's own MIME choice instead of
+/// [`CLIPBOARD_MIME`]'s exact-string treatment.
+fn serve_text_in_process(text: &str) -> Result<(), io::Error> {
+    use wl_clipboard_rs::copy::{MimeType, Options, Source};
+
+    Options::new()
+        .copy(
+            Source::Bytes(text.as_bytes().to_vec().into_boxed_slice()),
+            MimeType::Text,
+        )
+        .map_err(io::Error::other)
+}
+
+/// Spawns `saola-capture clipboard-serve --mime <mime>` detached and pipes it
+/// `bytes`. The child then owns the selection for as long as it holds it,
+/// outliving this process — see [`crate::cli::Command::ClipboardServe`].
+///
+/// **Generalized in Stage 16** from an image-only `spawn_clipboard_helper`
+/// (which always passed [`CLIPBOARD_MIME`]) to take `mime` explicitly, for
+/// the same reason [`serve_bytes_in_process`] was: [`copy_text_to_clipboard`]
+/// wants the identical detached-helper mechanism with a different MIME
+/// string, not a second copy of the process-spawning code.
+fn spawn_clipboard_helper(bytes: &[u8], mime: &str) -> Result<(), io::Error> {
     let exe = std::env::current_exe()?;
     let mut child = Command::new(exe)
         .arg("clipboard-serve")
         .arg("--mime")
-        .arg(CLIPBOARD_MIME)
+        .arg(mime)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -695,7 +756,7 @@ fn spawn_clipboard_helper(png: &[u8]) -> Result<(), io::Error> {
     // died on startup this returns `EPIPE` rather than a signal — Rust sets
     // `SIGPIPE` to `SIG_IGN` at process start — so the error is reportable.
     let result = match child.stdin.take() {
-        Some(mut stdin) => stdin.write_all(png),
+        Some(mut stdin) => stdin.write_all(bytes),
         None => Err(io::Error::other(
             "could not open a pipe to the clipboard helper",
         )),
@@ -853,6 +914,107 @@ fn history_line(entry: &HistoryEntry) -> String {
     object.insert("scale".to_string(), serde_json::Value::from(entry.scale));
     object.insert("bytes".to_string(), serde_json::Value::from(entry.bytes));
     serde_json::Value::Object(object).to_string()
+}
+
+// ---------------------------------------------------------------------
+// History index — reading (Stage 16)
+// ---------------------------------------------------------------------
+
+/// Reads every parseable row of the index at `path`, oldest first (the file's
+/// own append order — see [`HistoryEntry`]'s doc comment, "newest last").
+/// [`crate::modules::history`] is the one caller, and reverses this itself
+/// for "newest first" display, keeping this function's contract "the file,
+/// faithfully" rather than baking in a display order.
+///
+/// **Best-effort, matching every other reader in this module**: a missing
+/// file (no history yet, or `history` was never written for lack of a data
+/// directory — see [`save_capture_indexing_to`]) is not an error, just an
+/// empty history — `Vec::new()`. A line that fails to parse is *skipped*,
+/// per [`HistoryEntry`]'s own documented reader contract ("a line half-
+/// written by a machine that lost power is the expected failure, and it is
+/// always the last one"); this function does not distinguish "skipped a bad
+/// line" from "the file just doesn't have one" in its return value, because
+/// nothing downstream needs to know which — a corrupt trailing line and a
+/// pristine file both mean "here is everything readable".
+pub fn read_history_entries(path: &Path) -> Vec<HistoryEntry> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    parse_history_lines(&text)
+}
+
+/// The testable core of [`read_history_entries`]: the same parse, over text
+/// already in memory rather than read from a path — so a fixture string
+/// (including deliberately malformed lines) exercises the parser without
+/// touching the filesystem, the same split every other pure/impure pair in
+/// this module uses.
+fn parse_history_lines(text: &str) -> Vec<HistoryEntry> {
+    text.lines().filter_map(parse_history_line).collect()
+}
+
+/// One line to one [`HistoryEntry`], or `None` if the line is blank, isn't
+/// valid JSON, isn't an object, is missing a required key, or has a `kind`/
+/// `format` outside the schema's documented enum — every one of those is
+/// "cannot parse", not a partial success, so this returns `Option` rather
+/// than trying to salvage a half-decoded entry.
+///
+/// `kind`/`format` decode through [`static_kind`]/[`static_format`] rather
+/// than leaking an arbitrary `String` to `&'static str`: [`HistoryEntry`]'s
+/// fields are `&'static str` specifically because the schema is a closed
+/// enum of three/two known words (see its own doc comment's table), so a
+/// reader that saw some *other* word has found a line this schema version
+/// cannot represent — correctly "cannot parse", not a value to invent a
+/// leaked string for.
+fn parse_history_line(line: &str) -> Option<HistoryEntry> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object()?;
+
+    let unix = object.get("unix")?.as_i64()?;
+    let path = PathBuf::from(object.get("path")?.as_str()?);
+    let png_sidecar = object
+        .get("png")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let kind = static_kind(object.get("kind")?.as_str()?)?;
+    let format = static_format(object.get("format")?.as_str()?)?;
+    let width = u32::try_from(object.get("width")?.as_u64()?).ok()?;
+    let height = u32::try_from(object.get("height")?.as_u64()?).ok()?;
+    let scale = object.get("scale")?.as_f64()?;
+    let bytes = object.get("bytes")?.as_u64()?;
+
+    Some(HistoryEntry {
+        unix,
+        path,
+        png_sidecar,
+        kind,
+        format,
+        width,
+        height,
+        scale,
+        bytes,
+    })
+}
+
+fn static_kind(value: &str) -> Option<&'static str> {
+    match value {
+        "fullscreen" => Some("fullscreen"),
+        "region" => Some("region"),
+        "window" => Some("window"),
+        _ => None,
+    }
+}
+
+fn static_format(value: &str) -> Option<&'static str> {
+    match value {
+        "webp" => Some("webp"),
+        "png" => Some("png"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1363,5 +1525,90 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(contents.lines().next().expect("one line")).expect("valid JSON");
         assert_eq!(parsed["v"], 1);
+    }
+
+    // -- history index — reading (Stage 16) ---------------------------------
+
+    #[test]
+    fn round_trips_a_written_entry_through_the_reader() {
+        let entry = HistoryEntry {
+            unix: 1_786_000_000,
+            path: PathBuf::from("/tmp/Screenshot_2026-08-08_17-04-09.webp"),
+            png_sidecar: Some(PathBuf::from("/tmp/Screenshot_2026-08-08_17-04-09.png")),
+            kind: "region",
+            format: "webp",
+            width: 640,
+            height: 480,
+            scale: 1.5,
+            bytes: 12_345,
+        };
+        let parsed = parse_history_lines(&history_line(&entry));
+        assert_eq!(parsed, vec![entry]);
+    }
+
+    #[test]
+    fn the_reader_skips_blank_and_unparseable_lines_but_keeps_the_good_ones() {
+        let good = HistoryEntry {
+            unix: 1,
+            path: PathBuf::from("/tmp/a.webp"),
+            png_sidecar: None,
+            kind: "fullscreen",
+            format: "webp",
+            width: 1,
+            height: 1,
+            scale: 1.0,
+            bytes: 1,
+        };
+        let text = format!(
+            "\n{}\nnot json at all\n{{\"unix\": 2}}\n{{\"unix\":3,\"path\":\"/tmp/b.webp\",\
+             \"kind\":\"laser\",\"format\":\"webp\",\"width\":1,\"height\":1,\"scale\":1.0,\
+             \"bytes\":1}}\n",
+            history_line(&good)
+        );
+        // Line 1: blank. Line 3: garbage. Line 4: valid JSON, missing keys.
+        // Line 5: an unknown `kind` — outside the closed enum, so it must be
+        // dropped too, per `static_kind`'s doc comment.
+        let parsed = parse_history_lines(&text);
+        assert_eq!(parsed, vec![good]);
+    }
+
+    #[test]
+    fn read_history_entries_on_a_missing_file_is_an_empty_history_not_an_error() {
+        let dir = TempDir::new("history-missing");
+        let path = dir.path().join("does-not-exist.jsonl");
+        assert_eq!(read_history_entries(&path), Vec::new());
+    }
+
+    #[test]
+    fn read_history_entries_reads_a_real_file_in_append_order() {
+        let dir = TempDir::new("history-read");
+        let path = dir.path().join("history.jsonl");
+
+        let first = HistoryEntry {
+            unix: 1,
+            path: PathBuf::from("/tmp/first.webp"),
+            png_sidecar: None,
+            kind: "fullscreen",
+            format: "webp",
+            width: 1,
+            height: 1,
+            scale: 1.0,
+            bytes: 1,
+        };
+        let second = HistoryEntry {
+            unix: 2,
+            path: PathBuf::from("/tmp/second.webp"),
+            png_sidecar: None,
+            kind: "window",
+            format: "png",
+            width: 1,
+            height: 1,
+            scale: 1.0,
+            bytes: 1,
+        };
+        append_history(&path, &first).expect("append");
+        append_history(&path, &second).expect("append");
+
+        assert_eq!(read_history_entries(&path), vec![first, second]);
     }
 }

@@ -192,6 +192,16 @@ enum ToastKind {
     /// "videos open containing dir for now") rather than the editor, which
     /// has no video support at all.
     Recording { path: PathBuf },
+    /// **Stage 16.** `PickColor` resolved. The icon tile is the picked
+    /// color itself (a real swatch — the one `ToastKind` with content it can
+    /// paint directly, unlike `Notice`/`Recording`'s "no `src/icons.rs` yet"
+    /// plain-ivory substitute), and the body is the hex string in the
+    /// design system's monospace family (PLAN.md task 2: "swatch toast + hex
+    /// (mono font)"). Clicking does nothing — same posture as `Notice`: the
+    /// clipboard copy already happened at pick time
+    /// (`dbus.rs::CaptureService::pick_color`), before this toast is even
+    /// pushed, so there is nothing left for a click to *do*.
+    Swatch { hex: String, rgb: (f64, f64, f64) },
 }
 
 /// One notification card's state.
@@ -293,6 +303,12 @@ impl ToastStack {
         self.push_kind(ToastKind::Recording { path }, theme, now);
     }
 
+    /// Push a `PickColor` result — **Stage 16**. Same timing, same stack
+    /// rule, same card; see [`ToastKind::Swatch`].
+    pub fn push_swatch(&mut self, hex: String, rgb: (f64, f64, f64), theme: &Theme, now: Instant) {
+        self.push_kind(ToastKind::Swatch { hex, rgb }, theme, now);
+    }
+
     fn push_kind(&mut self, kind: ToastKind, theme: &Theme, now: Instant) {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
@@ -341,9 +357,11 @@ impl ToastStack {
                     kind: ToastKind::Recording { path },
                     ..
                 }) => Action::OpenDir(path.clone()),
-                // A notice has nothing to open (Stage 11).
+                // A notice has nothing to open (Stage 11); neither does a
+                // swatch (Stage 16) — the clipboard copy already happened
+                // before this toast was ever pushed.
                 Some(Toast {
-                    kind: ToastKind::Notice { .. },
+                    kind: ToastKind::Notice { .. } | ToastKind::Swatch { .. },
                     ..
                 })
                 | None => Action::None,
@@ -514,6 +532,10 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string()),
         ),
+        // **Stage 16.** The body is the hex string itself, rendered below in
+        // the design system's mono family rather than `body_font` — see the
+        // `tile`/mono-font branch just below this match.
+        ToastKind::Swatch { hex, .. } => ("Color picked".to_string(), hex.clone()),
     };
 
     let tile: Element<'static, Message> = match &toast.kind {
@@ -531,6 +553,23 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
                 .height(Length::Fixed(ICON_TILE_SIZE))
                 .style(move |_: &iced::Theme| container::Style {
                     background: Some(iced::Background::Color(paper)),
+                    ..container::Style::default()
+                })
+                .into()
+        }
+        // **Stage 16.** Unlike `Notice`/`Recording`, this tile *has* real
+        // content to paint with no icon set needed at all: the picked color
+        // itself, at full alpha regardless of the card's own fade (a
+        // desaturated swatch mid-fade would misreport the very color the
+        // toast exists to show).
+        ToastKind::Swatch { rgb, .. } => {
+            let (r, g, b) = *rgb;
+            let swatch = iced::Color::from_rgb(r as f32, g as f32, b as f32);
+            container(Space::new())
+                .width(Length::Fixed(ICON_TILE_SIZE))
+                .height(Length::Fixed(ICON_TILE_SIZE))
+                .style(move |_: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(swatch)),
                     ..container::Style::default()
                 })
                 .into()
@@ -554,8 +593,16 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
     ]
     .align_y(Center);
 
+    // **Stage 16.** PLAN.md task 2: "swatch toast + hex (mono font)" — the
+    // one card whose body isn't a filename or free-text message, so it's the
+    // one card that reaches for `saola_theme::convert::mono_font` rather
+    // than `body_font`.
+    let body_display_font = match &toast.kind {
+        ToastKind::Swatch { .. } => saola_theme::convert::mono_font(theme),
+        _ => body_font,
+    };
     let body = text(body_text)
-        .font(body_font)
+        .font(body_display_font)
         .size(body_size)
         .color(text_secondary);
 
@@ -702,7 +749,9 @@ mod tests {
             .iter()
             .filter_map(|toast| match &toast.kind {
                 ToastKind::Capture { path, .. } => Some(path.clone()),
-                ToastKind::Notice { .. } | ToastKind::Recording { .. } => None,
+                ToastKind::Notice { .. }
+                | ToastKind::Recording { .. }
+                | ToastKind::Swatch { .. } => None,
             })
             .collect()
     }

@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::VideoPreset;
 
+pub mod export;
 pub mod ffmpeg_cli;
 
 /// The default video bitrate for both hardware presets — CAPTURE-RESEARCH

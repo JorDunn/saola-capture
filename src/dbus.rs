@@ -317,6 +317,14 @@ pub enum DaemonEvent {
     /// from inside a served D-Bus method, which has no way to reach the
     /// iced daemon's own event loop directly.
     QuitRequested,
+    /// **Stage 16.** `PickColor` resolved — the swatch toast's content.
+    /// Sent alongside (never instead of) `PickColor`'s own D-Bus reply,
+    /// the same "the bus reply is the contract; this is purely the
+    /// on-screen half" split every other event in this enum already
+    /// follows. `hex` is precomputed (`modules::picker::rgb_to_hex`) rather
+    /// than making the toast redo the conversion — one definition, one call
+    /// site, matching that function's own doc comment.
+    ColorPicked { hex: String, rgb: (f64, f64, f64) },
 }
 
 /// How an interactive region selection ended — the value the daemon sends
@@ -343,17 +351,14 @@ pub enum RegionOutcome {
     Unavailable(&'static str),
 }
 
-/// A method that isn't implemented yet: log to stderr (so `daemon`'s own
-/// terminal, or its systemd journal once Stage 17 wires autostart, shows
-/// what was asked for) and hand back a clean `zbus::fdo::Error` naming the
-/// stage that lands it. Centralized here so all five stub bodies stay
-/// one-line calls instead of five copies of the same two statements —
-/// Stage 5/10/16 delete the corresponding call site (not this function) as
-/// each method grows a real implementation.
-fn not_yet_implemented(method: &str, stage: &str) -> zbus::fdo::Error {
-    eprintln!("saola-capture: daemon: {method} called — not implemented yet ({stage})");
-    zbus::fdo::Error::NotSupported(format!("{method} is not implemented yet ({stage})"))
-}
+// `not_yet_implemented` — the helper every stub method through Stage 15
+// shared ("log to stderr, hand back a clean `zbus::fdo::Error` naming the
+// stage that lands it") — is gone as of **Stage 16**: `PickColor` was the
+// last stub (every prior stage's Status paragraph said so), and a helper
+// with no remaining call site is dead code under `-D warnings`, not a
+// convenience worth keeping "just in case". If a future method is added as
+// a stub again, recreating a one-line version of this is cheap; keeping an
+// unused one around is not.
 
 /// The daemon's half of the `shot` pipeline — the exact two library calls
 /// `main.rs`'s `--no-daemon` branch makes, in the same order, differing only
@@ -1552,11 +1557,74 @@ impl CaptureService {
 
     /// `PickColor() -> (ddd)` — RGB in `0.0..=1.0`, matching
     /// `org.gnome.Shell.Screenshot.PickColor`'s own return shape (Stage 2's
-    /// research: niri serves this itself). Stage 16 wires this to
-    /// `modules/picker.rs`.
+    /// research: niri serves this itself).
+    ///
+    /// **Real as of Stage 16**, via `modules::picker::pick_color` — see that
+    /// module's doc comment for a correction this stage's own research
+    /// found: niri's `PickColor` does not actually return a bare `(ddd)`
+    /// the way this crate's own method (below) does; it returns `a{sv}`
+    /// with the triple under a `"color"` key, and `modules::picker` is what
+    /// unwraps that. This method's *own* signature is unaffected — it is a
+    /// different interface with a signature this crate chose deliberately.
+    ///
+    /// Blocks until the user clicks (or cancels), exactly like
+    /// `Screenshot`'s interactive region and `StopRecording` — see
+    /// `modules::picker::pick_color`'s doc comment for why that's safe here
+    /// too. On success this also copies the hex string to the clipboard
+    /// (`storage::copy_text_to_clipboard`, `ClipboardOwner::ThisProcess` —
+    /// the daemon outlives the copy, same reasoning `capture_and_save`
+    /// already uses for a screenshot's own clipboard write) and offers a
+    /// swatch toast via `Self::events` — both **best-effort**: a clipboard
+    /// or channel failure is logged and does not fail the call, since the
+    /// caller (a CLI verb, the app window) is still owed the three doubles
+    /// either way.
     async fn pick_color(&self) -> zbus::fdo::Result<(f64, f64, f64)> {
         eprintln!("saola-capture: daemon: PickColor()");
-        Err(not_yet_implemented("PickColor", "Stage 16"))
+
+        let connection = match Connection::session().await {
+            Ok(connection) => connection,
+            Err(err) => {
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "could not open a session bus connection to call PickColor: {err}"
+                )));
+            }
+        };
+
+        let (r, g, b) = crate::modules::picker::pick_color(&connection)
+            .await
+            .map_err(|err| {
+                eprintln!("saola-capture: daemon: PickColor failed: {err}");
+                zbus::fdo::Error::Failed(err.to_string())
+            })?;
+
+        let hex = crate::modules::picker::rgb_to_hex(r, g, b);
+
+        if let Err(err) = crate::storage::copy_text_to_clipboard(
+            &hex,
+            crate::storage::ClipboardOwner::ThisProcess,
+        ) {
+            eprintln!(
+                "saola-capture: daemon: picked {hex} but could not copy it to the clipboard: \
+                 {err}"
+            );
+        }
+
+        if self
+            .events
+            .clone()
+            .try_send(DaemonEvent::ColorPicked {
+                hex: hex.clone(),
+                rgb: (r, g, b),
+            })
+            .is_err()
+        {
+            eprintln!(
+                "saola-capture: daemon: could not show the swatch toast for {hex} (channel full \
+                 or the daemon's event loop is gone) — the color was still picked and copied"
+            );
+        }
+
+        Ok((r, g, b))
     }
 
     /// `OpenWindow(mode s)` — `mode` is `"main"` or `"edit:<path>"` (see

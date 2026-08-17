@@ -29,10 +29,13 @@
 //! and the `window edit <path>` stub editor), and `dbus.rs`'s `OpenWindow`
 //! spawns it detached instead of answering with a stub error.
 //!
-//! What is still a stub: `record start|stop|toggle` (Stage 11 — the daemon
-//! has no encoder yet) and `pick-color` (Stage 16) — each reporting a clean
-//! error naming its stage rather than failing silently. **`record start
-//! --dry-run` is not a stub as of Stage 10**: it runs the whole
+//! **Stage 16 makes `pick-color` real** too: `run_pick_color` (below) still
+//! does exactly what it always did — call the daemon's `PickColor` and
+//! format the reply as a hex swatch — but the daemon's own side of that call
+//! (`dbus.rs::CaptureService::pick_color`) is no longer a stub, so this path
+//! is now genuinely end-to-end. Nothing else in this file was a stub by
+//! Stage 15; `record start|stop|toggle` became real in Stage 11. **`record
+//! start --dry-run` is not a stub as of Stage 10**: it runs the whole
 //! ScreenCast-plus-PipeWire negotiation in this process (`run_record_dry_run`
 //! → `capture::screencast::dry_run`) and never contacts the daemon at all.
 //!
@@ -430,27 +433,20 @@ fn run_record_dry_run(
 }
 
 /// `pick-color`: call the daemon, format the RGB triple as a hex swatch.
-/// The daemon's `PickColor` stub always errors today (Stage 16 wires it
-/// to niri's `org.gnome.Shell.Screenshot.PickColor`), so the formatting
-/// path below isn't reachable end to end yet — kept real (not a second
-/// stub) so Stage 16 only has to delete the `Err` short-circuit in
-/// `dbus.rs`, not write this conversion.
+///
+/// **Real end to end as of Stage 16** — the daemon's own `PickColor`
+/// (`dbus.rs::CaptureService::pick_color`) now genuinely asks niri and
+/// returns real doubles, and also copies the hex to the clipboard and raises
+/// a swatch toast on its own; this function's job is unchanged from every
+/// earlier stage's version of it, just finally reachable: call, format, print
+/// to stdout (`report`'s caller in `main`).
 fn run_pick_color() -> Result<String, CliRunError> {
     run_async(async {
         let connection = connect_to_daemon().await?;
         let proxy = dbus::Capture1Proxy::new(&connection).await?;
         let (r, g, b) = proxy.pick_color().await?;
-        Ok(rgb_to_hex(r, g, b))
+        Ok(modules::picker::rgb_to_hex(r, g, b))
     })
-}
-
-/// `(r, g, b)` in `0.0..=1.0` (matching `org.gnome.Shell.Screenshot.PickColor`'s
-/// own return shape, per CAPTURE-RESEARCH) to `#RRGGBB`. Clamped before the
-/// cast to `u8` — a value fractionally outside range (floating-point noise
-/// at the 0.0/1.0 boundary) rounds to a valid byte instead of wrapping.
-fn rgb_to_hex(r: f64, g: f64, b: f64) -> String {
-    let byte = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
-    format!("#{:02X}{:02X}{:02X}", byte(r), byte(g), byte(b))
 }
 
 /// `open`: ask the daemon to raise the main window. `WindowAction::
@@ -886,6 +882,14 @@ impl Daemon {
             Message::Warning { title, body } => {
                 self.toasts
                     .push_notice(title, body, &self.theme, Instant::now());
+                self.sync_toast_surface()
+            }
+            // Stage 16: `PickColor` resolved. The clipboard copy already
+            // happened in `dbus.rs::CaptureService::pick_color`; this is
+            // purely the swatch toast.
+            Message::ColorPicked { hex, rgb } => {
+                self.toasts
+                    .push_swatch(hex, rgb, &self.theme, Instant::now());
                 self.sync_toast_surface()
             }
             // Stage 8's delayed-capture countdown pill.
@@ -1406,7 +1410,14 @@ fn overlay_event_subscription() -> Subscription<Message> {
 /// stdio, dropped `Child` handle. The window process is still Stage 9's
 /// stub (`run_window` — it prints and exits 0 today), which is fine: this
 /// call site only has to *ask*, not depend on what answers.
-fn spawn_editor(path: &Path) -> std::io::Result<()> {
+///
+/// `pub(crate)` as of **Stage 16**: `modules::history`'s Open/Edit action
+/// wants the exact same "spawn a detached editor" behavior a toast click
+/// already has, from a different process mode (the app window, not the
+/// daemon) that happens to live in the same binary — one definition, called
+/// from both `main.rs::Daemon::update` and `modules::app::App::update`,
+/// rather than a second copy.
+pub(crate) fn spawn_editor(path: &Path) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     std::process::Command::new(exe)
         .arg("window")
@@ -1435,7 +1446,12 @@ fn spawn_editor(path: &Path) -> std::io::Result<()> {
 /// A missing `xdg-open` (unlikely — it ships with `xdg-utils`, a near-universal
 /// dependency of any desktop environment) degrades to a logged error at the
 /// call site, never a panic.
-fn open_containing_dir(path: &Path) -> std::io::Result<()> {
+///
+/// `pub(crate)` as of **Stage 16**, for the same reason [`spawn_editor`]
+/// just above is: `modules::history`'s Open/"Show in folder" actions on a
+/// recording (or, for "Show in folder", a screenshot too) want this exact
+/// behavior from the app window process.
+pub(crate) fn open_containing_dir(path: &Path) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(path);
     std::process::Command::new("xdg-open")
         .arg(dir)
@@ -1548,6 +1564,14 @@ enum Message {
     /// matching D-Bus signal, because nothing failed (see the event's own
     /// doc comment).
     Warning { title: String, body: String },
+    /// **Stage 16.** `PickColor` resolved — `dbus.rs`'s
+    /// [`dbus::DaemonEvent::ColorPicked`], forwarded through
+    /// `dbus_worker_stream`. Raises the swatch toast
+    /// (`modules::toast::ToastStack::push_swatch`); the clipboard copy
+    /// already happened daemon-side, in `CaptureService::pick_color` itself,
+    /// so this variant is purely the on-screen half — the same split every
+    /// other `DaemonEvent` in this file already has.
+    ColorPicked { hex: String, rgb: (f64, f64, f64) },
 }
 
 /// Everything one interactive region selection needs to start, bundled so
@@ -1699,6 +1723,12 @@ fn dbus_worker_stream() -> impl Stream<Item = Message> {
                         // SIGTERM would.
                         dbus::DaemonEvent::QuitRequested => {
                             Message::Shutdown(ShutdownReason::TrayQuit)
+                        }
+                        // **Stage 16.** A `PickColor` call resolved — the
+                        // clipboard copy already happened in `dbus.rs`; this
+                        // is purely the swatch toast.
+                        dbus::DaemonEvent::ColorPicked { hex, rgb } => {
+                            Message::ColorPicked { hex, rgb }
                         }
                     };
                     if sender.send(message).await.is_err() {

@@ -136,7 +136,7 @@ use zbus::Connection;
 use crate::cli::{self, AudioSource, ShotKind};
 use crate::config::{CaptureConfig, ImageFormat, VideoPreset};
 use crate::dbus::Capture1Proxy;
-use crate::modules::editor;
+use crate::modules::{editor, history, picker};
 
 // ---------------------------------------------------------------------
 // Entry point
@@ -328,10 +328,19 @@ impl AudioChoice {
 }
 
 /// Which screen this process is showing — set once at boot from
-/// [`WindowMode`] and never changed afterward (there is no in-app
-/// navigation between "main" and "editor"; a toast click or `window edit`
-/// spawns a whole new process for the editor instead, per the module doc
-/// comment).
+/// [`WindowMode`] for `Main`/`Editor` (there is still no in-app navigation
+/// *into* the editor; a toast click or `window edit` spawns a whole new
+/// process for it, per the module doc comment's own reasoning for why that
+/// split exists — an edit target is a whole separate document).
+///
+/// **Stage 16 adds one real exception**: [`ViewState::History`] *is*
+/// reached by in-app navigation (`Message::HistoryRequested`/
+/// `Message::HistoryClosed`, `main_view`'s History button), toggled within
+/// this same running process rather than spawning a new one. The
+/// distinction that makes this the right call and not a quiet violation of
+/// the rule above: browsing history has no "document" of its own the way an
+/// edit does — it's a view over data this same window can load, act on, and
+/// discard, not a separate file another process should own the lifetime of.
 enum ViewState {
     Main,
     Editor {
@@ -348,6 +357,11 @@ enum ViewState {
         /// bigger variant's stack size even while sitting in `Main`.
         editor: Result<Box<editor::EditorState>, String>,
     },
+    /// **Stage 16.** Boxed for the same `large_enum_variant` reason
+    /// `Editor`'s payload is — `history::HistoryModel` carries a whole
+    /// loaded library plus per-row decoded thumbnails, which is not a cost
+    /// every `ViewState::Main` value should pay to make room for.
+    History(Box<history::HistoryModel>),
 }
 
 /// The window process's whole state.
@@ -458,6 +472,7 @@ impl App {
             } => {
                 format!("Saola Capture — {}", file_label(path))
             }
+            ViewState::History(_) => "Saola Capture — History".to_string(),
         }
     }
 
@@ -601,6 +616,79 @@ impl App {
                 } => state.update(message).map(Message::Editor),
                 _ => Task::none(),
             },
+            // **Stage 16.** Loading the library is a handful of file reads
+            // plus (for however many screenshots are in it) a WebP/PNG
+            // decode each — done synchronously here, on `update`'s own call
+            // stack, not through `Task::perform`. Recorded rather than
+            // silently accepted: `modules::history`'s own doc comment
+            // doesn't cover this cost, and a very large history could make
+            // this button visibly stall the window the same class of way
+            // `modules::editor`'s worst-case Blur drag does (Stage 15's own
+            // recorded-not-fixed finding) — see the Stage 16 handoff.
+            Message::HistoryRequested => {
+                self.view = ViewState::History(Box::new(history::HistoryModel::load(&self.config)));
+                Task::none()
+            }
+            Message::HistoryClosed => {
+                self.view = ViewState::Main;
+                Task::none()
+            }
+            Message::History(message) => match &mut self.view {
+                ViewState::History(model) => {
+                    let action = model.update(message);
+                    self.apply_history_action(action)
+                }
+                _ => Task::none(),
+            },
+            Message::PickColorRequested => self.start_pick_color(),
+            Message::PickColorFinished(result) => self
+                .finish(result.map(|(r, g, b)| format!("Picked {}", picker::rgb_to_hex(r, g, b)))),
+        }
+    }
+
+    /// Turns a [`history::Action`] into whatever cross-process/background
+    /// effect it names — the same "child model returns a value, the parent
+    /// interprets it" shape `Message::Toast`'s handling in `main.rs`'s
+    /// `Daemon::update` already established for [`crate::modules::toast::
+    /// Action`], applied here instead of inline in the `Message::History`
+    /// arm above purely so that arm's `match` doesn't have to nest this
+    /// deeply.
+    fn apply_history_action(&mut self, action: history::Action) -> Task<Message> {
+        match action {
+            history::Action::None => Task::none(),
+            history::Action::Edit(path) => {
+                // Same fire-and-forget posture `main.rs::Daemon::update`'s
+                // own `modules::toast::Action::Open` arm takes: a spawn
+                // failure here is vanishingly unlikely (a missing
+                // `current_exe()`, in practice) and there is no existing
+                // "surface an error on the History screen" message worth
+                // inventing solely for it — logged, not silently dropped.
+                if let Err(err) = crate::spawn_editor(&path) {
+                    eprintln!(
+                        "saola-capture: window: could not open the editor for {}: {err}",
+                        path.display()
+                    );
+                }
+                Task::none()
+            }
+            history::Action::OpenDir(path) => {
+                if let Err(err) = crate::open_containing_dir(&path) {
+                    eprintln!(
+                        "saola-capture: window: could not open the folder containing {}: {err}",
+                        path.display()
+                    );
+                }
+                Task::none()
+            }
+            history::Action::Export { source, format } => {
+                let path_for_message = source.clone();
+                Task::perform(run_export(source, format), move |result| {
+                    Message::History(history::Message::ExportFinished(
+                        path_for_message.clone(),
+                        result,
+                    ))
+                })
+            }
         }
     }
 
@@ -666,6 +754,32 @@ impl App {
         Task::batch([hide, request])
     }
 
+    /// **Stage 16.** The same hide-then-ask-the-daemon shape
+    /// [`Self::start_capture`] uses, for `PickColor` — hiding the window
+    /// while picking matters more here than for a screenshot: with the
+    /// window still up, it could sit directly over the very pixel the user
+    /// is trying to click on niri's own eyedropper cursor.
+    fn start_pick_color(&mut self) -> Task<Message> {
+        if self.busy {
+            return Task::none();
+        }
+        let Some(connection) = self.connection.clone() else {
+            self.feedback = Some(Err(
+                "not connected to the daemon yet — try again in a moment".to_string(),
+            ));
+            return Task::none();
+        };
+
+        self.busy = true;
+        self.feedback = None;
+        let hide = match self.window_id {
+            Some(id) => window::set_mode(id, window::Mode::Hidden),
+            None => Task::none(),
+        };
+        let request = Task::perform(request_pick_color(connection), Message::PickColorFinished);
+        Task::batch([hide, request])
+    }
+
     fn finish(&mut self, result: Result<String, String>) -> Task<Message> {
         self.busy = false;
         self.feedback = Some(result);
@@ -689,6 +803,11 @@ impl App {
                 path,
                 editor: Err(err),
             } => editor_error_view(theme, path, err),
+            ViewState::History(model) => column![
+                history_back_row(theme),
+                model.view(theme).map(Message::History),
+            ]
+            .into(),
         };
 
         let content = column![head, divider, body];
@@ -816,6 +935,24 @@ impl App {
             self.connection.is_some(),
         ));
 
+        // **Stage 16.** Two secondary actions, neither a capture — both
+        // `button::rest` (§11's "exactly one terracotta element" stays
+        // Capture/Start Recording's, the live action on this screen).
+        sections.push(section_label(theme, "More"));
+        sections.push(
+            row![
+                secondary_button(theme, "History", true, Some(Message::HistoryRequested)),
+                secondary_button(
+                    theme,
+                    "Pick Color",
+                    !self.busy && self.connection.is_some(),
+                    Some(Message::PickColorRequested),
+                ),
+            ]
+            .spacing(theme.sizes.pill_gap)
+            .into(),
+        );
+
         if let Some(feedback) = &self.feedback {
             sections.push(feedback_view(theme, feedback));
         } else if self.connection.is_none() {
@@ -882,6 +1019,51 @@ async fn request_recording(
         .start_recording(options.kind.as_str(), options.to_dbus_options())
         .await
         .map_err(|err| err.to_string())
+}
+
+/// **Stage 16.** `PickColor` from the app window — the exact same daemon
+/// call `run_pick_color` (`main.rs`) makes for the CLI, over this window's
+/// own connection. The daemon does the clipboard copy and raises the swatch
+/// toast on its own (`dbus.rs::CaptureService::pick_color`); this call's
+/// return value is only this window's own feedback line.
+async fn request_pick_color(connection: Connection) -> Result<(f64, f64, f64), String> {
+    let proxy = Capture1Proxy::new(&connection)
+        .await
+        .map_err(|err| err.to_string())?;
+    proxy.pick_color().await.map_err(|err| err.to_string())
+}
+
+/// **Stage 16.** Runs a GIF/animated-WebP export off iced's executor thread
+/// — see [`run_blocking`]'s own doc comment for why this is a fourth copy of
+/// that guard rather than a shared one.
+async fn run_export(
+    source: PathBuf,
+    format: crate::encode::export::AnimatedFormat,
+) -> Result<(PathBuf, u64), String> {
+    run_blocking(move || {
+        crate::encode::export::export_with_size(&source, format).map_err(|err| err.to_string())
+    })
+    .await
+}
+
+/// The one blocking-work guard this file needs — see `modules::editor`'s
+/// identically named, identically shaped private function's own doc comment
+/// for why this is a deliberate small duplication (one per module that needs
+/// it) rather than a shared helper: `dbus::run_blocking` is private to the
+/// daemon process, `editor::run_blocking` private to that module, and this
+/// is the window process's own copy for [`run_export`].
+async fn run_blocking<T, F>(work: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => match tokio::task::spawn_blocking(work).await {
+            Ok(result) => result,
+            Err(err) => Err(format!("the export task did not finish: {err}")),
+        },
+        Err(_) => work(),
+    }
 }
 
 /// **Stage 12.** A standing listener for the two signals that mark a
@@ -1056,6 +1238,29 @@ enum Message {
     /// **Stage 14.** Nests the whole editor surface's own message type — see
     /// `Message::Editor`'s `update` arm.
     Editor(editor::Message),
+    /// **Stage 16.** The Main tab's "History" button — loads the library and
+    /// switches `view` to [`ViewState::History`]; see that variant's own doc
+    /// comment for why this is genuine in-app navigation rather than a
+    /// spawned process.
+    HistoryRequested,
+    /// The History screen's own "Back" button — returns to
+    /// [`ViewState::Main`]. No daemon call, no `Task` — a plain state change,
+    /// which is why (unlike `Capture`) this doesn't go through `start_capture`
+    /// /`finish`'s hide-and-reshow machinery at all.
+    HistoryClosed,
+    /// Nests [`history::Message`] — the same "delegate to the child model's
+    /// own `update`, translate its `Action`" shape `Message::Editor` already
+    /// uses, except `history::HistoryModel::update` returns a value
+    /// ([`history::Action`]) instead of a `Task`, so this arm interprets that
+    /// value itself rather than just mapping a `Task`.
+    History(history::Message),
+    /// **Stage 16.** The Main tab's "Pick Color" button.
+    PickColorRequested,
+    /// `PickColor`'s D-Bus reply — the daemon already did the clipboard copy
+    /// and raised the swatch toast (`dbus.rs::CaptureService::pick_color`);
+    /// this is purely this window's own feedback line and hide/reshow, the
+    /// same shape [`Message::ScreenshotFinished`] already has.
+    PickColorFinished(Result<(f64, f64, f64), String>),
 }
 
 // ---------------------------------------------------------------------
@@ -1221,6 +1426,52 @@ fn capture_button(
         .height(Length::Fixed(theme.sizes.hit_target_touch))
         .style(saola_theme::style::button::active(theme, Surface::Paper))
         .on_press_maybe((!busy && connected).then_some(Message::Capture))
+        .into()
+}
+
+/// A `button::rest` pill for a secondary (non-capture) action — **Stage
+/// 16**'s History/Pick Color buttons. `enabled: false` disables the button
+/// (`on_press_maybe`) rather than hiding it, matching every other
+/// availability gate on this screen (`capture_button`'s own `busy`/
+/// `connected` gate).
+fn secondary_button(
+    theme: &Theme,
+    label: &str,
+    enabled: bool,
+    on_press: Option<Message>,
+) -> Element<'static, Message> {
+    let content = container(
+        text(label.to_string())
+            .font(saola_theme::convert::ui_font_regular(theme))
+            .size(theme.typography.size.secondary),
+    )
+    .align_x(Center)
+    .align_y(Center)
+    .height(Length::Fill);
+
+    button(content)
+        .height(Length::Fixed(theme.sizes.hit_target_bar))
+        .style(saola_theme::style::button::rest(theme, Surface::Paper))
+        .on_press_maybe(enabled.then_some(on_press).flatten())
+        .into()
+}
+
+fn history_back_row(theme: &Theme) -> Element<'static, Message> {
+    let back = button(
+        text("← Back")
+            .font(saola_theme::convert::ui_font_regular(theme))
+            .size(theme.typography.size.secondary),
+    )
+    .style(saola_theme::style::button::rest(theme, Surface::Paper))
+    .on_press(Message::HistoryClosed);
+
+    container(back)
+        .padding(Padding {
+            top: theme.sizes.pill_gap,
+            right: theme.sizes.popover_padding,
+            bottom: 0.0,
+            left: theme.sizes.popover_padding,
+        })
         .into()
 }
 
