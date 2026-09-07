@@ -1,0 +1,47 @@
+# Maintainer: Jordan Dunn <jordan.dunn@nodetwo.io>
+#
+# Template — the @PKGVER@ placeholder and the SKIP checksum are filled in by
+# CI. On each GitHub release, .github/workflows/pkgbuild-release.yml
+# substitutes the version from the release tag, computes the tarball's real
+# sha256, and attaches the finished PKGBUILD to the release as an asset.
+# (Not pushed to the AUR — deliberately, for now.)
+
+pkgname=saola-capture
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='Screenshot and screen-recording app for the Saola desktop environment (niri)'
+arch=('x86_64' 'aarch64')
+url='https://github.com/JorDunn/saola-capture'
+license=('MIT OR Apache-2.0')
+# niri-ipc is GPL-3.0-or-later; the binary is a combined work.
+depends=('ffmpeg' 'gcc-libs' 'glibc' 'libxkbcommon' 'libpipewire' 'systemd-libs' 'wayland' 'vulkan-icd-loader')
+# git: the saola-theme dependency is a git dependency (pinned to a release
+# tag in Cargo.toml), so `cargo fetch` needs git available.
+# clang: libpipewire-sys uses bindgen at build time.
+makedepends=('cargo' 'git' 'clang')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/$pkgname-v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+# GitHub archives of tag saola-capture-vX.Y.Z unpack to
+# saola-capture-saola-capture-vX.Y.Z (repo name + full tag; the leading-"v" strip
+# GitHub applies to v-prefixed tags doesn't fire here).
+_srcdir="$pkgname-$pkgname-v$pkgver"
+
+prepare() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$_srcdir"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo build --frozen --release
+}
+
+package() {
+  cd "$_srcdir"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

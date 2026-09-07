@@ -13,14 +13,18 @@ window, history library, annotation editor), and **CLI verbs** (`shot`,
 architecture, dependencies, or conventions updates this file in the same
 stage and says so in its handoff. A stale AGENTS.md is a bug.
 
-> Status: Stages 1–16 landed (repo skeleton, dependency survey; every capture
+> Status: Stages 1–17 landed (repo skeleton, dependency survey; every capture
 > path proven with live evidence in `docs/CAPTURE-RESEARCH.md`; full CLI
 > parsing, `capture.toml` config, the `io.saola.Capture1` bus, a surfaceless
 > daemon boot; Stage 5's **real screenshot pipeline**; Stage 6's **PrintScr
 > MVP**; Stage 7's **region selection overlay**; Stage 8's **window capture
 > and a visible delayed-capture countdown**; Stage 9's **main app window
-> process**; and — new in Stage 10 — the **ScreenCast session + PipeWire
-> frame pipeline**).
+> process**; Stage 10's **ScreenCast session + PipeWire frame pipeline**;
+> Stage 11's **recording end-to-end**; Stage 12's **tray item + region/window
+> recording**; Stage 13's **audio recording + A/V sync corrections**; Stage 14's
+> **annotation editor**; Stage 15's **text/step tools + blur/pixelate
+> redaction**; Stage 16's **history library + color picker + GIF/WebP export**;
+> and Stage 17's **CI, packaging, README, and release-plz setup**).
 > `shot --fullscreen`, `shot --region [--geometry WxH+X+Y]` and (as of Stage
 > 8) `shot --window [--window-id ID]` all genuinely capture, encode, save,
 > copy and print a path. Fullscreen, `--geometry` region and `--window` all
@@ -487,6 +491,17 @@ stage and says so in its handoff. A stale AGENTS.md is a bug.
 > real recording (would need one to exist first — reasoned through and
 > argument-tested, not executed). See the Stage 16 handoff for the full
 > human-check list.
+> **Stage 17 lands CI, packaging, autostart, README.** `.github/workflows/ci.yml`
+> (fmt/clippy/test/build on push/PR, `APT_BUILD_DEPS` with libwayland-dev/
+> libpipewire-0.3-dev/clang), `.github/workflows/release-plz.yml` (release-pr
+> and release jobs), `.github/workflows/pkgbuild-release.yml` (PKGBUILD
+> version/checksum generation on release), `release-plz.toml` (git-only mode,
+> Keep a Changelog format, per-crate tags `saola-capture-v*`), `contrib/aur/
+> PKGBUILD` (template with ffmpeg/pipewire/clang in depends/makedepends; niri-ipc
+> GPL-3.0-or-later licensing surprise noted in depends comment), `CHANGELOG.md`
+> (Keep a Changelog seed), and `README.md` (features, install, configuration
+> schema, CLI examples, manual setup with niri binds and daemon, known
+> limitations). The prerelease gate is `0.1.0-dev`.
 > PLAN.md is the staged build plan. Sections marked *(pending Stage N)* fill
 > in as later stages land.
 >
@@ -1671,10 +1686,15 @@ PLAN.md's Architecture section is binding; read it first. Summary:
 
 ## Releases
 
-release-plz in git-only mode, mirrored from saola-panel: release-pr +
-release jobs, tags `saola-capture-v{version}`, PKGBUILD attached as a
-release asset (not pushed to AUR), `0.1.0-dev` suffix as the prerelease
-gate. Set up in Stage 17.
+**Stage 17 set up release-plz in git-only mode, mirrored from saola-panel.**
+`.github/workflows/ci.yml` (fmt/clippy/test/build jobs, `APT_BUILD_DEPS` with
+libwayland-dev/libpipewire-0.3-dev/clang), `.github/workflows/release-plz.yml`
+(release-pr and release jobs), `.github/workflows/pkgbuild-release.yml` (PKGBUILD
+version/checksum fill on release), `release-plz.toml` (per-crate tags
+`saola-capture-v{version}`, Keep a Changelog header/format), and
+`contrib/aur/PKGBUILD` (template with ffmpeg/pipewire/clang in `depends`/
+`makedepends`). The prerelease gate is `0.1.0-dev` until a real release bumps
+to `0.1.0`.
 
 ## Boundaries (binding)
 

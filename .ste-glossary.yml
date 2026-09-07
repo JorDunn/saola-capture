@@ -1,0 +1,543 @@
+name: saola-capture
+# Technical Names — product, protocol, tool, and format names; CLI verbs,
+# subcommands, and flags; config-file keys; file/format extensions; and other
+# domain nouns this project's docs use as fixed technical vocabulary rather
+# than general English. See AGENTS.md's Style Guide Links entry for the
+# ste100 invocation this file backs.
+technical_nouns:
+  - word: saola
+    approved_meaning: The Saola desktop environment and its project family name.
+  - word: capture
+    approved_meaning: The action of making a screenshot or a screen recording, or the Saola Capture app itself.
+    inflections: [captures, captured, capturing]
+  - word: niri
+    approved_meaning: The niri Wayland compositor.
+  - word: wayland
+    approved_meaning: The Wayland display protocol.
+  - word: pipewire
+    approved_meaning: The PipeWire media server.
+  - word: webp
+    approved_meaning: The WebP image format.
+  - word: png
+    approved_meaning: The PNG image format.
+  - word: matroska
+    approved_meaning: The Matroska video container format.
+  - word: mkv
+    approved_meaning: The Matroska file extension.
+  - word: mp4
+    approved_meaning: The MP4 video container format.
+  - word: hevc
+    approved_meaning: The HEVC (H.265) video codec.
+  - word: av1
+    approved_meaning: The AV1 video codec.
+  - word: vaapi
+    approved_meaning: Video Acceleration API, the hardware-encoding interface.
+  - word: gif
+    approved_meaning: The GIF animated-image format.
+  - word: arch
+    approved_meaning: The Arch Linux distribution.
+  - word: linux
+    approved_meaning: The Linux operating system kernel.
+  - word: rust
+    approved_meaning: The Rust programming language.
+  - word: ffmpeg
+    approved_meaning: The ffmpeg command-line media tool.
+  - word: cli
+    approved_meaning: Command-line interface.
+  - word: dbus
+    approved_meaning: The D-Bus message bus.
+  - word: kdl
+    approved_meaning: The KDL config-file language niri uses.
+  - word: toml
+    approved_meaning: The TOML config-file language Saola Capture uses.
+  - word: sh
+    approved_meaning: A shell command-line example.
+  - word: opus
+    approved_meaning: The Opus audio codec.
+  - word: pulseaudio
+    approved_meaning: The PulseAudio sound server.
+  - word: alsa
+    approved_meaning: The ALSA sound driver layer PulseAudio names devices from.
+  - word: git
+    approved_meaning: The git version-control tool.
+  - word: makepkg
+    approved_meaning: The Arch Linux package-build tool.
+  - word: pacman
+    approved_meaning: The Arch Linux package manager.
+  - word: cargo
+    approved_meaning: The Rust package manager and build tool.
+  - word: pkgbuild
+    approved_meaning: An Arch Linux package build script, or the file named PKGBUILD.
+  - word: curl
+    approved_meaning: The curl command-line download tool.
+  - word: sudo
+    approved_meaning: The command that runs one command as the root user.
+  - word: clang
+    approved_meaning: The Clang compiler, a build-time tool this project needs.
+  - word: mit
+    approved_meaning: The MIT software license.
+  - word: apache
+    approved_meaning: The Apache software license.
+  - word: gnu
+    approved_meaning: The GNU project.
+  - word: screenshot
+    approved_meaning: A still image of the screen or part of it.
+    inflections: [screenshots]
+  - word: region
+    approved_meaning: A rectangular area of the screen you select.
+  - word: window
+    approved_meaning: A rectangular area that shows one app's content.
+  - word: daemon
+    approved_meaning: The background service process (`saola-capture daemon`).
+  - word: overlay
+    approved_meaning: The on-screen box you drag to select a region.
+  - word: notice
+    approved_meaning: A short on-screen card that reports a capture result.
+    inflections: [notices]
+  - word: audio
+    approved_meaning: Recorded sound.
+  - word: video
+    approved_meaning: A screen recording.
+  - word: cursor
+    approved_meaning: The mouse pointer shown on screen.
+  - word: clipboard
+    approved_meaning: The system clipboard the operating system copies to.
+  - word: history
+    approved_meaning: The saved list of past screenshots and recordings.
+  - word: library
+    approved_meaning: The History screen that lists saved captures.
+  - word: format
+    approved_meaning: A file type, such as webp or png.
+    inflections: [formats]
+  - word: codec
+    approved_meaning: A method that compresses video or audio.
+    inflections: [codecs]
+  - word: preset
+    approved_meaning: A named codec choice, such as hevc, av1, or h264.
+    inflections: [presets]
+  - word: device
+    approved_meaning: A hardware component, such as a render node or a microphone.
+  - word: node
+    approved_meaning: A render device path under /dev/dri.
+  - word: render
+    approved_meaning: The hardware step that encodes video.
+    part_of_speech: verb
+  - word: track
+    approved_meaning: One audio or video stream inside a recording.
+    part_of_speech: verb
+  - word: sync
+    approved_meaning: The match between audio time and video time.
+  - word: offset
+    approved_meaning: A fixed time shift applied to audio.
+    inflections: [offsets]
+  - word: delay
+    approved_meaning: A wait time before a capture starts.
+    inflections: [delays]
+  - word: toggle
+    approved_meaning: An action that turns a state on if it is off, and off if it is on.
+    inflections: [toggles]
+  - word: interface
+    approved_meaning: The app window, or a network/audio device list.
+  - word: root
+    approved_meaning: The top level of a config file, or the superuser account.
+  - word: boot
+    approved_meaning: The moment niri starts.
+  - word: startup
+    approved_meaning: The time when niri or the daemon first starts.
+  - word: hotkey
+    approved_meaning: A keyboard shortcut.
+  - word: bind
+    approved_meaning: A niri config entry that maps a key to an action.
+    inflections: [binds]
+  - word: title
+    approved_meaning: The text label niri shows for a hotkey.
+    inflections: [titles]
+  - word: command
+    approved_meaning: A line you run at a shell prompt.
+    inflections: [commands]
+  - word: flag
+    approved_meaning: A command-line option, such as --region.
+    inflections: [flags]
+  - word: folder
+    approved_meaning: A directory on disk.
+    inflections: [folders]
+  - word: path
+    approved_meaning: A location on disk.
+    inflections: [paths]
+  - word: line
+    approved_meaning: One row of text in a file or at a shell prompt.
+    inflections: [lines]
+  - word: section
+    approved_meaning: One part of a config file or this document.
+    inflections: [sections]
+  - word: default
+    approved_meaning: The value a setting takes if you do not change it.
+    inflections: [defaults]
+  - word: seconds
+    approved_meaning: A unit of time.
+  - word: setting
+    approved_meaning: One named config value.
+    inflections: [settings]
+  - word: pointer
+    approved_meaning: The mouse pointer shown on screen.
+  - word: message
+    approved_meaning: A short piece of text the app sends over D-Bus or shows on screen.
+    inflections: [messages]
+  - word: geometry
+    approved_meaning: An exact position and size, given as WIDTHxHEIGHT+X+Y.
+  - word: coordinates
+    approved_meaning: An exact X and Y position on screen.
+  - word: id
+    approved_meaning: A number that names one specific window.
+  - word: warning
+    approved_meaning: A notice that reports a smaller problem, not a failure.
+    part_of_speech: verb
+    inflections: [warnings]
+  - word: license
+    approved_meaning: The legal terms a project is under.
+    inflections: [licenses]
+  - word: version
+    approved_meaning: A release number.
+    inflections: [versions]
+  - word: faststart
+    approved_meaning: An MP4 flag that lets a video start playing before the whole file downloads.
+  - word: run
+    approved_meaning: To start and carry out a program or command.
+    part_of_speech: verb
+    inflections: [runs, running]
+  - word: save
+    approved_meaning: To write a file to disk.
+    part_of_speech: verb
+    inflections: [saves, saved, saving]
+  - word: build
+    approved_meaning: To compile the program from source code.
+    part_of_speech: verb
+    inflections: [builds, built, building]
+  - word: install
+    approved_meaning: To install a package.
+    inflections: [installer, installers]
+  - word: settings
+    part_of_speech: noun
+  - word: main
+    part_of_speech: adjective
+  - word: app
+    approved_meaning: A program, short for application.
+    inflections: [apps]
+  - word: image
+    approved_meaning: A screenshot file.
+    inflections: [images]
+  - word: pixel
+    approved_meaning: One point of color on the screen.
+    inflections: [pixels]
+  - word: encode
+    approved_meaning: To turn raw video or audio into a file format.
+    part_of_speech: verb
+    inflections: [encodes, encoded, encoding, encoder, encoders]
+  - word: crop
+    approved_meaning: To cut an image down to a smaller area.
+    part_of_speech: verb
+    inflections: [crops, cropped, cropping]
+  - word: hide
+    approved_meaning: To cover part of an image so it cannot be read.
+    part_of_speech: verb
+    inflections: [hides, hidden, hiding]
+  - word: private
+    approved_meaning: Not meant for other people to see.
+  - word: content
+    approved_meaning: What is shown inside an image or a window.
+  - word: text
+    approved_meaning: Written words placed on an image.
+  - word: draw
+    approved_meaning: To place a line or a shape on an image.
+    part_of_speech: verb
+    inflections: [draws, drew, drawing]
+  - word: press
+    approved_meaning: To push a button with the pointer.
+    part_of_speech: verb
+    inflections: [presses, pressed, pressing]
+  - word: program
+    approved_meaning: A running instance of an app.
+    inflections: [programs]
+  - word: config
+    approved_meaning: A config file, short for configuration.
+  - word: configure
+    approved_meaning: To set values in a config file.
+    part_of_speech: verb
+    inflections: [configures, configured, configuring]
+  - word: folder
+    approved_meaning: A directory on disk.
+    inflections: [folders]
+  - word: disk
+    approved_meaning: Local storage on the computer.
+  - word: home
+    approved_meaning: The user's home directory.
+  - word: permission
+    approved_meaning: The legal right a license gives.
+    inflections: [permissions]
+  - word: github
+    approved_meaning: The GitHub code-hosting site.
+  - word: setup
+    approved_meaning: The steps that prepare a program to run.
+  - word: shortcut
+    approved_meaning: A key combination that runs a command.
+    inflections: [shortcuts]
+  - word: combination
+    approved_meaning: Two or more keys pressed together.
+    inflections: [combinations]
+  - word: instance
+    approved_meaning: One running copy of a program.
+    inflections: [instances]
+  - word: edit
+    approved_meaning: To change an image with the edit tool.
+    part_of_speech: verb
+    inflections: [edits, edited, editing, editor, editors]
+  - word: source
+    approved_meaning: An audio device, or the original code of a program.
+    inflections: [sources]
+  - word: list
+    approved_meaning: A set of items shown one after another.
+    inflections: [lists, listed, listing]
+  - word: compositor
+    approved_meaning: The program that draws every window on screen.
+  - word: desktop
+    approved_meaning: The graphical environment a user works in.
+  - word: environment
+    approved_meaning: The desktop a user works in.
+  - word: file
+    approved_meaning: A named item stored on disk.
+    inflections: [files]
+  - word: package
+    approved_meaning: A file that installs a program.
+    inflections: [packages]
+  - word: target
+    approved_meaning: The build output directory cargo writes to.
+  - word: dir
+    approved_meaning: A directory, short for directory.
+  - word: lossless
+    approved_meaning: A format with no loss of image detail.
+  - word: hardware
+    approved_meaning: The physical parts of the computer, such as the GPU.
+  - word: ready
+    approved_meaning: Able to run right away.
+  - word: web
+    approved_meaning: The World Wide Web.
+  - word: playback
+    approved_meaning: Showing a saved video again.
+  - word: own
+    approved_meaning: Belonging to the same item just named.
+  - word: mic
+    approved_meaning: A microphone, short for microphone.
+  - word: shift
+    approved_meaning: A fixed change in time.
+  - word: positive
+    approved_meaning: A number greater than zero.
+  - word: toast
+    approved_meaning: A short on-screen notice card.
+    inflections: [toasts]
+  - word: box
+    approved_meaning: A rectangle drawn on screen.
+    inflections: [boxes]
+  - word: card
+    approved_meaning: A small rectangle of on-screen content.
+    inflections: [cards]
+  - word: fade
+    approved_meaning: To become slowly less visible.
+    part_of_speech: verb
+  - word: future
+    approved_meaning: A time not yet reached.
+  - word: project
+    approved_meaning: This body of code and its plan.
+    inflections: [projects]
+  - word: support
+    approved_meaning: The ability of a tool to work with something.
+  - word: export
+    approved_meaning: To make a new file from an existing one.
+    part_of_speech: verb
+    inflections: [exports, exported, exporting]
+  - word: animated
+    approved_meaning: Made of many images shown in sequence.
+  - word: element
+    approved_meaning: One visible part of the on-screen display.
+    inflections: [elements]
+  - word: tray
+    approved_meaning: The small icon area of a desktop panel.
+  - word: menu
+    approved_meaning: A list of actions a user can pick from.
+    inflections: [menus]
+  - word: iced
+    approved_meaning: The Rust GUI library this app is built with.
+  - word: service
+    approved_meaning: A program that runs in the background.
+    inflections: [services]
+  - word: key
+    approved_meaning: One button on the keyboard.
+    inflections: [keys]
+  - word: portal
+    approved_meaning: A desktop-wide screen capture system this project does not use.
+    inflections: [portals]
+  - word: protocol
+    approved_meaning: A fixed set of rules two programs use to talk.
+    inflections: [protocols]
+  - word: active
+    approved_meaning: Running right now.
+  - word: binary
+    approved_meaning: One compiled program file.
+    inflections: [binaries]
+  - word: automatic
+    approved_meaning: Done by the program, with no user action.
+  - word: necessary
+    approved_meaning: Needed for a task to work.
+  - word: overlay
+    part_of_speech: noun
+  - word: shot
+    approved_meaning: A screenshot, or the shot CLI verb.
+  - word: spawn
+    approved_meaning: To start a new program from niri config.
+    part_of_speech: verb
+  - word: dev
+    approved_meaning: The /dev device directory, or short for development.
+  - word: pick
+    approved_meaning: The pick-color CLI verb.
+  - word: cd
+    approved_meaning: The shell command that changes directory.
+  - word: config.kdl
+    approved_meaning: niri's own config file name.
+  - word: capture.toml
+    approved_meaning: Saola Capture's config file name.
+  - word: ~/.config
+    approved_meaning: The user's config directory.
+  - word: ~/pictures
+    approved_meaning: The user's Pictures directory.
+  - word: --fullscreen
+    approved_meaning: The flag that selects the full screen.
+  - word: --region
+    approved_meaning: The flag that selects a region.
+  - word: --window
+    approved_meaning: The flag that selects a window.
+  - word: --window-id
+    approved_meaning: The flag that names one window by ID.
+  - word: --geometry
+    approved_meaning: The flag that gives an exact position and size.
+  - word: --delay
+    approved_meaning: The flag that sets a wait time.
+  - word: --no
+    approved_meaning: Half of the --no-daemon flag.
+  - word: --format
+    approved_meaning: The flag that sets the image format.
+  - word: --output=/tmp
+    approved_meaning: An example --output flag value.
+  - word: --dry
+    approved_meaning: Half of the --dry-run flag.
+  - word: --audio
+    approved_meaning: The flag that sets the audio device.
+  - word: --all
+    approved_meaning: Half of the --all-targets flag.
+  - word: -d
+    approved_meaning: The clippy flag that turns warnings into errors.
+  - word: -lo
+    approved_meaning: The curl flag that names an output file.
+  - word: -si
+    approved_meaning: The makepkg flag for install and sync.
+  - word: -s
+    approved_meaning: The pacman flag for sync.
+  - word: print
+    approved_meaning: The Print key on the keyboard.
+  - word: mod+shift+s
+    approved_meaning: A key combination for region screenshots.
+  - word: mod+shift+r
+    approved_meaning: A key combination for record toggle.
+  - word: title="screenshot
+    approved_meaning: Part of a niri hotkey-overlay-title value.
+  - word: title="record
+    approved_meaning: Part of a niri hotkey-overlay-title value.
+  - word: targets
+    approved_meaning: Half of the --all-targets flag.
+  - word: clippy
+    approved_meaning: The Rust lint tool cargo runs.
+  - word: bus
+    approved_meaning: Half of D-Bus, the message bus name.
+  - word: ipc
+    approved_meaning: Inter-process communication.
+  - word: terms
+    approved_meaning: The rules set out in a license.
+  - word: drag
+    approved_meaning: To move the pointer while a button is held down.
+    part_of_speech: verb
+    inflections: [drags, dragged, dragging]
+  - word: enter
+    approved_meaning: The Enter key on the keyboard.
+  - word: escape
+    approved_meaning: The Escape key on the keyboard.
+  - word: size
+    approved_meaning: The width and height of a region.
+  - word: progress
+    approved_meaning: Work not yet finished.
+  - word: nothing
+    approved_meaning: No item at all.
+  - word: even
+    approved_meaning: In every case, with no exception.
+  - word: combine
+    approved_meaning: To join separate files into one.
+    part_of_speech: verb
+    inflections: [combines, combined, combining]
+  - word: background
+    approved_meaning: Running with no window shown.
+  - word: "true"
+    approved_meaning: The boolean value "on".
+  - word: "false"
+    approved_meaning: The boolean value "off".
+  - word: /tmp
+    approved_meaning: The system temporary directory.
+  - word: /dev
+    approved_meaning: The Linux device directory.
+  - word: dri
+    approved_meaning: The Direct Rendering Infrastructure directory under /dev.
+  - word: libwayland
+    approved_meaning: The Wayland client library package name.
+  - word: later
+    approved_meaning: A higher version number.
+  - word: d
+    approved_meaning: Half of D-Bus.
+  - word: what
+    approved_meaning: An interrogative word used in a heading.
+  - word: both
+    approved_meaning: Two items together, not one alone.
+  - word: alsa_input.example
+    approved_meaning: An example ALSA input device name.
+  - word: alsa_output.example-speakers.monitor
+    approved_meaning: An example ALSA output device name.
+  - word: --release
+    approved_meaning: The cargo flag that builds an optimized binary.
+  - word: lint
+    approved_meaning: A tool that checks code for common mistakes.
+  - word: every
+    approved_meaning: Each one, with none left out.
+  - word: dependency
+    approved_meaning: A library one program needs to build or run.
+    inflections: [dependencies]
+  - word: exact
+    approved_meaning: Correct in every detail, with no error.
+  - word: else
+    approved_meaning: In the other case.
+  - word: need
+    approved_meaning: To be necessary for a task.
+    part_of_speech: verb
+    inflections: [needs, needed, needing]
+  - word: itself
+    approved_meaning: The same item, alone.
+  - word: screenshot.webp
+    approved_meaning: An example screenshot file name.
+  - word: changelog
+    approved_meaning: The file that lists every change to a project.
+  - word: unreleased
+    approved_meaning: Changed, but not yet given a version number.
+  - word: semantic
+    approved_meaning: Part of the name Semantic Versioning.
+  - word: versioning
+    approved_meaning: The scheme that gives each release a version number.
+  - word: keepachangelog.com
+    approved_meaning: The web address for the Keep a Changelog format.
+  - word: semver.org
+    approved_meaning: The web address for Semantic Versioning.
+technical_verbs: []
+preferred_terms: {}

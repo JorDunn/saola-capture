@@ -1,0 +1,53 @@
+# release-plz — per-crate semver bumps, changelogs, tags, and GitHub releases,
+# all derived from Conventional Commits. Docs: https://release-plz.dev
+
+[workspace]
+# Not published to crates.io.
+publish = false
+# Pre-1.0, `feat:` bumps the minor (0.1 -> 0.2), not the patch — matches
+# saola-theme's versioning so a feature release reads the same across repos.
+features_always_increment_minor = true
+# NOTE: release-plz's default version detection asks crates.io for the current
+# released version — for an unpublished crate that can never bump past the
+# first release (it concludes "already up-to-date" forever; see saola-theme
+# commit 957ee68 for the full failure). saola-theme fixed this with
+# `git_only = true`, but that mode runs `cargo package --workspace` at the
+# last tag, which fails here: this crate's saola-theme *git* dependency can't
+# be packaged while saola-theme is unpublished. Instead, the release-pr CI job
+# checks out the latest tag and passes it as `--registry-manifest-path`, which
+# gives release-plz its released baseline without ever running `cargo package`
+# (see .github/workflows/release-plz.yml).
+# cargo-semver-checks needs a crates.io baseline to diff against — enable if we publish.
+semver_check = false
+# Per-crate GitHub release + tag ({package}-v{version}) when a crate changes.
+git_release_enable = true
+# For a single-crate repo release-plz would default to plain `v{version}` tags;
+# pin the workspace-style name so tags read the same across the Saola repos
+# (saola-theme-v0.2.0, saola-panel-v0.1.0, saola-capture-v0.1.0, …) — and the
+# release-pr CI job's `git describe --match 'saola-capture-v*'` baseline lookup
+# depends on it.
+git_tag_name = "{{ package }}-v{{ version }}"
+# One CHANGELOG.md per crate, in each crate's directory (release-plz default).
+changelog_update = true
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+# Map conventional commit types onto Keep a Changelog's categories.
+# Order matters: first match wins.
+commit_parsers = [
+  { message = "^security|^fix\\(security\\)", group = "Security" },
+  { message = "^remove", group = "Removed" },
+  { message = "^deprecate", group = "Deprecated" },
+  { message = "^\\w+(\\(.*\\))?!", group = "Changed" }, # breaking changes (`feat!:` etc.)
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf|^refactor", group = "Changed" },
+  { message = "^docs|^chore|^ci|^style|^test|^build", skip = true },
+]
