@@ -113,16 +113,10 @@ use std::sync::Arc;
 
 use iced::widget::{button, canvas, column, container, image, row, scrollable, text, text_input};
 use iced::{mouse, Center, Element, Length, Padding, Point, Rectangle, Size, Task};
-use saola_theme::{ColorExt, Surface, Theme};
+use saola_theme::{Chrome, ColorExt, Surface, Theme};
 
 use crate::capture::{Frame, PixelRect};
 use crate::config::ImageFormat;
-// The one piece of `modules::app`'s segmented control this module shares
-// rather than duplicates: the geometry must match between the two twins or
-// the same control would look different on the two surfaces. (The ~25 lines
-// of `segmented_row` itself stay duplicated for the reason that function's
-// own doc comment gives — it hardcodes its owner's `Message` type.)
-use crate::modules::app::SEGMENT_INSET;
 use crate::storage::{self, ClipboardOwner, StorageError};
 
 // ---------------------------------------------------------------------
@@ -159,8 +153,9 @@ const MIN_STROKE_RADIUS: f32 = 0.5;
 /// A numbered-step badge's disc radius, image-space px. Not a
 /// `saola-theme` token — the same "a drawing tool's own parameter, not an
 /// interface control's size" posture as [`StrokeWidth::pixels`] and
-/// `modules::overlay::HANDLE_RADIUS` (see CLAUDE.md's design-language
-/// gaps section, which this stage extends rather than re-litigates).
+/// `modules::overlay`'s own `EDGE_SNAP_DISTANCE`/`MIN_SELECTION` (see
+/// AGENTS.md's design-language gaps section, which this stage extends
+/// rather than re-litigates).
 const STEP_BADGE_RADIUS: f32 = 14.0;
 
 /// The step badge's numeral size, as a multiple of [`STEP_BADGE_RADIUS`] —
@@ -494,8 +489,8 @@ impl StrokeWidth {
     }
 
     /// Image-space pixels. Deliberately not a `saola-theme` token — like
-    /// `modules::overlay`'s `HANDLE_RADIUS`, this is a drawing-tool
-    /// parameter, not an interface control's size.
+    /// `modules::overlay`'s `EDGE_SNAP_DISTANCE`/`MIN_SELECTION`, this is a
+    /// drawing-tool parameter, not an interface control's size.
     fn pixels(self) -> f32 {
         match self {
             StrokeWidth::Thin => 3.0,
@@ -2661,10 +2656,10 @@ impl EditorState {
 
         // `align_y(Center)` on every mixed-content row in this toolbar: a
         // `segmented_row` is a track container (its segments plus
-        // `SEGMENT_INSET` above and below) while an `action_button` is a bare
-        // `hit_target_bar` pill, so the two are *not* the same height. A row
-        // defaults to `Alignment::Start`, which would hang the shorter pills
-        // from the taller track's top edge.
+        // `sizes.segment_inset` above and below) while an `action_button` is
+        // a bare `hit_target_bar` pill, so the two are *not* the same
+        // height. A row defaults to `Alignment::Start`, which would hang the
+        // shorter pills from the taller track's top edge.
         let mut rows = column![
             row![tools].spacing(theme.sizes.island_gap),
             row![colors, widths, undo, redo, delete]
@@ -2742,6 +2737,10 @@ impl EditorState {
             accent: theme.palette.accent.into_iced(),
             text_font: saola_theme::convert::ui_font(theme),
             last_pointer: self.model.pointer,
+            dash_segments: [
+                theme.sizes.selection_dash_fill,
+                theme.sizes.selection_dash_gap,
+            ],
         })
         .width(Length::Fill)
         .height(Length::Fill);
@@ -2849,7 +2848,7 @@ impl EditorState {
 
         // Themed for the same reason `modules::app::main_view`'s scrollable
         // is: iced's default scrollbar is a near-black rail that ignores the
-        // theme and paints over `paper_window`'s rounded corner.
+        // theme and paints over `container::window`'s rounded corner.
         scrollable(lines.padding(theme.sizes.popover_padding))
             .width(Length::Fill)
             .style(saola_theme::style::scrollable::rest(theme, Surface::Paper))
@@ -2919,7 +2918,15 @@ fn action_button(
         button(content())
             .height(height)
             .padding(padding)
-            .style(saola_theme::style::button::rest(theme, Surface::Paper))
+            // `Chrome::Window`: this toolbar lives inside the editor's app
+            // window, not shell chrome. A no-op on `Surface::Paper` today
+            // (the two chromes are identical there) — the correct variant
+            // if an ink app-window mode ever ships.
+            .style(saola_theme::style::button::rest(
+                theme,
+                Surface::Paper,
+                Chrome::Window,
+            ))
             .on_press_maybe(message)
             .into()
     }
@@ -2942,7 +2949,7 @@ where
     T: Copy + PartialEq + 'static,
     F: Fn(T) -> Message + 'static,
 {
-    let mut track = row![].spacing(SEGMENT_INSET);
+    let mut track = row![].spacing(theme.sizes.segment_inset);
     for &(value, label) in options {
         let is_selected = value == selected;
         let content = container(
@@ -2970,6 +2977,8 @@ where
                 .style(saola_theme::style::segmented::segment(
                     theme,
                     Surface::Paper,
+                    // `Chrome::Window` — see `action_button`'s own note.
+                    Chrome::Window,
                     is_selected,
                 ))
                 .on_press(on_select(value)),
@@ -2977,7 +2986,7 @@ where
     }
 
     container(track)
-        .padding(SEGMENT_INSET)
+        .padding(theme.sizes.segment_inset)
         .style(saola_theme::style::segmented::track(theme, Surface::Paper))
         .into()
 }
@@ -3010,6 +3019,11 @@ struct EditorCanvas {
     /// left the canvas widget's bounds) — see [`EditorModel::pointer`]'s doc
     /// comment.
     last_pointer: Option<Point>,
+    /// The selected-annotation highlight's dashed pattern —
+    /// `[sizes.selection_dash_fill, sizes.selection_dash_gap]`, the same
+    /// token `modules::overlay`'s own selection edge uses (see
+    /// [`draw_selection_highlight`]'s doc comment).
+    dash_segments: [f32; 2],
 }
 
 impl EditorCanvas {
@@ -3088,7 +3102,7 @@ impl canvas::Program<Message> for EditorCanvas {
                 self.text_font,
             );
             if Some(annotation.id) == self.selected {
-                draw_selection_highlight(&mut frame, fit, shape, self.accent);
+                draw_selection_highlight(&mut frame, fit, shape, self.accent, self.dash_segments);
             }
         }
 
@@ -3332,16 +3346,18 @@ fn draw_arrowhead(
 /// A dashed bounding-box outline around a selected annotation, in the
 /// style's own accent color — the interactive echo of the toast/overlay's
 /// established "dashed terracotta means this is the thing selected"
-/// language (`modules::overlay`'s selection edge, same [`DASH_SEGMENTS`]-
-/// style pattern, re-derived locally rather than importing the overlay's
-/// private constant).
+/// language. `dash_segments` is `modules::overlay`'s own
+/// `[sizes.selection_dash_fill, sizes.selection_dash_gap]`, passed in from
+/// [`EditorCanvas`] rather than hardcoded a second time now that a real
+/// token exists for it (was a locally re-derived `[6.0, 4.0]` before
+/// saola-theme v0.15.0 upstreamed the pattern).
 fn draw_selection_highlight(
     frame: &mut canvas::Frame,
     fit: FitTransform,
     shape: &Shape,
     accent: iced::Color,
+    dash_segments: [f32; 2],
 ) {
-    const DASH_SEGMENTS: [f32; 2] = [6.0, 4.0];
     let bounds = shape_bounds(shape).expand(6.0);
     let top_left = fit.to_view(Point::new(bounds.x, bounds.y));
     let size = Size::new(bounds.width * fit.scale, bounds.height * fit.scale);
@@ -3354,7 +3370,7 @@ fn draw_selection_highlight(
             line_cap: canvas::LineCap::Butt,
             line_join: canvas::LineJoin::Round,
             line_dash: canvas::LineDash {
-                segments: &DASH_SEGMENTS,
+                segments: &dash_segments,
                 offset: 0,
             },
         },

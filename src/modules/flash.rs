@@ -22,7 +22,7 @@
 //! `main.rs::flash_surface_settings` explains the live nested-niri finding
 //! that made a per-capture spawn/unmap the wrong shape (a brand-new
 //! surface's Wayland configure round trip plus first `wgpu` frame can
-//! easily eat the whole ~140 ms fade budget before anything is ever
+//! easily eat the whole ~150 ms fade budget before anything is ever
 //! composited). This module doesn't know or care either way — [`Flash`] is
 //! just a fade-opacity state machine; `main.rs` decides what to do with a
 //! surface.
@@ -36,19 +36,14 @@
 //! the one place that reads the real clock — once when a `CaptureTaken`
 //! event triggers the flash, and again on every [`Message::Tick`].
 //!
-//! # The saola-theme gap this hit
+//! # The saola-theme gap this hit, upstreamed at v0.15.0 (2026-09-06)
 //!
-//! There is no dedicated "flash"/"shutter" duration in `saola-theme`
-//! v0.5.0's `Motion` token group (`hover`, `popover`, `wake`, `toast_*`,
-//! `breathe` — no plain fade). [`fade`] reuses `motion.hover` (140 ms): it
-//! is §5's own family for a bare colour/opacity transition (unlike
-//! `motion.popover`'s 160 ms, which is tuned for a translate+scale
-//! *entrance*) and the closest existing token to the style guide's
-//! "~150 ms". Flagged here as a gap for a future saola-theme tag bump
-//! rather than restyled locally with a hardcoded literal or invented
-//! upstream on the spot — the same "document the gap, don't patch around
-//! it" posture `saola-lockscreen::modules::reveal`'s doc comment recorded
-//! for its own missing tokens.
+//! `saola-theme` v0.5.0's `Motion` token group had no dedicated "flash"/
+//! "shutter" duration (`hover`, `popover`, `wake`, `toast_*`, `breathe` —
+//! no plain fade), so [`fade`] used to reuse `motion.hover` (140 ms) as the
+//! closest existing family for a bare colour/opacity transition. v0.15.0
+//! adds `motion.flash` (150 ms — the style guide's own "~150 ms", not
+//! `hover`'s borrowed 140), and [`fade`] reads that directly now.
 
 use std::time::{Duration, Instant};
 
@@ -57,17 +52,16 @@ use iced::{Element, Length, Subscription};
 use saola_theme::{ColorExt, Theme};
 
 /// How often the fade re-renders while active. 16 ms is close to one frame
-/// at 60 Hz — smooth enough for a ~140 ms fade without a real
+/// at 60 Hz — smooth enough for a ~150 ms fade without a real
 /// animation-frame API (iced 0.14 has none; `iced::time::every` is the
 /// sanctioned polling exception the panel's `claude`/`window_title`
 /// modules already use for exactly this kind of short, gated animation).
 const TICK: Duration = Duration::from_millis(16);
 
-/// The fade's duration, sourced from the theme — see this module's doc
-/// comment for the token-gap note explaining why it's `motion.hover` and
-/// not a dedicated "flash" field.
+/// The fade's duration, sourced from the theme — `motion.flash` as of
+/// saola-theme v0.15.0 (was `motion.hover`; see this module's doc comment).
 pub fn fade(theme: &Theme) -> Duration {
-    Duration::from_millis(theme.motion.hover.into())
+    Duration::from_millis(theme.motion.flash.into())
 }
 
 /// One flash's fade state. `None` (idle) means no surface should be
@@ -256,11 +250,11 @@ mod tests {
     }
 
     #[test]
-    fn fade_reuses_the_hover_token() {
+    fn fade_reads_the_flash_token() {
         let theme = Theme::saola();
         assert_eq!(
             fade(&theme),
-            Duration::from_millis(theme.motion.hover.into())
+            Duration::from_millis(theme.motion.flash.into())
         );
     }
 }

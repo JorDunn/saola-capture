@@ -1192,8 +1192,12 @@ impl Daemon {
         }
 
         let settings = overlay_surface_settings(&request.output.name);
-        let overlay =
-            modules::overlay::Overlay::new(request.frame, request.output, request.focused_window);
+        let overlay = modules::overlay::Overlay::new(
+            request.frame,
+            request.output,
+            request.focused_window,
+            &self.theme,
+        );
         self.overlay = Some(overlay);
         self.overlay_reply = Some(request.reply);
         let (id, task) = self.spawn_surface(SurfaceRole::Overlay, settings);

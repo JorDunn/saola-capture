@@ -26,11 +26,14 @@ iced = { version = "0.14", features = ["tokio", "svg", "image", "advanced", "can
 # (selection overlay, flash, toast stack, optional recording chip) per Architecture.
 iced_layershell = "0.19"
 # `tag` and `version` must move together (cargo errors if they disagree — the same
-# footgun-guard the panel's Cargo.toml documents). Pinned to the panel's current tag,
-# `saola-theme-v0.5.0` (verified live 2026-08-08: `git ls-remote --tags` shows the tag,
-# and `crates/saola-theme/Cargo.toml` inside it reports `version = "0.5.0"`, matching
-# below). Never `branch = "main"` — see CLAUDE.md Design language.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.5.0", version = "0.5.0" }
+# footgun-guard the panel's Cargo.toml documents). Pinned to `saola-theme-v0.15.0`
+# (verified live 2026-09-06: `git ls-remote --tags` shows the tag, and
+# `crates/saola-theme/Cargo.toml` inside it reports `version = "0.15.0"`, matching
+# below). This bump is what upstreamed every local gap this crate had been carrying
+# since Stage 6/7/the 2026-08-09 UI-polish pass — see AGENTS.md's Design language
+# section for which literal became which token. Never `branch = "main"` — see
+# CLAUDE.md Design language.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.15.0", version = "0.15.0" }
 # D-Bus. `default-features = false` drops zbus's default `async-io` runtime; `tokio`
 # makes it share the one runtime this crate ever spins up — iced's `tokio` feature
 # builds it for the daemon/window processes (same teaching note as the panel's

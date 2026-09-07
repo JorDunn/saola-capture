@@ -87,7 +87,7 @@ use std::time::UNIX_EPOCH;
 
 use iced::widget::{button, column, container, image, row, scrollable, text, Space};
 use iced::{Center, Element, Length};
-use saola_theme::{ColorExt, Surface, Theme};
+use saola_theme::{Chrome, ColorExt, Surface, Theme};
 
 use crate::capture::Frame;
 use crate::config::CaptureConfig;
@@ -571,7 +571,15 @@ impl HistoryModel {
                         .font(saola_theme::convert::ui_font_regular(theme))
                         .size(theme.typography.size.secondary)
                 )
-                .style(saola_theme::style::button::rest(theme, Surface::Paper))
+                // `Chrome::Window`: this button lives inside the app
+                // window, not shell chrome. A no-op on `Surface::Paper`
+                // today (the two chromes are identical there) — the correct
+                // variant if an ink app-window mode ever ships.
+                .style(saola_theme::style::button::rest(
+                    theme,
+                    Surface::Paper,
+                    Chrome::Window,
+                ))
                 .on_press(Message::Refresh),
             ]
             .align_y(Center),
@@ -830,7 +838,15 @@ fn small_button(
             .into()
     } else {
         button(content)
-            .style(saola_theme::style::button::rest(theme, Surface::Paper))
+            // `Chrome::Window`: this row action lives inside the app
+            // window, not shell chrome. A no-op on `Surface::Paper` today
+            // (the two chromes are identical there) — the correct variant
+            // if an ink app-window mode ever ships.
+            .style(saola_theme::style::button::rest(
+                theme,
+                Surface::Paper,
+                Chrome::Window,
+            ))
             .on_press_maybe(on_press)
             .into()
     }

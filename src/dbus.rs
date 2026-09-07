@@ -1377,8 +1377,8 @@ impl CaptureService {
         }
 
         // 128 px is generous headroom over the toast's 36 px icon tile
-        // (`modules::toast::ICON_TILE_SIZE`) — enough that a HiDPI render
-        // still looks sharp, small enough that the GPU upload stays cheap.
+        // (`theme.sizes.icon_tile`) — enough that a HiDPI render still
+        // looks sharp, small enough that the GPU upload stays cheap.
         let thumbnail = crate::modules::toast::thumbnail_handle(&frame, 128);
         if self
             .events

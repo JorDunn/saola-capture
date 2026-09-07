@@ -539,5 +539,79 @@ technical_nouns:
     approved_meaning: The web address for the Keep a Changelog format.
   - word: semver.org
     approved_meaning: The web address for Semantic Versioning.
+  - word: theme
+    approved_meaning: The saola-theme design system crate, or the set of colors and sizes it provides.
+    inflections: [themes]
+  - word: saola-theme
+    approved_meaning: The saola-theme crate.
+  - word: token
+    approved_meaning: A named design value (a color, size, or time) that saola-theme provides.
+    inflections: [tokens]
+  - word: style
+    approved_meaning: A saola-theme widget style function.
+    inflections: [styles]
+  - word: chrome
+    approved_meaning: The saola-theme Chrome context, shell chrome or window chrome.
+    inflections: [Chrome]
+  - word: toolbar
+    approved_meaning: The floating toolbar on the region overlay.
+    inflections: [toolbars]
+  - word: icon
+    approved_meaning: A small picture that identifies an action or a state.
+    inflections: [icons]
+  - word: tile
+    approved_meaning: The square icon area in a notification card.
+    inflections: [tiles]
+  - word: toast
+    approved_meaning: The notification card the daemon shows after a capture.
+    inflections: [toasts]
+  - word: notification
+    approved_meaning: A message the desktop shows to the user.
+    inflections: [notifications]
+  - word: readout
+    approved_meaning: The size readout on the region overlay.
+  - word: inset
+    approved_meaning: The space between a segmented control's track and its segments.
+  - word: segment
+    approved_meaning: One option in a segmented control.
+    inflections: [segments, segmented]
+  - word: button
+    approved_meaning: A widget the user clicks.
+    inflections: [buttons]
+  - word: radius
+    approved_meaning: The radius of a round handle or corner.
+  - word: dash
+    approved_meaning: One filled part of a dashed line.
+    inflections: [dashes, dashed]
+  - word: ms
+    approved_meaning: Milliseconds.
+  - word: rule
+    approved_meaning: The thin line in a notification card that shows its remaining life.
+    inflections: [rules]
+  - word: release
+    approved_meaning: A published version of the software.
+    inflections: [releases]
+  - word: workflow
+    approved_meaning: A GitHub Actions workflow file.
+    inflections: [workflows]
+  - word: release-plz
+    approved_meaning: The release-plz release tool.
+  - word: lint
+    approved_meaning: The clippy and fmt checks.
+  - word: fill_subtle
+    approved_meaning: The saola-theme on_ink.fill_subtle color token.
+  - word: handoff
+    approved_meaning: A PLAN.md stage handoff note.
+    inflections: [handoffs]
+  - word: .gitignore
+    approved_meaning: The git ignore file.
+  - word: CHANGELOG.md
+    approved_meaning: The changelog file.
+  - word: paper
+    approved_meaning: The Saola paper surface, the light background of an app window.
+  - word: shell
+    approved_meaning: The desktop shell, or the saola-theme shell chrome context.
+  - word: flash
+    approved_meaning: The shutter flash the daemon shows after a screenshot.
 technical_verbs: []
 preferred_terms: {}

@@ -50,34 +50,38 @@
 //! every color it draws (background, text, life rule, shadow) by the
 //! phase's `alpha` instead of wrapping the card in an opacity widget.
 //!
-//! # The saola-theme gaps this hit
+//! # The two local gaps this hit, upstreamed at saola-theme v0.15.0 (2026-09-06)
 //!
-//! Two, both flagged for a future tag bump rather than restyled locally
-//! (CLAUDE.md Design language):
+//! Both were flagged for a future tag bump rather than restyled locally
+//! (AGENTS.md Design language); both are now real tokens/styles and the
+//! local workarounds are gone:
 //!
-//! - **No opaque-ink "card" style helper.** `saola_theme::style::container::card`
-//!   exists but does the *opposite* of what §6 wants here: its `Surface::Ink`
-//!   arm paints an **ivory** card (for ivory content floating on an ink
-//!   shell — its own doc comment says as much), while §6's notification card
-//!   is itself solid ink with ivory text. [`ink_card_style`] below composes
-//!   the right thing from tokens that do exist (`palette.ink`,
-//!   `on_ink.primary`, `radii.card`, `shadows.popover`) — the same
-//!   "derive locally, don't restyle" posture `saola-lockscreen::modules::reveal`
-//!   used for its own three missing style helpers. (`shadows.popover`'s
-//!   `0 18px 48px rgba(12,10,0,.5)` is, gratifyingly, *exactly* §6's spec
-//!   value — no gap there.)
-//! - **No `icon_tile` size token.** §6 wants a "36px icon tile"; `Sizes` has
-//!   no field for it (`icon_bare` is 32–34 for the power menu, `list_row` is
-//!   38 — neither is it). [`ICON_TILE_SIZE`] is the spec's literal value,
-//!   named and documented rather than inlined as a bare number at each use
-//!   site.
+//! - **The opaque-ink card.** This module used to hand-compose it
+//!   (`ink_card_style`) because `saola_theme::style::container::card` does
+//!   the *opposite* of what §6 wants — its `Surface::Ink` arm paints an
+//!   **ivory** card, while §6's notification card is solid ink with ivory
+//!   text. [`saola_theme::style::container::notification_card`] is that
+//!   exact recipe now (`palette.ink`, `on_ink.primary`, `radii.card`,
+//!   `shadows.popover`, all alpha-scaled by its own `alpha` argument), and
+//!   [`card_view`] calls it directly.
+//! - **The 36px icon tile and the 3px life rule.** `theme.sizes.icon_tile`/
+//!   `theme.sizes.life_rule` replace what were local literals
+//!   (`ICON_TILE_SIZE`/`LIFE_RULE_HEIGHT`). The life rule itself is now a
+//!   real `iced::widget::progress_bar` styled with
+//!   [`saola_theme::style::notification::life_rule`], rather than a `Space`
+//!   painted to a shrinking width — see [`card_view`]. The `Notice`/
+//!   `Recording` icon tile (the plain placeholder square this crate draws
+//!   until it has a real icon set — see [`ToastKind::Notice`]) is styled
+//!   with [`saola_theme::style::notification::icon_tile`] for the same
+//!   reason; the `Capture`/`Swatch` tiles paint real content of their own
+//!   (a thumbnail, a picked color) and don't use it.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use iced::widget::{column, container, image, mouse_area, row, text, Space};
-use iced::{Center, Element, Length, Subscription};
-use saola_theme::{ColorExt, ShadowExt, Theme};
+use iced::widget::{column, container, image, mouse_area, progress_bar, row, text, Space};
+use iced::{Center, Element, Fill, Length, Subscription};
+use saola_theme::{ColorExt, Theme};
 
 use crate::capture::Frame;
 
@@ -86,15 +90,6 @@ use crate::capture::Frame;
 /// over up to 6.35 s, so ~30 fps reads just as smooth and costs less than
 /// half the wakeups.
 const TICK: Duration = Duration::from_millis(32);
-
-/// §6's "36px icon tile" — no `Sizes` field for it exists in saola-theme
-/// v0.5.0; see this module's doc comment for the gap note.
-const ICON_TILE_SIZE: f32 = 36.0;
-
-/// §6's "3px life rule" — same gap-note posture as [`ICON_TILE_SIZE`]; no
-/// dedicated rule-thickness token exists (`sizes.window_border`, at 2px, is
-/// the closest and is for a different purpose).
-const LIFE_RULE_HEIGHT: f32 = 3.0;
 
 // ---------------------------------------------------------------------
 // Thumbnails
@@ -119,7 +114,7 @@ const LIFE_RULE_HEIGHT: f32 = 3.0;
 /// Downsampled with simple nearest-neighbor sampling first: a full
 /// screenshot frame can be tens of megabytes of RGBA, and every byte of it
 /// would otherwise ride into the GPU's image cache to be displayed at
-/// `ICON_TILE_SIZE`. `max_dim` bounds the *longer* side; the shorter side
+/// `theme.sizes.icon_tile`. `max_dim` bounds the *longer* side; the shorter side
 /// scales to match, so the thumbnail keeps the screenshot's aspect ratio
 /// (a centre-crop-to-square would distort or lose content instead).
 pub fn thumbnail_handle(frame: &Frame, max_dim: u32) -> image::Handle {
@@ -487,8 +482,11 @@ fn fraction(elapsed: Duration, total: Duration) -> f32 {
 }
 
 /// One card, fully composed: icon tile, title + right-aligned app name,
-/// body (the file name), and the life rule — §6 verbatim, modulo the two
-/// gaps this module's doc comment records.
+/// body (the file name), and the life rule — §6 verbatim, using the real
+/// `saola_theme::style::container::notification_card`/
+/// `saola_theme::style::notification::{life_rule, icon_tile}` styles this
+/// module used to hand-compose locally (see this module's doc comment for
+/// the upstreaming history).
 fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Message> {
     let elapsed = toast.elapsed(now);
     let (offset_x, alpha) = phase(theme, elapsed);
@@ -499,16 +497,17 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
         color
     };
 
-    let ink = scale_alpha(theme.palette.ink.into_iced());
+    // `notification_card`/`life_rule`/`icon_tile` (below) do their own
+    // alpha scaling from this same `alpha` — these three are only the
+    // colors *outside* those three helpers' reach: the header/body text and
+    // the life rule's own accent, which the widgets painting them
+    // (`text`/`progress_bar`'s `bar`) don't get from a container style.
     let text_primary = scale_alpha(theme.on_ink.primary.into_iced());
     let text_tertiary = scale_alpha(theme.on_ink.tertiary.into_iced());
     let text_secondary = scale_alpha(theme.on_ink.secondary.into_iced());
-    let accent = scale_alpha(theme.palette.accent.into_iced());
-    let mut shadow = theme.shadows.popover.into_iced();
-    shadow.color.a *= alpha;
 
     let card_width = theme.sizes.notification_card_width;
-    let radius = theme.radii.card;
+    let icon_tile_size = theme.sizes.icon_tile;
     let padding = theme.sizes.popover_padding;
     let title_font = saola_theme::convert::ui_font(theme);
     let body_font = saola_theme::convert::ui_font_regular(theme);
@@ -540,34 +539,33 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
 
     let tile: Element<'static, Message> = match &toast.kind {
         ToastKind::Capture { thumbnail, .. } => image(thumbnail.clone())
-            .width(Length::Fixed(ICON_TILE_SIZE))
-            .height(Length::Fixed(ICON_TILE_SIZE))
+            .width(Length::Fixed(icon_tile_size))
+            .height(Length::Fixed(icon_tile_size))
             .content_fit(iced::ContentFit::Cover)
             .into(),
-        // See `ToastKind::Notice`/`ToastKind::Recording`: an ivory tile, no
-        // glyph, until this crate has an icon set.
-        ToastKind::Notice { .. } | ToastKind::Recording { .. } => {
-            let paper = scale_alpha(theme.palette.paper.into_iced());
-            container(Space::new())
-                .width(Length::Fixed(ICON_TILE_SIZE))
-                .height(Length::Fixed(ICON_TILE_SIZE))
-                .style(move |_: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(paper)),
-                    ..container::Style::default()
-                })
-                .into()
-        }
+        // No glyph, until this crate has an icon set — see
+        // `ToastKind::Notice`'s doc comment. `notification::icon_tile` is
+        // the real drop-in for this exact "empty placeholder tile" case (it
+        // was minted for it): `on_ink.fill_subtle`, `radii.tile`, alpha
+        // already folded in.
+        ToastKind::Notice { .. } | ToastKind::Recording { .. } => container(Space::new())
+            .width(Length::Fixed(icon_tile_size))
+            .height(Length::Fixed(icon_tile_size))
+            .style(saola_theme::style::notification::icon_tile(theme, alpha))
+            .into(),
         // **Stage 16.** Unlike `Notice`/`Recording`, this tile *has* real
         // content to paint with no icon set needed at all: the picked color
         // itself, at full alpha regardless of the card's own fade (a
         // desaturated swatch mid-fade would misreport the very color the
-        // toast exists to show).
+        // toast exists to show) — so this one keeps its own local style
+        // rather than `notification::icon_tile`, which always paints
+        // `on_ink.fill_subtle`.
         ToastKind::Swatch { rgb, .. } => {
             let (r, g, b) = *rgb;
             let swatch = iced::Color::from_rgb(r as f32, g as f32, b as f32);
             container(Space::new())
-                .width(Length::Fixed(ICON_TILE_SIZE))
-                .height(Length::Fixed(ICON_TILE_SIZE))
+                .width(Length::Fixed(icon_tile_size))
+                .height(Length::Fixed(icon_tile_size))
                 .style(move |_: &iced::Theme| container::Style {
                     background: Some(iced::Background::Color(swatch)),
                     ..container::Style::default()
@@ -577,8 +575,8 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
     };
 
     let thumb = container(tile)
-        .width(Length::Fixed(ICON_TILE_SIZE))
-        .height(Length::Fixed(ICON_TILE_SIZE));
+        .width(Length::Fixed(icon_tile_size))
+        .height(Length::Fixed(icon_tile_size));
 
     let header = row![
         text(title_text)
@@ -608,25 +606,28 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
 
     let content = row![
         thumb,
-        column![header, body].spacing(4.0).width(Length::Fill),
+        column![header, body]
+            .spacing(theme.sizes.gap_tight)
+            .width(Length::Fill),
     ]
     .spacing(gap)
     .padding(padding)
     .align_y(Center);
 
-    let life_rule = container(
-        Space::new()
-            .width(Length::Fixed((card_width * life).max(0.0)))
-            .height(Length::Fixed(LIFE_RULE_HEIGHT)),
-    )
-    .style(move |_: &iced::Theme| container::Style {
-        background: Some(iced::Background::Color(accent)),
-        ..container::Style::default()
-    });
+    // A real `progress_bar`, not a hand-shrunk `Space` rectangle — see this
+    // module's doc comment. `life` (1.0 → 0.0 as the card ages) is exactly
+    // the widget's own `value` fraction; `girth` is the bar's thickness
+    // here since it's laid out horizontally.
+    let life_rule = progress_bar(0.0..=1.0, life)
+        .length(Fill)
+        .girth(theme.sizes.life_rule)
+        .style(saola_theme::style::notification::life_rule(theme, alpha));
 
     let card = container(column![content, life_rule])
         .width(Length::Fixed(card_width))
-        .style(ink_card_style(ink, text_primary, radius, shadow));
+        .style(saola_theme::style::container::notification_card(
+            theme, alpha,
+        ));
 
     let slid = row![Space::new().width(Length::Fixed(offset_x.max(0.0))), card,];
 
@@ -635,32 +636,6 @@ fn card_view(theme: &Theme, toast: &Toast, now: Instant) -> Element<'static, Mes
         .on_enter(Message::Hovered(toast.id))
         .on_exit(Message::Unhovered(toast.id))
         .into()
-}
-
-/// The §6 notification card's own container style — see this module's doc
-/// comment for why `saola_theme::style::container::card` is the wrong
-/// helper here. Every argument is a plain `Copy` value rather than a
-/// borrowed `&Theme`, so the returned closure is `'static` (matching
-/// `saola-theme`'s own style helpers' shape — see e.g.
-/// `saola_theme::style::container::card`, which extracts primitives before
-/// building its closure for the same reason).
-fn ink_card_style(
-    background: iced::Color,
-    text_color: iced::Color,
-    radius: f32,
-    shadow: iced::Shadow,
-) -> impl Fn(&iced::Theme) -> container::Style {
-    move |_| container::Style {
-        text_color: Some(text_color),
-        background: Some(iced::Background::Color(background)),
-        border: iced::Border {
-            color: iced::Color::TRANSPARENT,
-            width: 0.0,
-            radius: radius.into(),
-        },
-        shadow,
-        ..container::Style::default()
-    }
 }
 
 #[cfg(test)]

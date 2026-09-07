@@ -1024,77 +1024,97 @@ PLAN.md's Architecture section is binding; read it first. Summary:
 - `src/icons.rs` copies saola-panel's pattern (stroke baked into assets,
   `include_bytes!`, svg tint via theme roles). Migrating icons to a shared
   saola-icons crate is **recorded debt**, not this repo's job.
-- **saola-theme v0.5.0 token/style gaps found in Stage 6** (documented and
-  worked around locally per the rule above's spirit — no tag bump yet, since
-  each was answered by deriving from *existing* tokens rather than needing a
-  genuinely new one; a future consolidated pass should still upstream them):
+- **saola-theme v0.5.0 gaps found in Stage 6, upstreamed and adopted at
+  v0.15.0 (2026-09-06)**. All three are now real tokens/styles; the local
+  workarounds they replaced are gone:
   - No dedicated flash/shutter motion duration — `modules::flash::fade`
-    reuses `motion.hover` (140 ms).
+    used to reuse `motion.hover` (140 ms); it now reads `motion.flash`
+    (150 ms — the style guide's own "~150 ms", not `hover`'s borrowed
+    value, so this is a genuine +10 ms correction, not just a rename).
   - `saola_theme::style::container::card(theme, Surface::Ink)` paints the
     *opposite* of what the ink notification card needs (an ivory card, not
-    an ink one) — `modules::toast::ink_card_style` composes the right thing
-    locally from `palette.ink`/`on_ink.primary`/`radii.card`/
-    `shadows.popover`.
+    an ink one) — `modules::toast` used to compose the right thing locally
+    (`ink_card_style`, from `palette.ink`/`on_ink.primary`/`radii.card`/
+    `shadows.popover`); it now calls
+    `saola_theme::style::container::notification_card(theme, alpha)`
+    directly, and the local composition is deleted.
   - No `Sizes.icon_tile` field for the toast's 36 px icon tile, and no
-    life-rule-thickness field for its 3 px terracotta rule —
-    `modules::toast::ICON_TILE_SIZE`/`LIFE_RULE_HEIGHT` are the spec's
-    literal values, named and documented at their one definition site.
-- **saola-theme v0.5.0 gaps found in Stage 7** (same posture, still no tag
-  bump). `scrim.capture`, `radii.selection`, `palette.accent`,
-  `container::popover`, `container::bar_pill` and `button::rest` all existed
-  and are used verbatim; `sizes.window_border` (2 px) is reused as the
-  selection edge's stroke width, on the grounds that it is the system's one
-  *thin decorative line* thickness. Three genuine design-token gaps, all in
-  `modules::overlay`: no handle size (`HANDLE_RADIUS`), no dash pattern for
-  the one dashed edge in the whole style guide (`DASH_SEGMENTS`), no width
-  for a small numeric readout pill (`READOUT_WIDTH`).
-  **Deliberately *not* filed as gaps**: `HANDLE_HIT_RADIUS`,
-  `EDGE_SNAP_DISTANCE` and `MIN_SELECTION` describe pointer *behaviour*, not
-  appearance — a design system has no opinion on how close to an edge a drag
-  should snap, and upstreaming them would miscategorise interaction as style.
-- **saola-theme gaps found in Stage 14** (same posture, still no tag bump),
-  both in `modules::editor`: no color token for a windowed canvas's crop-tool
-  dimming (`scrims.capture` is specified for the full-output capture overlay
-  specifically, not this surface, so `draw_crop_dimming` uses a plain black
-  at low alpha rather than reaching for a token that doesn't mean this); and
-  no stroke-width scale for a drawing tool's pen (`StrokeWidth::pixels`,
-  three named literals — the same "a design system has no opinion on a
-  drawing tool's own parameters" reasoning `modules::overlay`'s
-  `HANDLE_RADIUS` already established, not a numeric-size gap like the ones
-  above).
-- **saola-theme gaps found in Stage 15** (same posture, still no tag bump),
-  all in `modules::editor`: no size/ratio tokens for the Step badge
-  (`STEP_BADGE_RADIUS`, `STEP_BADGE_FONT_RATIO` — the same drawing-tool-
-  parameter category `StrokeWidth::pixels` already established, not a
-  numeric-size gap) and no width token for the export panel's small quality
-  `text_input` (`QUALITY_FIELD_WIDTH` — a one-off layout parameter, not a
-  reusable size scale value). **Not a gap, worth noting as the positive
-  case**: the Text tool's three size stops (`TextSizeStop::{Small,Medium,
-  Large}`) are *not* a new literal scale — they resolve to three existing
-  `saola_theme::Theme::typography.size` entries (`body`/`section_heading`/
-  `screen_title`), the same "reuse an existing token rather than inventing
-  a parallel scale" instinct the format/color pickers already followed.
-- **saola-theme gap found in the 2026-08-09 UI-polish pass** (same posture,
-  still no tag bump): v0.5.0 ships `style::segmented::track`/`segment` but no
-  *geometry* to go with them — no gap between adjacent segments, no inset of
-  the row from the track's edge. `modules::app::SEGMENT_INSET` (4.0, shared
-  by `modules::editor`'s twin `segmented_row` via a `pub(super)` re-use, so
-  the two surfaces cannot drift) is that value, and it is **not invented
-  here**: it is what saola-theme's own reference usage of those two helpers
-  does (`examples/gallery/main.rs`: `container(row(segments).spacing(4))
-  .style(track).padding(4)`). Worth upstreaming as a token in the same
-  consolidated pass as the gaps above, since every consumer of a segmented
-  control will otherwise re-derive it. **Why it is not cosmetic**: every
-  segment is a full `radii.pill`, so at zero spacing adjacent pills' rounded
-  ends scallop into one another and a four-option control reads as a row of
-  overlapping blobs rather than one control — verified by before/after
-  screenshots of the real app window.
+    life-rule-thickness field for its 3 px terracotta rule — were
+    `modules::toast::ICON_TILE_SIZE`/`LIFE_RULE_HEIGHT`, now
+    `theme.sizes.icon_tile`/`theme.sizes.life_rule`. The life rule itself
+    is also now a real `iced::widget::progress_bar` styled with
+    `saola_theme::style::notification::life_rule`, and the `Notice`/
+    `Recording` placeholder tile uses
+    `saola_theme::style::notification::icon_tile` — both new v0.15.0
+    styles minted for exactly this shape.
+- **saola-theme v0.5.0 gaps found in Stage 7, upstreamed and adopted at
+  v0.15.0 (2026-09-06)**. `scrim.capture`, `radii.selection`,
+  `palette.accent`, `container::popover`, `container::bar_pill` and
+  `button::rest` all existed and are used verbatim; `sizes.window_border`
+  (2 px) is reused as the selection edge's stroke width, on the grounds
+  that it is the system's one *thin decorative line* thickness. The three
+  genuine design-token gaps this stage found, all in `modules::overlay`,
+  are now tokens with the same values the local constants carried: no
+  handle size (was `HANDLE_RADIUS`, now `theme.sizes.handle_radius`), no
+  dash pattern for the one dashed edge in the whole style guide (was
+  `DASH_SEGMENTS`, now `theme.sizes.selection_dash_fill`/
+  `selection_dash_gap`), no width for a small numeric readout pill (was
+  `READOUT_WIDTH`, now `theme.sizes.readout_width`).
+  **Deliberately *not* filed as gaps, and still local**: `EDGE_SNAP_DISTANCE`
+  and `MIN_SELECTION` describe pointer *behaviour*, not appearance — a
+  design system has no opinion on how close to an edge a drag should snap,
+  and upstreaming them would miscategorise interaction as style. The
+  overlay's hit-test radius (formerly `HANDLE_HIT_RADIUS`) is the same kind
+  of behaviour constant, but is now derived at runtime as
+  `sizes.handle_radius * HANDLE_HIT_RADIUS_RATIO` (`Overlay::new`) rather
+  than a bare literal, so it can't silently drift out of sync with the
+  token it scales.
+- **saola-theme gaps found in Stage 14** (same posture; still unfilled as
+  of v0.15.0), both in `modules::editor`: no color token for a windowed
+  canvas's crop-tool dimming (`scrims.capture` is specified for the
+  full-output capture overlay specifically, not this surface, so
+  `draw_region_dimming` uses a plain black at low alpha rather than
+  reaching for a token that doesn't mean this); and no stroke-width scale
+  for a drawing tool's pen (`StrokeWidth::pixels`, three named literals —
+  the same "a design system has no opinion on a drawing tool's own
+  parameters" reasoning `modules::overlay`'s (now-local-only)
+  `EDGE_SNAP_DISTANCE`/`MIN_SELECTION` already established, not a
+  numeric-size gap like Stage 6/7's above).
+- **saola-theme gaps found in Stage 15** (same posture; still unfilled as
+  of v0.15.0), all in `modules::editor`: no size/ratio tokens for the Step
+  badge (`STEP_BADGE_RADIUS`, `STEP_BADGE_FONT_RATIO` — the same
+  drawing-tool-parameter category `StrokeWidth::pixels` already
+  established, not a numeric-size gap) and no width token for the export
+  panel's small quality `text_input` (`QUALITY_FIELD_WIDTH` — a one-off
+  layout parameter, not a reusable size scale value). **Not a gap, worth
+  noting as the positive case**: the Text tool's three size stops
+  (`TextSizeStop::{Small,Medium,Large}`) are *not* a new literal scale —
+  they resolve to three existing `saola_theme::Theme::typography.size`
+  entries (`body`/`section_heading`/`screen_title`), the same "reuse an
+  existing token rather than inventing a parallel scale" instinct the
+  format/color pickers already followed.
+- **saola-theme gap found in the 2026-08-09 UI-polish pass, upstreamed and
+  adopted at v0.15.0 (2026-09-06)**: v0.5.0 shipped
+  `style::segmented::track`/`segment` but no *geometry* to go with them —
+  no gap between adjacent segments, no inset of the row from the track's
+  edge. `theme.sizes.segment_inset` (4.0) is that value now — was a local
+  `modules::app::SEGMENT_INSET`, shared by `modules::editor`'s twin
+  `segmented_row` via a `pub(super)` re-use so the two surfaces couldn't
+  drift; both call sites now read the token directly instead, so there is
+  nothing left to keep in sync by hand. **Why it mattered, and still
+  does**: every segment is a full `radii.pill`, so at zero spacing adjacent
+  pills' rounded ends scallop into one another and a four-option control
+  reads as a row of overlapping blobs rather than one control — verified
+  by before/after screenshots of the real app window.
   **Also found in that pass, and not a gap at all — just an unused style**:
   both `scrollable`s in this crate (`modules::app::main_view`,
   `modules::editor::footer_view`) were unstyled, so they rendered iced's
-  *default* near-black scrollbar straight over `paper_window`'s rounded
-  corner. `saola_theme::style::scrollable::rest` already existed and is now
-  applied; check for that helper before adding any new scrollable.
+  *default* near-black scrollbar straight over the app window's rounded
+  corner (`saola_theme::style::container::window(theme, Surface::Paper)`,
+  named `paper_window` before v0.15.0 folded it into the shared
+  `Surface`-parameterized `window` helper). `saola_theme::style::
+  scrollable::rest` already existed and is now applied; check for that
+  helper before adding any new scrollable.
 - **No new saola-theme gap found in Stage 16** — `modules::history`'s one
   bare-literal size, `THUMBNAIL_MAX_DIM` (96px), is the same "a design
   system has no opinion on a drawing surface's own layout parameter"
@@ -1106,6 +1126,20 @@ PLAN.md's Architecture section is binding; read it first. Summary:
 
 ## Conventions
 
+- **`Chrome::Shell` vs `Chrome::Window`** (saola-theme v0.15.0's new
+  `button::rest`/`segmented::segment` parameter): `Chrome::Shell` for every
+  layer-shell surface in this crate (`modules::overlay`'s floating
+  toolbar — the daemon's own chrome, same as saola-panel's bar/popovers);
+  `Chrome::Window` for every control inside the separate-process app window
+  (`modules::app`, `modules::editor`, `modules::history` — all
+  `Surface::Paper`). The two chromes render identically on `Surface::Paper`
+  today (a rest control there is already a translucent ink fill, so there's
+  nothing louder to step back from), which is why this bump was a pure
+  no-op visually on the app window; on `Surface::Ink`, `Chrome::Window`
+  recedes a rest control into the translucent `on_ink` fill ladder instead
+  of the shell's full-opacity ivory pill, so it is the correct choice if an
+  ink app-window mode ever ships. Pick the variant by *where the surface
+  lives*, not by which `Surface` it's drawn on.
 - **No-panic rule**: no `panic!`/`unwrap`/`expect`/indexing on runtime
   paths. A dead daemon means `Print` silently does nothing — silent absence
   is the worst failure mode. Absent services (no daemon, no tray host, no

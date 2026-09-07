@@ -50,9 +50,9 @@
 //! screenshot" is the question a size readout is asked. (On a scale-1 output
 //! the two are identical, so this only shows up on fractional scale.)
 //!
-//! # saola-theme v0.5.0: what this surface needed and what it found
+//! # saola-theme tokens this surface uses
 //!
-//! Same posture as `modules::flash`/`modules::toast` (CLAUDE.md Design
+//! Same posture as `modules::flash`/`modules::toast` (AGENTS.md Design
 //! language): derive from tokens that exist, spell the derivation out, and
 //! name a genuine gap rather than quietly hardcoding.
 //!
@@ -68,49 +68,49 @@
 //! readout's solid ink pill), `button::rest` (§6's at-rest ivory pill,
 //! including its `Status::Disabled` arm — see [`toolbar`]).
 //!
-//! **Genuine design-token gaps** (flagged for a future consolidated
-//! saola-theme pass, not upstreamed this stage, no tag bump):
-//!
-//! - No handle size. §7 says "round terracotta handles" with no dimension
-//!   anywhere in the style guide. [`HANDLE_RADIUS`].
-//! - No dash pattern for a dashed edge — §7 is the only place in the whole
-//!   guide that asks for one. [`DASH_SEGMENTS`].
-//! - No width for a small numeric readout pill. [`READOUT_WIDTH`].
+//! **Three former gaps, upstreamed and adopted at v0.15.0 (2026-09-06)**:
+//! `sizes.handle_radius` (the drag handle dot's radius — was the local
+//! `HANDLE_RADIUS` this module minted for §7's undimensioned "round
+//! terracotta handles"), `sizes.selection_dash_fill`/`selection_dash_gap`
+//! (the dashed edge's `[on, off]` pattern — was the local `DASH_SEGMENTS`),
+//! and `sizes.readout_width` (the size-readout pill's fixed width — was the
+//! local `READOUT_WIDTH`). All three values are unchanged from what this
+//! module already used.
 //!
 //! **Not gaps — interaction constants, which are deliberately not theme
-//! tokens**: [`HANDLE_HIT_RADIUS`], [`EDGE_SNAP_DISTANCE`] and
+//! tokens**: [`HANDLE_HIT_RADIUS_RATIO`], [`EDGE_SNAP_DISTANCE`] and
 //! [`MIN_SELECTION`] describe how the *pointer* behaves, not how anything
 //! looks. A design system has no opinion on how close to an edge a drag
 //! should snap; putting them in `saola-theme` would be miscategorising
-//! behaviour as style.
+//! behaviour as style. [`Overlay::hit_radius`] is derived from
+//! `sizes.handle_radius` at construction time (see that field's doc
+//! comment) precisely so this ratio can't silently drift out of sync with
+//! the token it scales.
 
 use std::fmt;
 
 use iced::widget::{button, canvas, container, image, mouse_area, row, text, Stack};
 use iced::{keyboard, mouse, Element, Length, Padding, Point, Rectangle, Size};
-use saola_theme::{ColorExt, Surface, Theme};
+use saola_theme::{Chrome, ColorExt, Surface, Theme};
 
 use crate::capture::{LogicalRect, OutputInfo, WindowRef};
 
 // ---------------------------------------------------------------------
-// Constants — see the module doc comment for which of these are theme
-// gaps and which are deliberately not design tokens at all.
+// Constants — pure interaction/behaviour, deliberately not design tokens.
+// See the module doc comment. The three appearance values these used to
+// carry locally (handle radius, dash pattern, readout width) are now
+// `theme.sizes.handle_radius`/`selection_dash_fill`/`selection_dash_gap`/
+// `readout_width`, read at each use site below.
 // ---------------------------------------------------------------------
 
-/// The drawn radius of one round selection handle, in logical pixels. §7
-/// asks for "round terracotta handles" and never sizes them; 5 px (a 10 px
-/// dot) is small enough that eight of them don't crowd a modest selection
-/// and large enough to read as a grab point next to a 2 px edge.
-const HANDLE_RADIUS: f32 = 5.0;
-
-/// How far from a handle's centre a press still counts as grabbing it.
-/// Deliberately more than double [`HANDLE_RADIUS`]: the drawn dot is a
-/// *hint*, and a selection edge is a one-pixel-precise thing to aim at.
-/// Not a theme token — see the module doc comment.
-const HANDLE_HIT_RADIUS: f32 = 12.0;
-
-/// The selection edge's dash pattern: `[on, off]`, in logical pixels.
-const DASH_SEGMENTS: [f32; 2] = [6.0, 4.0];
+/// [`Overlay::hit_radius`]'s multiplier on `sizes.handle_radius`: how far
+/// from a handle's centre a press still counts as grabbing it. Deliberately
+/// more than double — the drawn dot is a *hint*, and a selection edge is a
+/// one-pixel-precise thing to aim at. A ratio rather than a fixed pixel
+/// count so it tracks the token if `handle_radius` ever changes upstream,
+/// instead of the two silently drifting apart. Not a theme token itself —
+/// see the module doc comment.
+const HANDLE_HIT_RADIUS_RATIO: f32 = 2.4;
 
 /// How close (logical px) an edge has to come to the output's own edge
 /// before it snaps flush to it. This is what makes "select the whole left
@@ -123,12 +123,6 @@ const EDGE_SNAP_DISTANCE: f32 = 8.0;
 /// making a stray click a no-op rather than a one-pixel screenshot. Not a
 /// theme token.
 const MIN_SELECTION: f32 = 4.0;
-
-/// The size readout pill's fixed width. Fixed rather than hugging its text
-/// so the pill doesn't twitch as the digit count changes mid-drag — the
-/// same reason the readout uses tabular numerals (IBM Plex's figures are
-/// tabular by default; see `saola_theme::convert::ui_font`).
-const READOUT_WIDTH: f32 = 136.0;
 
 // ---------------------------------------------------------------------
 // The geometry core — pure, `Theme`-free, exhaustively unit-tested
@@ -619,6 +613,14 @@ pub struct Overlay {
     /// disabled in that case, the same `Option`-gates-`on_press` pattern
     /// [`toolbar`] already uses for Capture.
     focused_window: Option<WindowRef>,
+    /// How far from a handle's centre a press still counts as grabbing it —
+    /// `sizes.handle_radius * HANDLE_HIT_RADIUS_RATIO`, resolved once at
+    /// [`Overlay::new`] rather than re-read from a `Theme` on every press.
+    /// This module's pure geometry functions ([`press`](Self::press),
+    /// [`hit_test`]) stay `Theme`-free by design (see the module doc
+    /// comment); storing the one derived number this struct needs is what
+    /// lets `hit_test` keep taking a plain `f32` instead of a `&Theme`.
+    hit_radius: f32,
 }
 
 /// What [`Overlay::update`] asks `main.rs` to do — the same "return a value,
@@ -688,7 +690,12 @@ pub enum Message {
 }
 
 impl Overlay {
-    pub fn new(frame: FrozenFrame, output: OutputInfo, focused_window: Option<WindowRef>) -> Self {
+    pub fn new(
+        frame: FrozenFrame,
+        output: OutputInfo,
+        focused_window: Option<WindowRef>,
+        theme: &Theme,
+    ) -> Self {
         let bounds = Rect::new(
             0.0,
             0.0,
@@ -703,6 +710,7 @@ impl Overlay {
             interaction: Interaction::Idle,
             cursor: None,
             focused_window,
+            hit_radius: theme.sizes.handle_radius * HANDLE_HIT_RADIUS_RATIO,
         }
     }
 
@@ -756,7 +764,7 @@ impl Overlay {
             return;
         };
         let point = clamp_point(cursor, self.bounds);
-        match hit_test(self.selection, point, HANDLE_HIT_RADIUS) {
+        match hit_test(self.selection, point, self.hit_radius) {
             HitTarget::Handle(handle) => {
                 self.interaction = Interaction::Resizing { handle };
             }
@@ -860,8 +868,12 @@ impl Overlay {
             accent: theme.palette.accent.into_iced(),
             radius: theme.radii.selection,
             edge_width: theme.sizes.window_border,
-            handle_radius: HANDLE_RADIUS,
-            hit_radius: HANDLE_HIT_RADIUS,
+            handle_radius: theme.sizes.handle_radius,
+            hit_radius: self.hit_radius,
+            dash_segments: [
+                theme.sizes.selection_dash_fill,
+                theme.sizes.selection_dash_gap,
+            ],
         })
         .width(Length::Fill)
         .height(Length::Fill);
@@ -889,6 +901,7 @@ impl Overlay {
         let (width, height) = self.readout_size(rect);
         let height_px = theme.sizes.panel_pill;
         let gap = theme.sizes.island_gap;
+        let readout_width = theme.sizes.readout_width;
 
         let pill = container(
             text(format!("{width} × {height}"))
@@ -896,7 +909,7 @@ impl Overlay {
                 .size(theme.typography.size.body)
                 .color(theme.on_ink.primary.into_iced()),
         )
-        .width(Length::Fixed(READOUT_WIDTH))
+        .width(Length::Fixed(readout_width))
         .height(Length::Fixed(height_px))
         .align_x(iced::Center)
         .align_y(iced::Center)
@@ -911,7 +924,7 @@ impl Overlay {
         let left = clamp_f32(
             rect.x,
             self.bounds.x,
-            (self.bounds.right() - READOUT_WIDTH).max(self.bounds.x),
+            (self.bounds.right() - readout_width).max(self.bounds.x),
         );
 
         container(pill)
@@ -1029,7 +1042,17 @@ fn pill_button(
             bottom: 0.0,
             left: theme.sizes.popover_padding,
         })
-        .style(saola_theme::style::button::rest(theme, Surface::Ink));
+        // `Chrome::Shell`: the overlay's floating toolbar is layer-shell
+        // chrome, not a control inside an app window — `Chrome::Window`
+        // would recede this button into the translucent `on_ink` fill
+        // ladder instead of the full-opacity ivory pill the style guide's
+        // toolbar wants (mirrors saola-panel's own `modules::clock`
+        // reasoning for the same choice on `Surface::Ink`).
+        .style(saola_theme::style::button::rest(
+            theme,
+            Surface::Ink,
+            Chrome::Shell,
+        ));
 
     if let Some(message) = message {
         widget = widget.on_press(message);
@@ -1102,6 +1125,9 @@ struct SelectionPainter {
     edge_width: f32,
     handle_radius: f32,
     hit_radius: f32,
+    /// The dashed edge's `[on, off]` pattern —
+    /// `[sizes.selection_dash_fill, sizes.selection_dash_gap]`.
+    dash_segments: [f32; 2],
 }
 
 impl canvas::Program<Message> for SelectionPainter {
@@ -1159,7 +1185,7 @@ impl canvas::Program<Message> for SelectionPainter {
                 line_cap: canvas::LineCap::Butt,
                 line_join: canvas::LineJoin::Round,
                 line_dash: canvas::LineDash {
-                    segments: &DASH_SEGMENTS,
+                    segments: &self.dash_segments,
                     offset: 0,
                 },
             },
@@ -1239,11 +1265,16 @@ mod tests {
         }
     }
 
+    fn theme() -> Theme {
+        Theme::saola()
+    }
+
     fn overlay() -> Overlay {
         Overlay::new(
             FrozenFrame::new(image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255])),
             output_at(0, 0),
             None,
+            &theme(),
         )
     }
 
@@ -1334,13 +1365,22 @@ mod tests {
 
     // -- hit_test ---------------------------------------------------------
 
+    /// The same `hit_radius` [`Overlay::new`] derives at runtime
+    /// (`sizes.handle_radius * HANDLE_HIT_RADIUS_RATIO`), computed here so
+    /// these pure-function tests don't need an `Overlay` just to get a
+    /// number `hit_test` itself takes as a plain `f32`.
+    fn test_hit_radius() -> f32 {
+        theme().sizes.handle_radius * HANDLE_HIT_RADIUS_RATIO
+    }
+
     #[test]
     fn hit_test_finds_every_handle() {
         let rect = Rect::new(100.0, 100.0, 200.0, 200.0);
+        let hit_radius = test_hit_radius();
         for handle in Handle::ALL {
             let center = handle.center(rect);
             assert_eq!(
-                hit_test(Some(rect), center, HANDLE_HIT_RADIUS),
+                hit_test(Some(rect), center, hit_radius),
                 HitTarget::Handle(handle),
                 "{handle:?}"
             );
@@ -1349,12 +1389,12 @@ mod tests {
 
     #[test]
     fn hit_test_prefers_a_corner_when_a_tiny_selection_overlaps_its_handles() {
-        // A 10x10 selection: every handle is within `HANDLE_HIT_RADIUS` of
-        // every other. A press on the top-left corner must resize *both*
-        // axes, which is why `Handle::ALL` lists corners first.
+        // A 10x10 selection: every handle is within the hit radius of every
+        // other. A press on the top-left corner must resize *both* axes,
+        // which is why `Handle::ALL` lists corners first.
         let rect = Rect::new(0.0, 0.0, 10.0, 10.0);
         assert_eq!(
-            hit_test(Some(rect), point(0.0, 0.0), HANDLE_HIT_RADIUS),
+            hit_test(Some(rect), point(0.0, 0.0), test_hit_radius()),
             HitTarget::Handle(Handle::TopLeft)
         );
     }
@@ -1362,12 +1402,13 @@ mod tests {
     #[test]
     fn hit_test_distinguishes_inside_from_outside() {
         let rect = Rect::new(100.0, 100.0, 200.0, 200.0);
+        let hit_radius = test_hit_radius();
         assert_eq!(
-            hit_test(Some(rect), point(200.0, 200.0), HANDLE_HIT_RADIUS),
+            hit_test(Some(rect), point(200.0, 200.0), hit_radius),
             HitTarget::Inside
         );
         assert_eq!(
-            hit_test(Some(rect), point(500.0, 500.0), HANDLE_HIT_RADIUS),
+            hit_test(Some(rect), point(500.0, 500.0), hit_radius),
             HitTarget::Outside
         );
     }
@@ -1375,7 +1416,7 @@ mod tests {
     #[test]
     fn hit_test_with_no_selection_always_starts_a_new_drag() {
         assert_eq!(
-            hit_test(None, point(0.0, 0.0), HANDLE_HIT_RADIUS),
+            hit_test(None, point(0.0, 0.0), test_hit_radius()),
             HitTarget::Outside
         );
     }
@@ -1749,6 +1790,7 @@ mod tests {
             // A second monitor whose origin is *not* the desktop origin.
             output_at(1706, 40),
             None,
+            &theme(),
         );
         overlay.update(Message::CursorMoved(point(100.0, 100.0)));
         overlay.update(Message::Pressed);
@@ -1772,6 +1814,7 @@ mod tests {
             FrozenFrame::new(image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255])),
             output_at(1706, 40),
             None,
+            &theme(),
         );
         assert_eq!(
             overlay.update(Message::SelectFullOutput),
@@ -1792,6 +1835,7 @@ mod tests {
             FrozenFrame::new(image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255])),
             output_at(0, 0),
             Some(WindowRef(7)),
+            &theme(),
         );
         assert_eq!(
             overlay.update(Message::SelectWindow),
@@ -1813,6 +1857,7 @@ mod tests {
             FrozenFrame::new(image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255])),
             nested_output(),
             None,
+            &theme(),
         );
         // CAPTURE-RESEARCH §1.4's own worked example: logical 400x300 at
         // scale 1.5 is physical 600x450.

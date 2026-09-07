@@ -87,7 +87,7 @@
 //!
 //! # §11 checklist, walked (PLAN.md Stage 9, task 4)
 //!
-//! **The main window's chrome** (the outer `paper_window`-styled container,
+//! **The main window's chrome** (the outer `container::window`-styled container,
 //! the 46px header):
 //! 1. Ivory (`Surface::Paper`) — a window, not shell chrome, per §2.
 //! 2. Exactly one terracotta element: the Capture/Start Recording button
@@ -113,7 +113,7 @@
 //!    surfaces' timed fades; not a violation, since "does it animate" only
 //!    binds surfaces that do.
 //! 9. N/A — not a popover.
-//! 10. Added a colour? No — ink/ivory/terracotta only, `paper_window`'s own
+//! 10. Added a colour? No — ink/ivory/terracotta only, `container::window`'s own
 //!     ink border included.
 //!
 //! **The editor** (`modules::editor`, real as of Stage 14) shares the same
@@ -130,7 +130,7 @@ use iced::widget::{
     button, column, container, mouse_area, row, rule, scrollable, text, toggler, Space,
 };
 use iced::{window, Center, Element, Length, Padding, Subscription, Task};
-use saola_theme::{ColorExt, Surface, Theme};
+use saola_theme::{Chrome, ColorExt, Surface, Theme};
 use zbus::Connection;
 
 use crate::cli::{self, AudioSource, ShotKind};
@@ -203,7 +203,7 @@ pub fn run(mode: WindowMode) -> iced::Result {
         // reason CLAUDE.md's Stage 6 finding documents for layer-shell
         // surfaces: without an explicit transparent clear color, iced
         // paints the theme's own opaque background before drawing
-        // anything, which would square off `paper_window`'s rounded
+        // anything, which would square off `container::window`'s rounded
         // corners against a rectangle nobody asked for. That finding was
         // about `iced_layershell` specifically; applying the same defensive
         // pair here is cheap and untested-but-consistent — see the Stage 9
@@ -256,28 +256,6 @@ fn editor_window_size(theme: &Theme) -> iced::Size {
 fn window_height(theme: &Theme) -> f32 {
     theme.sizes.window_header + 12.0 * theme.sizes.list_row + 4.0 * theme.sizes.popover_padding
 }
-
-/// The gap between adjacent segments in a segmented control, and the inset
-/// of the whole row from its `segmented::track` container's edge — the same
-/// value for both, which is what makes the track read as a rail the pills
-/// sit *in* rather than a shape they overlap.
-///
-/// A local named constant rather than a token, and a **fifth** entry in this
-/// crate's running list of saola-theme gaps (after `modules::overlay`'s
-/// `HANDLE_RADIUS`, `modules::toast`'s `ICON_TILE_SIZE`, and
-/// `modules::editor`'s `StrokeWidth::pixels`/`STEP_BADGE_RADIUS`): v0.5.0
-/// ships `style::segmented::track`/`segment` but no geometry to go with
-/// them. The value is not invented here — it is what saola-theme's own
-/// reference usage of those two helpers uses
-/// (`examples/gallery/main.rs`: `container(row(segments).spacing(4))
-/// .style(style::segmented::track(t, s)).padding(4)`), so this is a copy of
-/// the design system's own answer, pending a real token.
-///
-/// Why it matters, concretely: every segment is a full `radii.pill`, so at
-/// zero spacing adjacent pills' rounded ends scallop into each other and a
-/// four-option control reads as a row of overlapping blobs rather than one
-/// control (verified by screenshot before/after, 2026-08-09).
-pub(super) const SEGMENT_INSET: f32 = 4.0;
 
 // ---------------------------------------------------------------------
 // State
@@ -821,7 +799,7 @@ impl App {
         container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(saola_theme::style::container::paper_window(theme))
+            .style(saola_theme::style::container::window(theme, Surface::Paper))
             .into()
     }
 
@@ -967,7 +945,7 @@ impl App {
         // The style is not optional decoration: an unstyled `scrollable`
         // renders iced's *default* scrollbar, which is a near-black rail
         // that ignores the theme entirely and paints straight over
-        // `paper_window`'s rounded corner. `saola_theme::style::scrollable::
+        // `container::window`'s rounded corner. `saola_theme::style::scrollable::
         // rest` is the surface-aware answer (track-role rail, ivory thumb,
         // terracotta while dragged) and already existed in v0.5.0 — it was
         // simply never wired up here.
@@ -1339,7 +1317,7 @@ where
     T: Copy + PartialEq + 'static,
     F: Fn(T) -> Message + 'static,
 {
-    let mut track = row![].spacing(SEGMENT_INSET);
+    let mut track = row![].spacing(theme.sizes.segment_inset);
     for &(value, label) in options {
         let is_selected = value == selected;
         let content = container(
@@ -1373,6 +1351,11 @@ where
                 .style(saola_theme::style::segmented::segment(
                     theme,
                     Surface::Paper,
+                    // The app window's own controls are `Chrome::Window` —
+                    // visually a no-op on `Surface::Paper` (the two chromes
+                    // are identical there), the correct variant if an ink
+                    // app-window mode ever ships.
+                    Chrome::Window,
                     is_selected,
                 ))
                 .on_press(on_select(value)),
@@ -1380,7 +1363,7 @@ where
     }
 
     container(track)
-        .padding(SEGMENT_INSET)
+        .padding(theme.sizes.segment_inset)
         .style(saola_theme::style::segmented::track(theme, Surface::Paper))
         .into()
 }
@@ -1451,7 +1434,15 @@ fn secondary_button(
 
     button(content)
         .height(Length::Fixed(theme.sizes.hit_target_bar))
-        .style(saola_theme::style::button::rest(theme, Surface::Paper))
+        // `Chrome::Window`: this button lives inside the app window, not
+        // shell chrome. A no-op on `Surface::Paper` today (the two chromes
+        // are identical there) — the correct variant if an ink app-window
+        // mode ever ships.
+        .style(saola_theme::style::button::rest(
+            theme,
+            Surface::Paper,
+            Chrome::Window,
+        ))
         .on_press_maybe(enabled.then_some(on_press).flatten())
         .into()
 }
@@ -1462,7 +1453,11 @@ fn history_back_row(theme: &Theme) -> Element<'static, Message> {
             .font(saola_theme::convert::ui_font_regular(theme))
             .size(theme.typography.size.secondary),
     )
-    .style(saola_theme::style::button::rest(theme, Surface::Paper))
+    .style(saola_theme::style::button::rest(
+        theme,
+        Surface::Paper,
+        Chrome::Window,
+    ))
     .on_press(Message::HistoryClosed);
 
     container(back)
@@ -1506,7 +1501,7 @@ fn editor_error_view(theme: &Theme, path: &Path, err: &str) -> Element<'static, 
 
     container(
         column![caption, message]
-            .spacing(4.0)
+            .spacing(theme.sizes.gap_tight)
             .padding(theme.sizes.popover_padding),
     )
     .width(Length::Fill)
